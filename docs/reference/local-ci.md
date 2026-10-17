@@ -35,7 +35,7 @@ The gate requires a clean committed HEAD and performs these stages without skips
    Docker socket: healthy/lost-baton/healthy for fixture and library cases,
    plus addressed transcript and capture scenarios.
 
-Suites use the existing macOS network sandbox and process-observation probe,
+The four package suites use the existing macOS network sandbox and process-observation probe,
 with scratch HOME and temporary sockets and no inherited provider configuration.
 For this Apple Silicon macOS host, an unchanged relocated system `ps` was killed
 even outside the sandbox. The runner verifies the scratch copy against `/bin/ps`,
@@ -45,8 +45,8 @@ transformed hashes and admits it only after real self/child process observation
 and the existing network-confinement checks pass. It does not modify `/bin/ps` or
 machine security settings. These are test fixture homes, not alternate authenticated provider homes.
 The installed scenarios retain their nonroot, network-none, resource-limited
-containers without host mounts or credentials. Build/dependency downloads need
-network access; provider-backed agents are not run. This confines trusted tests,
+containers without host mounts or credentials. Build/dependency downloads and repository packaging/install checks need
+network access, matching the inherited workflow; provider-backed agents are not run. This confines trusted tests,
 not malicious repository code: host tests still have ordinary filesystem access
 and localhost TCP is allowed.
 

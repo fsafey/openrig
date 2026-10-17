@@ -68,11 +68,14 @@ test('production plan contains every suite, package inventory and full scenario 
     'pack-cli', 'pack-daemon', 'pack-tui', 'installed-scenarios',
   ]);
   for (const stage of stages) {
-    assert.deepEqual(Object.keys(stage.env).sort(), (stage.name.startsWith('test-') || stage.name === 'repo-tests'
+    assert.deepEqual(Object.keys(stage.env).sort(), (stage.name.startsWith('test-')
       ? ['HOME', 'PATH', 'TMPDIR', 'TMUX_TMPDIR', 'OPENRIG_CI_PS_COPY_SHA256', 'OPENRIG_CI_PS_PROVENANCE', 'CI', 'TERM']
       : stage.name === 'installed-scenarios' ? ['HOME', 'PATH', 'TMPDIR', 'CI', 'TERM', 'DOCKER_HOST']
       : ['HOME', 'PATH', 'TMPDIR', 'CI', 'TERM']).sort());
   }
+  const repo = stages.find(stage => stage.name === 'repo-tests');
+  assert.deepEqual(repo.argv, ['npm', 'run', 'test:repo']);
+  assert.match(repo.env.HOME, /build-home$/);
   const suite = stages.find(stage => stage.name === 'test-ui');
   assert.equal(suite.env.OPENRIG_CI_PS_COPY_SHA256, 'signed-copy-hash');
   assert.equal(suite.argv[0], '/usr/bin/sandbox-exec');
@@ -152,4 +155,16 @@ test('ps preparation rejects signatures with privileged entitlements', t => {
   assert.throws(() => prepareLocalPs(root, {
     execute: (_command, args) => ({ status: 0, stderr: 'Signature=adhoc', stdout: args.includes('--entitlements') ? '<plist>privileged</plist>' : '' }),
   }), /must have no entitlements/);
+});
+
+test('stage preparation failure invalidates stale PASS before preparation starts', t => {
+  const options = fixture(t);
+  assert.equal(qualify({ ...options, stages: [step('successful')] }).status, 'PASS');
+  const receipt = qualify({ ...options, stages: () => {
+    assert.equal(stored(options.root).status, 'FAIL');
+    throw new Error('ps preparation failed');
+  } });
+  assert.equal(receipt.status, 'FAIL');
+  assert.match(receipt.error, /ps preparation failed/);
+  assert.equal(stored(options.root).status, 'FAIL');
 });

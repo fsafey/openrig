@@ -30,14 +30,17 @@ export function qualify({ root, stages, inspect = candidate, execute = spawnSync
   mkdirSync(out, { recursive: true });
   const receipt = { version: 1, status: 'FAIL', candidate: { head: initial.head, tree: initial.tree },
     platform: process.platform, node: process.version, startedAt: new Date().toISOString(),
-    requiredStages: stages.map(stage => ({ name: stage.name, argv: stage.argv })), stages: [] };
+    requiredStages: [], stages: [] };
   const save = () => writeFileSync(join(out, 'receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`);
   save(); // Immediately invalidate a previous PASS, including on preflight refusal.
   try {
     requireCandidate(initial, initial);
     validate();
-    if (!stages.length) throw new Error('No qualification stages');
-    for (const [index, stage] of stages.entries()) {
+    const stageList = typeof stages === 'function' ? stages() : stages;
+    receipt.requiredStages = stageList.map(stage => ({ name: stage.name, argv: stage.argv }));
+    save();
+    if (!stageList.length) throw new Error('No qualification stages');
+    for (const [index, stage] of stageList.entries()) {
       const logPath = join(out, `${String(index + 1).padStart(2, '0')}-${stage.name}.log`);
       const entry = { name: stage.name, argv: stage.argv, status: 'RUNNING', startedAt: new Date().toISOString(), log: logPath };
       receipt.stages.push(entry);
@@ -52,7 +55,7 @@ export function qualify({ root, stages, inspect = candidate, execute = spawnSync
     }
     finalCheck();
     requireCandidate(inspect(root), initial);
-    if (receipt.stages.length !== stages.length || receipt.stages.some(stage => stage.status !== 'PASS')) throw new Error('Incomplete qualification');
+    if (receipt.stages.length !== stageList.length || receipt.stages.some(stage => stage.status !== 'PASS')) throw new Error('Incomplete qualification');
     receipt.status = 'PASS';
   } catch (error) {
     receipt.error = error.stack ?? String(error);
@@ -104,7 +107,7 @@ export function localStages(root, scratch, dockerHost, preparePs = prepareLocalP
     command('install', ['npm', 'ci'], { after: () => checkDependencyRoot(root) }),
     command('build', ['npm', 'run', 'build']),
     command('lint', ['npm', 'run', 'lint']),
-    test('repo-tests', ['run', 'test:repo']),
+    command('repo-tests', ['npm', 'run', 'test:repo']),
     ...['daemon', 'cli', 'tui', 'ui'].map(pkg => test(`test-${pkg}`, ['run', 'test', '-w', `packages/${pkg}`])),
     ...['cli', 'daemon', 'tui'].map(pkg => command(`pack-${pkg}`, ['npm', 'pack', '--dry-run', '--ignore-scripts', '--json', '-w', `packages/${pkg}`])),
     command('installed-scenarios', ['bash', 'scripts/run-pr-scenarios.sh', '--local'], { env: { ...env, DOCKER_HOST: dockerHost } }),
@@ -129,7 +132,7 @@ async function main() {
     // Use /private/tmp on macOS so sandbox socket paths have no /tmp symlink alias.
     const scratch = realpathSync(mkdtempSync('/private/tmp/openrig-local-ci-'));
     try {
-      const receipt = qualify({ root, stages: localStages(root, scratch, process.env.DOCKER_HOST), validate: () => {
+      const receipt = qualify({ root, stages: () => localStages(root, scratch, process.env.DOCKER_HOST), validate: () => {
         checkExistingDependencies(root);
         if (process.argv.length !== 2) throw new Error('ci:local accepts no skip or smoke options');
         if (process.platform !== 'darwin' || ![22, 24].includes(Number(process.versions.node.split('.')[0]))) throw new Error('ci:local requires macOS with Node 22 or 24');
