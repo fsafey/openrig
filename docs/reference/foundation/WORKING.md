@@ -53,6 +53,11 @@ Stop the team with `rig-foundation down foundation --snapshot --json`.
 
 ## Limitations and next decision
 
+Delivery is in [personal-fork PR #1](https://github.com/fsafey/openrig/pull/1).
+Local checks pass. Normal merge remains pending: GitHub reports Actions enabled
+but no registered workflows, and activation of the existing `tests.yml` returns
+404. Auto-merge is disabled in the fork. No branch rules or CI files were changed.
+
 Native resume and fresh replacement have different claim behavior. A resumed
 writer kept an old claim stamp despite a new OpenRig generation. Ordinary native
 permission prompts need operator attention. Rig-filtered event streams omitted

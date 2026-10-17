@@ -152,6 +152,11 @@ documentation placement guard, link/export-integrity checks and whitespace check
 Source changes are documentation and reusable YAML only; no implementation test
 was added. Full build, typecheck and repository/package/scenario suites belong
 to the pull-request workflow and are not represented as local checks here.
+At delivery, the personal fork had no rulesets or registered Actions workflows,
+despite containing `.github/workflows/tests.yml` and reporting Actions enabled.
+The ready PR scheduled no checks. `gh workflow enable tests.yml` returned 404.
+This is an unresolved fork delivery limitation, not a green CI result. Auto-merge
+was disabled; no admin bypass or unverified merge was used.
 
 ## Limits relevant to operation
 
