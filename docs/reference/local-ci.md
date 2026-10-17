@@ -37,8 +37,13 @@ The gate requires a clean committed HEAD and performs these stages without skips
 
 Suites use the existing macOS network sandbox and process-observation probe,
 with scratch HOME and temporary sockets and no inherited provider configuration.
-The copied system `ps` is selected only after its bytes and behavior pass that
-probe. These are test fixture homes, not alternate authenticated provider homes.
+For this Apple Silicon macOS host, an unchanged relocated system `ps` was killed
+even outside the sandbox. The runner verifies the scratch copy against `/bin/ps`,
+removes its setuid mode, ad-hoc signs only that copy without preserving privileged
+entitlements, and verifies the new signature. The probe records original and
+transformed hashes and admits it only after real self/child process observation
+and the existing network-confinement checks pass. It does not modify `/bin/ps` or
+machine security settings. These are test fixture homes, not alternate authenticated provider homes.
 The installed scenarios retain their nonroot, network-none, resource-limited
 containers without host mounts or credentials. Build/dependency downloads need
 network access; provider-backed agents are not run. This confines trusted tests,
@@ -46,6 +51,10 @@ not malicious repository code: host tests still have ordinary filesystem access
 and localhost TCP is allowed.
 
 ## Evidence and merge
+
+The existing machine-wide gate lock serializes runs before any scratch, dependency
+or evidence mutation and stays held through the final receipt. A contending run
+fails without overwriting the active run.
 
 A run writes `dist/local-ci/<commit>/receipt.json` and per-stage logs. Installed
 scenario evidence remains under `dist/pr-scenarios/`. Preserve those ignored

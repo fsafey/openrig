@@ -1,4 +1,4 @@
-// Hosted macOS only. Run inside the package suite's existing sandbox, before PATH changes.
+// macOS CI only. Run inside the package suite's existing sandbox, before PATH changes.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
@@ -20,9 +20,9 @@ function observe(file, pids) {
     visible: (r.stdout ?? "").trim().split(/\s+/).filter(Boolean).map(Number) };
 }
 
-function requireCopy(original, copy, observed, pids) {
+function requireCopy(expectedHash, copy, observed, pids) {
   assert.equal(copy.mode, "755");
-  assert.equal(copy.sha256, original.sha256);
+  assert.equal(copy.sha256, expectedHash);
   assert.equal(observed.status, 0, JSON.stringify(observed));
   assert.equal(observed.signal, null);
   assert.equal(observed.code, undefined);
@@ -69,10 +69,23 @@ assert.equal(realpathSync(process.env.TMUX_TMPDIR), root);
 const copyPath = join(root, "bin", "ps");
 assert.equal(realpathSync(copyPath), copyPath);
 const original = inspect("/bin/ps"), copy = inspect(copyPath);
-console.log("CI_PS_FILES " + JSON.stringify({ original, copy }));
-// Validate bytes/mode before executing the job-owned copy.
+// Hosted CI uses an unchanged copy. Local macOS may require ad-hoc signing of
+// the non-setuid scratch copy. Its trusted runner verifies bytes before signing
+// and records the transformed digest; signing does not replace behavioral checks.
+let expectedHash = original.sha256;
+if (process.env.OPENRIG_CI_PS_COPY_SHA256) {
+  const provenance = JSON.parse(process.env.OPENRIG_CI_PS_PROVENANCE);
+  assert.match(process.env.OPENRIG_CI_PS_COPY_SHA256, /^[a-f0-9]{64}$/);
+  assert.equal(provenance.originalSha256, original.sha256);
+  assert.equal(provenance.preSignSha256, original.sha256);
+  assert.equal(provenance.sha256, process.env.OPENRIG_CI_PS_COPY_SHA256);
+  expectedHash = provenance.sha256;
+  console.log("CI_PS_TRANSFORMATION " + JSON.stringify(provenance));
+}
+console.log("CI_PS_FILES " + JSON.stringify({ original, copy, expectedHash }));
+// Validate the admitted digest and mode before executing the job-owned copy.
 assert.equal(copy.mode, "755");
-assert.equal(copy.sha256, original.sha256);
+assert.equal(copy.sha256, expectedHash);
 
 const child = spawn(process.execPath, ["-e", "process.stdin.resume(); setTimeout(() => process.exit(0), 30000)"], { stdio: ["pipe", "ignore", "ignore"] });
 const childExit = once(child, "exit");
@@ -81,7 +94,7 @@ try {
   const pids = [process.pid, child.pid];
   const pair = { original: observe("/bin/ps", pids), copy: observe(copyPath, pids) };
   console.log("CI_PS_PAIR " + JSON.stringify(pair));
-  requireCopy(original, copy, pair.copy, pids);
+  requireCopy(expectedHash, copy, pair.copy, pids);
 
   const servers = [];
   try {
