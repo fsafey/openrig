@@ -1,0 +1,37 @@
+name: foundation-investigator
+version: "1.0"
+description: Investigate and independently review persistent-seat work and context recovery in the foundation pilot.
+
+profiles:
+  writer:
+    uses:
+      skills: []
+      guidance: []
+      subagents: []
+      plugins: []
+      runtime_resources: []
+    startup:
+      files:
+        - path: guidance/writer.md
+          delivery_hint: send_text
+          required: true
+  reviewer:
+    uses:
+      skills: []
+      guidance: []
+      subagents: []
+      plugins: []
+      runtime_resources: []
+    startup:
+      files:
+        - path: guidance/reviewer.md
+          delivery_hint: send_text
+          required: true
+
+resources: {}
+startup:
+  files:
+    - path: startup/context.md
+      delivery_hint: send_text
+      required: true
+  actions: []

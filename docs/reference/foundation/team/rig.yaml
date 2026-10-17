@@ -1,0 +1,27 @@
+version: "0.2"
+name: foundation
+summary: A bounded investigation and independent review of persistent seats, owned work, and recovery.
+culture_file: CULTURE.md
+
+pods:
+  - id: study
+    label: Foundation pilot
+    members:
+      - id: writer
+        agent_ref: local:agents/foundation
+        profile: writer
+        runtime: codex
+        model: gpt-6.1-sol
+        cwd: "."
+      - id: reviewer
+        agent_ref: local:agents/foundation
+        profile: reviewer
+        runtime: claude-code
+        model: claude-opus-5-5
+        cwd: "."
+    edges:
+      - kind: collaborates_with
+        from: writer
+        to: reviewer
+
+edges: []

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # All daemon/seat work runs inside the existing disposable testbed.
-# Default: GitHub CI. --remote: explicitly selected SSH Docker executor.
+# Default: GitHub CI. --local/--remote select an explicit Docker executor.
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 REMOTE=false
+LOCAL=false
 CASES=(fixture library)
 MODES=(healthy lost-baton healthy)
 # Stub-script scenarios run once each, healthy only: their planted failures are
@@ -14,6 +15,7 @@ OUT="$REPO_ROOT/dist/pr-scenarios"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --remote) REMOTE=true; shift ;;
+    --local) LOCAL=true; shift ;;
     --case)
       case "${2:-}" in
         fixture|library) CASES=("$2"); PASSING_CASES=();;
@@ -33,11 +35,15 @@ if [ "${MODES[*]}" = lost-baton ]; then
   test "${#CASES[@]}" -gt 0 || { echo 'transcript and capture run healthy only' >&2; exit 2; }
   PASSING_CASES=()
 fi
-if "$REMOTE"; then
+if "$LOCAL"; then
+  "$REMOTE" && { echo 'Choose only one of --local or --remote' >&2; exit 2; }
+  case "${DOCKER_HOST:-}" in unix:///*) ;; *) echo '--local requires explicit DOCKER_HOST=unix:///absolute/socket' >&2; exit 2;; esac
+  test -z "${DOCKER_CONTEXT:-}" || { echo 'Unset DOCKER_CONTEXT so it cannot override the selected DOCKER_HOST' >&2; exit 2; }
+elif "$REMOTE"; then
   case "${DOCKER_HOST:-}" in ssh://?*) ;; *) echo '--remote requires explicit DOCKER_HOST=ssh://...' >&2; exit 2;; esac
   test -z "${DOCKER_CONTEXT:-}" || { echo 'Unset DOCKER_CONTEXT so it cannot override the selected DOCKER_HOST' >&2; exit 2; }
 else
-  test "${GITHUB_ACTIONS:-}" = true || { echo 'Use GitHub CI or --remote with the prepared disposable SSH executor' >&2; exit 2; }
+  test "${GITHUB_ACTIONS:-}" = true || { echo 'Use GitHub CI or --remote with the prepared disposable SSH executor, or --local with an explicit local Docker socket' >&2; exit 2; }
   test "$(uname -s)" = Linux
 fi
 mkdir -p "$OUT"

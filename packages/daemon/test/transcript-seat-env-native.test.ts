@@ -25,6 +25,9 @@ describe.skipIf(process.platform === "win32")("native transcript seat environmen
     const prior = keys.map((key) => process.env[key]);
     try {
       await runFile("tmux", ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", "server", "sleep 60"], { env });
+      // This fixture tests tmux environment inheritance. Host login-shell startup/exit
+      // hooks (macOS zsh sessions, for example) can write HOME after kill-server.
+      await runFile("tmux", ["-S", socket, "set-option", "-g", "default-shell", "/bin/sh"], { env });
       const adapter = new TmuxAdapter(async (cmd) => (await run(`tmux -S ${shellQuote(socket)} ${cmd.slice(5)}`, { env })).stdout,
         undefined, argv ? async (args) => (await runFile(args[0]!, ["-S", socket, ...args.slice(1)], { env })).stdout : undefined);
       expect(await adapter.createSession("fixture", temp)).toEqual({ ok: true });

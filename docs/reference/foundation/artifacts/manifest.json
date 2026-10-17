@@ -1,0 +1,30 @@
+[
+  {
+    "file": "operating-brief.md",
+    "original_sha256": "a9fe0e563171f7ccaf9b226c7d98f88c6001138c232e2373b296dd7dc316c67a",
+    "original_bytes": 13665,
+    "published_sha256": "a5f266346a89ae4e3e68c9e5834b75ddd89621c22f121e0d67b6b4a60685b2f8",
+    "published_bytes": 13795
+  },
+  {
+    "file": "continuity-addendum.md",
+    "original_sha256": "7b56658ce25abd6df1e2dc438d7325e4adf3ccabf9f80f9dfb70dc1c4773d0ba",
+    "original_bytes": 5351,
+    "published_sha256": "eb2e75c130aa28e772825af0067250913f14e4b9b5041247258b225c78fd8220",
+    "published_bytes": 5748
+  },
+  {
+    "file": "review.md",
+    "original_sha256": "e1759c4a8878bda7da7ce379f293fda9690b61c1c47e8cf3186d5d5f317b85e5",
+    "original_bytes": 11064,
+    "published_sha256": "db7b7388053ce78ffd2671ba49935306e5f2e71895262910f8d9b87ca9d98fca",
+    "published_bytes": 11212
+  },
+  {
+    "file": "coordinator-acceptance.md",
+    "original_sha256": "176661514e9285401e90822a1781771687f28035ad0ffc88f054f87cdd5907d3",
+    "original_bytes": 1496,
+    "published_sha256": "a0e66dfa415e66dcff6d9b7020b0a8f72028f7270c6829229064a80c4a073201",
+    "published_bytes": 1653
+  }
+]
