@@ -43,12 +43,18 @@ printf '%s\\n' '${JSON.stringify(server)}'
     assert.deepEqual(JSON.parse(readFileSync(receipt, 'utf8')), { platform: 'linux/amd64', server });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
-test('ordinary invocation and ambiguous remote selection refuse before any build', () => {
+test('ordinary invocation and ambiguous executor selection refuse before any build', () => {
   const script = resolve('scripts/run-pr-scenarios.sh');
   for (const [args, extra, message] of [
     [[], {}, /Use GitHub CI or --remote/],
     [['--remote'], {}, /requires explicit DOCKER_HOST/],
     [['--remote'], { DOCKER_HOST: 'ssh://fixture.invalid', DOCKER_CONTEXT: 'other' }, /Unset DOCKER_CONTEXT/],
+    [['--local'], {}, /requires explicit DOCKER_HOST/],
+    [['--local'], { DOCKER_HOST: 'tcp://localhost:2375' }, /requires explicit DOCKER_HOST/],
+    [['--local'], { DOCKER_HOST: 'ssh://fixture.invalid' }, /requires explicit DOCKER_HOST/],
+    [['--local'], { DOCKER_HOST: 'unix://relative' }, /requires explicit DOCKER_HOST/],
+    [['--local'], { DOCKER_HOST: 'unix:///tmp/test-only.sock', DOCKER_CONTEXT: 'other' }, /Unset DOCKER_CONTEXT/],
+    [['--local', '--remote'], { DOCKER_HOST: 'unix:///tmp/test-only.sock' }, /Choose only one/],
     [['--remote', '--case', 'typo'], {}, /Expected --case/],
     [['--remote', '--mode', 'typo'], {}, /Expected --mode/],
   ]) {

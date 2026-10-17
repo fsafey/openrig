@@ -155,8 +155,10 @@ to the pull-request workflow and are not represented as local checks here.
 At delivery, the personal fork had no rulesets or registered Actions workflows,
 despite containing `.github/workflows/tests.yml` and reporting Actions enabled.
 The ready PR scheduled no checks. `gh workflow enable tests.yml` returned 404.
-This is an unresolved fork delivery limitation, not a green CI result. Auto-merge
-was disabled; no admin bypass or unverified merge was used.
+That initial delivery had no CI result. The authorized follow-up replaced hosted
+scheduling with [local-only CI](../local-ci.md), a required commit status and
+normal protected merging. The PR records its exact candidate and result. No
+admin bypass is part of that workflow.
 
 ## Limits relevant to operation
 
