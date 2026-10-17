@@ -11,6 +11,9 @@ merge bypass is part of this workflow.
 Use a clean sibling worktree, macOS, Node 22 or 24, tmux and a running local Docker
 engine. Installations and provider credentials are not used. The runner installs
 its own worktree dependencies with `npm ci`; never share `node_modules`.
+The release-surface tests require upstream release tags. Fetch them once if
+absent: `git fetch --no-tags upstream tag v0.3.1 tag v0.3.2` (the configured
+upstream is `https://github.com/mvschwarz/openrig`). Missing tags fail CI.
 For the foundation machine, an existing Colima default profile supplies Docker:
 
 ```sh
@@ -49,6 +52,19 @@ containers without host mounts or credentials. Build/dependency downloads and re
 network access, matching the inherited workflow; provider-backed agents are not run. This confines trusted tests,
 not malicious repository code: host tests still have ordinary filesystem access
 and localhost TCP is allowed.
+
+## Resume after a bounded failure
+
+Keep completed results when resuming, with their original commit and logs. Run
+the failed test after its focused fix, then continue the unrun suites. Record a
+separate resumed-qualification receipt containing the original and final commits,
+the exact intervening diff, every carried-forward result, replacement test result,
+and remaining stage result. Recheck changed documentation and dependency ownership.
+Only reuse evidence whose tested code, dependencies and setup remain applicable;
+changes to product code or build inputs require their affected checks again.
+Do not rewrite an earlier failed receipt as a passing full run. Publish the final
+status as resumed qualification, with the composition explained in the PR. The
+full-run command below remains available for a new candidate without prior evidence.
 
 ## Evidence and merge
 
