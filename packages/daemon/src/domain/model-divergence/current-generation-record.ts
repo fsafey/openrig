@@ -5,7 +5,7 @@
 
 import { dirname, join } from "node:path";
 import { lstartToMinTs } from "../codex-thread-id.js";
-import { verifyCodexPaneProcess, type NativeProcessLister, type NativeProcessRow } from "../native-process-lineage.js";
+import { observeCodexPaneProcess, verifyCodexPaneProcess, type NativeProcessLister, type NativeProcessRow } from "../native-process-lineage.js";
 import { parseSqliteUtcMs } from "../sqlite-time.js";
 
 export interface ProcessRow {
@@ -216,7 +216,7 @@ function cleanString(value: string | undefined): string | null {
 }
 
 export type VerifiedCodexProcess =
-  | { ok: true; panePid: number; process: NativeProcessRow; processes: NativeProcessRow[] }
+  | { ok: true; panePid: number; process: NativeProcessRow; processes: NativeProcessRow[]; fingerprint: string }
   | { ok: false; reason: string };
 
 /** The seat's verified native Codex process, proved again now. The identity verdict records that
@@ -227,7 +227,8 @@ export type VerifiedCodexProcess =
  *  pane's one stable native Codex (two snapshots, `verifyCodexPaneProcess`) must be the recorded PID,
  *  and it and the pane root must both predate the stamp: anything started later replaced them. A
  *  process started within the stamp's own second is refused until the next verdict. `processes` is
- *  the second snapshot. */
+ *  the second snapshot; `fingerprint` identifies the chain from native Codex to the pane root (PID,
+ *  parent, start, groups, command at every link) for `sameVerifiedCodexProcess`. */
 export async function confirmVerifiedCodexProcess(
   target: string,
   identity: { observedAt: string; evidence: { observedPid: number | null } },
@@ -246,7 +247,19 @@ export async function confirmVerifiedCodexProcess(
     const started = lstartToMinTs(row?.startedAt);
     if (started === undefined || !(started < verifiedSecond)) return { ok: false, reason: `its ${label} did not start before it was verified` };
   }
-  return { ok: true, panePid: native.panePid, process: native.process, processes };
+  return { ok: true, panePid: native.panePid, process: native.process, processes, fingerprint: native.fingerprint };
+}
+
+/** Whether the pane still holds the process chain `confirmVerifiedCodexProcess` proved: one more
+ *  observation, after everything awaited since, must find the same chain, so neither the native
+ *  process nor the pane root was replaced or had its PID reused meanwhile. */
+export async function sameVerifiedCodexProcess(
+  target: string,
+  fingerprint: string,
+  deps: { getPanePid: (target: string) => Promise<number | null>; listProcesses: NativeProcessLister },
+): Promise<boolean> {
+  const native = await observeCodexPaneProcess({ target, tmux: { getPanePid: deps.getPanePid }, listProcesses: deps.listProcesses });
+  return native?.fingerprint === fingerprint;
 }
 
 /** The live codex occupant's thread id, via its own pid's log join — bypasses the stored resume
