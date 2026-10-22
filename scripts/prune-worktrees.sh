@@ -56,7 +56,9 @@ runtime_idle_minutes=$((24 * 60))
 
 cd "$(git rev-parse --path-format=absolute --git-common-dir)/.."
 git fetch origin --prune --quiet
-merged_prs=$(gh pr list --state merged --limit 2000 --json headRefName,headRefOid,isCrossRepository \
+# Ask origin's repository for its PRs, not gh's default repository: in a fork that also has an
+# upstream remote, gh can resolve to the upstream, whose PRs say nothing about these branches.
+merged_prs=$(gh pr list --repo "$(git remote get-url origin)" --state merged --limit 2000 --json headRefName,headRefOid,isCrossRepository \
   --jq '.[] | select(.isCrossRepository == false) | "\(.headRefName) \(.headRefOid)"')
 [[ -n "$merged_prs" ]] || { echo "gh returned no merged PRs; refusing to judge" >&2; exit 1; }
 mainline=$(git rev-list --first-parent origin/main)
