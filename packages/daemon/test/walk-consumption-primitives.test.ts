@@ -341,6 +341,7 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
   let db: Database.Database;
   let registry: SessionRegistry;
   let panePid: number;
+  let paneReadHook: (() => void) | undefined;
   const threadId = "11111111-1111-4111-8111-111111111111";
 
   beforeEach(() => {
@@ -348,12 +349,13 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
     db = createFullTestDb();
     registry = new SessionRegistry(db);
     panePid = 3001;
+    paneReadHook = undefined;
     const store = new ContextUsageStore(db, { stateDir, codexHomeDir: stateDir });
     app = new Hono();
     app.use("*", async (c, next) => {
       c.set("contextUsageStore" as never, store as never);
       c.set("sessionRegistry" as never, registry as never);
-      c.set("tmuxAdapter" as never, { getPanePid: async () => panePid } as never);
+      c.set("tmuxAdapter" as never, { getPanePid: async () => { paneReadHook?.(); return panePid; } } as never);
       await next();
     });
     app.route("/api/sessions", sessionAdminRoutes);
@@ -524,6 +526,9 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
     ["the occupant tenure", nodeId => registry.mintOccupantTenure(nodeId, "handover", "new-native-id")],
     ["the bound pane", (nodeId, seat) => registry.updateBinding(nodeId, { tmuxSession: seat, tmuxPane: "%43" })],
     ["the pane root", () => { panePid = 3999; }],
+    ["the native Codex process", () => { vi.mocked(listNativeProcesses).mockImplementation(async () => wrappedCodex({ native: 3014 })); }],
+    ["the native Codex process behind its reused PID", () => { vi.mocked(listNativeProcesses).mockImplementation(async () => wrappedCodex({ nativeStarted: later() })); }],
+    ["the pane root behind its reused PID", () => { vi.mocked(listNativeProcesses).mockImplementation(async () => wrappedCodex({ rootStarted: later() })); }],
   ])("Codex refuses when %s changes while its thread resolves", async (_case, change) => {
     const { url, node, seat } = await seedCodex();
     vi.mocked(CodexThreadIdResolver.prototype.resolve).mockImplementation(async pid => {
@@ -532,6 +537,29 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
       return threadId;
     });
     const response = await app.request(url);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject(unverified("changed while resolving"));
+  });
+
+  it.each<[string, (nodeId: string, seat: string) => void]>([
+    ["the bound pane moves", (nodeId, seat) => registry.updateBinding(nodeId, { tmuxSession: seat, tmuxPane: "%43" })],
+    ["a successor tenure starts", nodeId => registry.mintOccupantTenure(nodeId, "handover", "new-native-id")],
+  ])("Codex refuses when %s during the closing pane read", async (_case, change) => {
+    const { url, node, seat } = await seedCodex();
+    let resolved = false;
+    vi.mocked(CodexThreadIdResolver.prototype.resolve).mockImplementation(async pid => {
+      if (pid !== 3004) return undefined;
+      resolved = true;
+      return threadId;
+    });
+    // The first pane read after the thread lookup is the closing one; the registry must be read after it.
+    paneReadHook = () => {
+      if (!resolved) return;
+      paneReadHook = undefined;
+      change(node.id, seat);
+    };
+    const response = await app.request(url);
+    expect(paneReadHook).toBeUndefined();
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject(unverified("changed while resolving"));
   });
