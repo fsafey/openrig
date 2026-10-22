@@ -4,6 +4,8 @@
 // identity tie-breaker: a deliberately retained predecessor may keep writing forever.
 
 import { dirname, join } from "node:path";
+import { lstartToMinTs } from "../codex-thread-id.js";
+import { verifyCodexPaneProcess, type NativeProcessLister, type NativeProcessRow } from "../native-process-lineage.js";
 import { parseSqliteUtcMs } from "../sqlite-time.js";
 
 export interface ProcessRow {
@@ -213,23 +215,64 @@ function cleanString(value: string | undefined): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+export type VerifiedCodexProcess =
+  | { ok: true; panePid: number; process: NativeProcessRow; processes: NativeProcessRow[] }
+  | { ok: false; reason: string };
+
+/** The seat's verified native Codex process, proved again now. The identity verdict records that
+ *  process's PID, which a shell or launcher may hold beneath the pane root, but not its start time.
+ *  Both writers of a verified verdict (the identity reconciler and `rebindAndVerifyPaneIdentity`)
+ *  stamp `observedAt` before they sample processes, and a live PID names one process, so a process
+ *  whose `ps` start second ended before that stamp is the one they saw. The
+ *  pane's one stable native Codex (two snapshots, `verifyCodexPaneProcess`) must be the recorded PID,
+ *  and it and the pane root must both predate the stamp: anything started later replaced them. A
+ *  process started within the stamp's own second is refused until the next verdict. `processes` is
+ *  the second snapshot. */
+export async function confirmVerifiedCodexProcess(
+  target: string,
+  identity: { observedAt: string; evidence: { observedPid: number | null } },
+  deps: { getPanePid: (target: string) => Promise<number | null>; listProcesses: NativeProcessLister },
+): Promise<VerifiedCodexProcess> {
+  let processes: NativeProcessRow[] = [];
+  const native = await verifyCodexPaneProcess({ target, tmux: { getPanePid: deps.getPanePid },
+    listProcesses: async () => (processes = await deps.listProcesses()) });
+  if (!native) return { ok: false, reason: `no stable native Codex process under pane ${target}` };
+  if (native.process.pid !== identity.evidence.observedPid) {
+    return { ok: false, reason: `its native Codex process is ${native.process.pid}, not the verified ${identity.evidence.observedPid}` };
+  }
+  const verifiedSecond = Math.floor(Date.parse(identity.observedAt) / 1000);
+  const root = processes.find((row) => row.pid === native.panePid);
+  for (const [label, row] of [["pane root", root], ["native Codex process", native.process]] as const) {
+    const started = lstartToMinTs(row?.startedAt);
+    if (started === undefined || !(started < verifiedSecond)) return { ok: false, reason: `its ${label} did not start before it was verified` };
+  }
+  return { ok: true, panePid: native.panePid, process: native.process, processes };
+}
+
 /** The live codex occupant's thread id, via its own pid's log join — bypasses the stored resume
  *  token entirely (the stored token is exactly what went stale on the specimen class). */
 export async function resolveLiveCodexThreadId(
   sessionTarget: string,
   deps: CurrentGenerationDeps,
+  /** The occupant `confirmVerifiedCodexProcess` proved: it may be the pane root itself, and the thread must be its own. */
+  verifiedPid?: number,
 ): Promise<CurrentRecordResolution> {
   const panePid = await deps.getPanePid(sessionTarget);
   if (!panePid) return { ok: false, reason: `no live pane pid for ${sessionTarget}` };
   const processes = await deps.listProcesses();
   const codexPids = findDescendants(processes, panePid, commandBasenameIs("codex"));
+  if (verifiedPid !== undefined && !codexPids.includes(verifiedPid)) codexPids.unshift(verifiedPid);
   if (codexPids.length === 0) return { ok: false, reason: `no codex process under the live pane of ${sessionTarget}` };
   const ids = new Set<string>();
+  let own: string | undefined;
   for (const pid of codexPids) {
     const threadId = await deps.readThreadIdByPid(pid, processes.find((p) => p.pid === pid)?.startedAt);
+    if (pid === verifiedPid) own = threadId;
     if (threadId) ids.add(threadId);
   }
-  if (ids.size === 1) return { ok: true, id: [...ids][0]! };
   if (ids.size > 1) return { ok: false, reason: `multiple codex threads under the live pane of ${sessionTarget}` };
-  return { ok: false, reason: `live codex process under ${sessionTarget} yielded no thread id from its logs` };
+  if (ids.size === 0) return { ok: false, reason: `live codex process under ${sessionTarget} yielded no thread id from its logs` };
+  const id = [...ids][0]!;
+  if (verifiedPid !== undefined && own !== id) return { ok: false, reason: `the live codex thread under ${sessionTarget} is not its verified process's own` };
+  return { ok: true, id };
 }
