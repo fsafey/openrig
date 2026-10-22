@@ -34,13 +34,12 @@ import type { MiddlewareHandler } from "hono";
 import type { EventBus } from "../domain/event-bus.js";
 import { validateResumeToken } from "../domain/resume-token-validation.js";
 import type { PermissionDriftReader } from "../domain/permission-drift-observer.js";
-import { ProcessCensus } from "../domain/process-census.js";
 import { CodexThreadIdResolver } from "../domain/codex-thread-id.js";
-import { resolveLiveCodexThreadId } from "../domain/model-divergence/current-generation-record.js";
+import { confirmVerifiedCodexProcess, resolveLiveCodexThreadId, sameVerifiedCodexProcess } from "../domain/model-divergence/current-generation-record.js";
+import { listNativeProcesses } from "../domain/native-process-lineage.js";
 import { SeatIdentityStore } from "../domain/seat-identity-store.js";
 import { parseSqliteUtcMs } from "../domain/sqlite-time.js";
 
-const generationCensus = new ProcessCensus({ freshnessMs: 0 }); // coalesce concurrent receipts; recheck each later read
 const generationThreadIds = new CodexThreadIdResolver({ codexHome: process.env.CODEX_HOME || undefined });
 
 function terminalAuthGuard(): MiddlewareHandler {
@@ -693,6 +692,8 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
   const runtime = context?.runtime ?? "claude-code";
   let transcriptPath: string | null;
   let sessionId: string | null;
+  // Imported before the identity checks, so nothing is awaited between their last registry read and the record read.
+  const fs = await import("node:fs");
   if (runtime === "codex") {
     const binding = registry.getBindingForNode(context!.nodeId);
     const identity = new SeatIdentityStore(registry.db).getForNode(context!.nodeId);
@@ -703,22 +704,31 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
       return c.json({ error: "record_identity_unverified", message: `No verified current occupant/pane binding for '${sessionName}'.` }, 409);
     }
     try {
-      const pid = await tmuxAdapter?.getPanePid?.(binding.tmuxPane);
-      if (!pid || pid !== identity.evidence.observedPid) {
-        return c.json({ error: "record_identity_unverified", message: `The bound pane for '${sessionName}' no longer matches its verified occupant.` }, 409);
+      // The verdict names the native Codex process, which a shell or launcher may hold beneath the
+      // pane root: prove that same process still occupies the bound pane, then join it to its thread.
+      const observe = { getPanePid: async (target: string) => (await tmuxAdapter?.getPanePid?.(target)) ?? null, listProcesses: listNativeProcesses };
+      const verifiedProcess = await confirmVerifiedCodexProcess(binding.tmuxPane, identity, observe);
+      if (!verifiedProcess.ok) {
+        return c.json({ error: "record_identity_unverified", message: `The bound pane for '${sessionName}' no longer matches its verified occupant: ${verifiedProcess.reason}.` }, 409);
       }
+      const { panePid: pid, process: native, processes } = verifiedProcess;
       const live = await resolveLiveCodexThreadId(binding.tmuxPane, {
         getPanePid: async () => pid,
-        listProcesses: () => generationCensus.list(),
+        listProcesses: async () => processes,
         readThreadIdByPid: (nativePid, startedAt) => startedAt
           ? generationThreadIds.resolve(nativePid, startedAt) : undefined,
-      });
+      }, native.pid);
       if (!live.ok) return c.json({ error: "record_identity_unverified", message: live.reason }, 409);
       sessionId = live.id;
       transcriptPath = store.readCodexTranscriptPath(sessionId);
+      // Every asynchronous observation comes first: after the thread lookup's awaits, the pane (its
+      // PID read again) must still hold the same process chain. The registry is read last, with no
+      // await between it and the record read.
+      if (!await sameVerifiedCodexProcess(binding.tmuxPane, verifiedProcess.fingerprint, observe)) {
+        return c.json({ error: "record_identity_unverified", message: `The verified Codex process under '${sessionName}' changed while resolving.` }, 409);
+      }
       if (registry.currentOccupantTenure(context!.nodeId)?.generationUuid !== occupant.generationUuid
-        || registry.getBindingForNode(context!.nodeId)?.tmuxPane !== binding.tmuxPane
-        || await tmuxAdapter.getPanePid?.(binding.tmuxPane) !== pid) {
+        || registry.getBindingForNode(context!.nodeId)?.tmuxPane !== binding.tmuxPane) {
         return c.json({ error: "record_identity_unverified", message: `The occupant binding changed while resolving '${sessionName}'.` }, 409);
       }
     } catch (err) {
@@ -732,7 +742,6 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
   if (!transcriptPath || !sessionId) {
     return c.json({ error: "unsupported_runtime", message: `No current-generation record resolves for '${sessionName}' (${runtime}) — consumption cannot be verified for this seat.` }, 409);
   }
-  const fs = await import("node:fs");
   const sinceRaw = c.req.query("sinceBytes");
   const since = sinceRaw === undefined ? 0 : Number(sinceRaw);
   if (!Number.isSafeInteger(since) || since < 0 || sinceRaw === "") {
