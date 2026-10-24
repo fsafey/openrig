@@ -5,11 +5,13 @@
 // shape is discovered + trusted (via the "2 Trust all and continue" launch gate) and
 // the turn-scope hooks (incl. the PermissionRequest keystone) FIRE.
 import { describe, it, expect, vi } from "vitest";
-import { CodexRuntimeAdapter, type CodexAdapterFsOps } from "../src/adapters/codex-runtime-adapter.js";
+import { CodexRuntimeAdapter, computeCodexHookTrust, type CodexAdapterFsOps } from "../src/adapters/codex-runtime-adapter.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
+import { parse as parseToml } from "smol-toml";
 
 const RELAY = "/daemon/assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs";
 const CONFIG = "/home/test/.codex/config.toml";
+const HOOKS = "/home/test/.codex/hooks.json";
 const EVENTS = ["SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest"] as const;
 
 function mockCodexFs(files?: Record<string, string>): CodexAdapterFsOps & { _store: Record<string, string> } {
@@ -33,7 +35,154 @@ function makeAdapter(fs: CodexAdapterFsOps, relay: string | undefined = RELAY): 
   return new CodexRuntimeAdapter({ tmux: mockTmux(), fsOps: fs, activityRelayPath: relay });
 }
 
+const managedGroup = (command = `node "${RELAY}"`) => ({
+  hooks: [{ type: "command", command, timeout: 5, statusMessage: "OpenRig activity" }],
+});
+
+describe("Codex existing JSON hook format", () => {
+  it("preserves an explicit activity-hook disable across runtime off/on with a later user group", () => {
+    const fs = mockCodexFs({ [RELAY]: "// relay", [HOOKS]: '{"hooks":{}}' });
+    const adapter = makeAdapter(fs);
+    adapter.ensureCodexActivityHooks();
+    const ownKey = `${HOOKS}:stop:0:0`;
+    fs._store[CONFIG] = fs._store[CONFIG]!.replace(`[hooks.state.${JSON.stringify(ownKey)}]`, `[hooks.state.${JSON.stringify(ownKey)}]\nenabled = false`);
+    const userGroup = { hooks: [{ type: "command", command: "/user/later" }] };
+    const document = JSON.parse(fs._store[HOOKS]!);
+    document.hooks.Stop.push(userGroup);
+    fs._store[HOOKS] = JSON.stringify(document);
+    fs._store[CONFIG] += `\n[hooks.state.${JSON.stringify(`${HOOKS}:stop:1:0`)}]\nenabled = false\ntrusted_hash = "sha256:user"\n`;
+
+    adapter.removeCodexActivityHooks();
+    expect(JSON.parse(fs._store[HOOKS]!).hooks.Stop).toEqual([userGroup]);
+    expect((parseToml(fs._store[CONFIG]!).hooks as any).state[`${HOOKS}:stop:0:0`]).toEqual({ enabled: false, trusted_hash: "sha256:user" });
+    adapter.ensureCodexActivityHooks();
+    expect(JSON.parse(fs._store[HOOKS]!).hooks.Stop).toEqual([userGroup, managedGroup()]);
+    const state = (parseToml(fs._store[CONFIG]!).hooks as any).state;
+    expect(state[`${HOOKS}:stop:0:0`]).toEqual({ enabled: false, trusted_hash: "sha256:user" });
+    const expected = computeCodexHookTrust("Stop", { keySource: HOOKS, command: `node "${RELAY}"`, timeoutSec: 5, statusMessage: "OpenRig activity", groupIndex: 1 });
+    expect(state[expected.key]).toEqual({ enabled: false, trusted_hash: expected.hash });
+  });
+
+  it.each(["{broken", "[]", '{"hooks":null}', '{"hooks":{"Stop":{}}}'])("warns and preserves invalid JSON and TOML: %s", (json) => {
+    const fs = mockCodexFs({ [RELAY]: "// relay", [HOOKS]: json, [CONFIG]: 'model = "custom"\n' });
+    const before = { ...fs._store };
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      makeAdapter(fs).ensureCodexActivityHooks();
+      expect(fs._store).toEqual(before);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(HOOKS));
+    } finally { warn.mockRestore(); }
+  });
+
+  it("accepts a hooks document with no groups yet", () => {
+    const fs = mockCodexFs({ [RELAY]: "// relay", [HOOKS]: '{"description":"My hooks"}' });
+    makeAdapter(fs).ensureCodexActivityHooks();
+    expect(JSON.parse(fs._store[HOOKS]!).hooks.Stop).toEqual([managedGroup()]);
+  });
+
+  it("is idempotent and upgrades only strictly marked groups", () => {
+    const nextRelay = "/new/assets/activity-relay.cjs";
+    const userGroups = [
+      { ...managedGroup(), matcher: "Bash" },
+      { hooks: [{ ...managedGroup().hooks[0], statusMessage: "My activity" }] },
+      { hooks: [{ ...managedGroup().hooks[0], command: `node "/user/activity-relay.cjs"`, userField: true }] },
+    ];
+    const fs = mockCodexFs({ [RELAY]: "// relay", [nextRelay]: "// next", [HOOKS]: JSON.stringify({ hooks: { Stop: userGroups } }) });
+    const adapter = makeAdapter(fs);
+    adapter.ensureCodexActivityHooks();
+    const first = { ...fs._store };
+    adapter.ensureCodexActivityHooks();
+    expect(fs._store).toEqual(first);
+    makeAdapter(fs, nextRelay).ensureCodexActivityHooks();
+    const json = JSON.parse(fs._store[HOOKS]!);
+    expect(json.hooks.Stop).toEqual([...userGroups, managedGroup(`node "${nextRelay}"`)]);
+    for (const event of EVENTS) expect(json.hooks[event].filter((g: unknown) => JSON.stringify(g) === JSON.stringify(managedGroup(`node "${nextRelay}"`)))).toHaveLength(1);
+    const trust = computeCodexHookTrust("Stop", { keySource: HOOKS, command: `node "${nextRelay}"`, timeoutSec: 5, statusMessage: "OpenRig activity", groupIndex: 3 });
+    expect((parseToml(fs._store[CONFIG]!).hooks as any).state[trust.key].trusted_hash).toBe(trust.hash);
+  });
+
+  it("migrates legacy TOML hooks and carries an operator disable into the JSON identity", () => {
+    const fs = mockCodexFs({ [RELAY]: "// relay" });
+    const adapter = makeAdapter(fs);
+    adapter.ensureCodexActivityHooks();
+    const legacyKey = `${CONFIG}:stop:0:0`;
+    fs._store[CONFIG] = fs._store[CONFIG]!.replace(`[hooks.state.${JSON.stringify(legacyKey)}]`, `[hooks.state.${JSON.stringify(legacyKey)}]\nenabled = false`);
+    const userGroup = { hooks: [{ type: "command", command: "/user/guard" }] };
+    fs._store[HOOKS] = JSON.stringify({ description: "Keep me", hooks: { Stop: [userGroup] } });
+    adapter.ensureCodexActivityHooks();
+    const config = fs._store[CONFIG]!;
+    expect(config).not.toContain("# BEGIN OPENRIG MANAGED ACTIVITY HOOKS");
+    const parsed = parseToml(config).hooks as any;
+    expect(parsed.Stop).toBeUndefined();
+    const expected = computeCodexHookTrust("Stop", { keySource: HOOKS, command: `node "${RELAY}"`, timeoutSec: 5, groupIndex: 1, statusMessage: "OpenRig activity" });
+    expect(parsed.state[expected.key]).toEqual({ enabled: false, trusted_hash: expected.hash });
+    expect(JSON.parse(fs._store[HOOKS]!).hooks.Stop).toEqual([userGroup, managedGroup()]);
+    const once = { ...fs._store };
+    adapter.ensureCodexActivityHooks();
+    expect(fs._store).toEqual(once);
+  });
+
+  it("preserves user inline hooks while warning that their mixed format remains", () => {
+    const userInline = '[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "/user/inline"\n';
+    const fs = mockCodexFs({ [RELAY]: "// relay", [CONFIG]: userInline, [HOOKS]: '{"hooks":{}}' });
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      makeAdapter(fs).ensureCodexActivityHooks();
+      expect(fs._store[CONFIG]).toContain(userInline);
+      expect(fs._store[CONFIG]).not.toContain("# BEGIN OPENRIG MANAGED ACTIVITY HOOKS");
+      expect(JSON.parse(fs._store[HOOKS]!).hooks.Stop).toEqual([managedGroup()]);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("user-authored inline Codex hooks remain"));
+    } finally { warn.mockRestore(); }
+  });
+
+  it("disables both representations in the selected home and preserves all native state", () => {
+    const selected = "/selected-codex";
+    const selectedConfig = `${selected}/config.toml`;
+    const selectedHooks = `${selected}/hooks.json`;
+    const fs = mockCodexFs({ [RELAY]: "// relay", [HOOKS]: '{"hooks":{}}' });
+    const adapter = new CodexRuntimeAdapter({ tmux: mockTmux(), fsOps: fs, activityRelayPath: RELAY, codexHome: selected });
+    adapter.ensureCodexActivityHooks();
+    const legacy = fs._store[selectedConfig]!;
+    fs._store[selectedHooks] = JSON.stringify({ hooks: { Stop: [managedGroup(), { ...managedGroup(), matcher: "Bash" }] } });
+    const state = '[hooks.state."user-key"]\nenabled = false\ntrusted_hash = "sha256:user"\n';
+    fs._store[selectedConfig] = `${legacy}\n${state}`;
+    adapter.removeCodexActivityHooks();
+    expect(fs._store[selectedConfig]).not.toContain("# BEGIN OPENRIG MANAGED ACTIVITY HOOKS");
+    expect(fs._store[selectedConfig]).toContain(state);
+    expect(JSON.parse(fs._store[selectedHooks]!).hooks.Stop).toEqual([{ ...managedGroup(), matcher: "Bash" }]);
+    expect(fs._store[HOOKS]).toBe('{"hooks":{}}');
+    const once = { ...fs._store };
+    adapter.removeCodexActivityHooks();
+    expect(fs._store).toEqual(once);
+  });
+
+  it("uses the real inline group index when user groups precede the managed block", () => {
+    const fs = mockCodexFs({ [RELAY]: "// relay", [CONFIG]: '[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "/user/guard"\n' });
+    makeAdapter(fs).ensureCodexActivityHooks();
+    const state = (parseToml(fs._store[CONFIG]!).hooks as any).state;
+    expect(state[`${CONFIG}:stop:1:0`]).toBeDefined();
+    expect(state[`${CONFIG}:stop:0:0`]).toBeUndefined();
+  });
+});
+
 describe("OPR.0.4.1.10 FR-A — Codex config-layer activity hooks", () => {
+  it("keeps an existing hooks.json active instead of adding competing inline hooks", () => {
+    const userGroup = { matcher: "Bash", hooks: [{ type: "command", command: "/user/guard" }] };
+    const userJson = { description: "User safety hooks", hooks: { PreToolUse: [userGroup], Stop: [userGroup] } };
+    const fs = mockCodexFs({ [RELAY]: "// relay", [HOOKS]: JSON.stringify(userJson) });
+    makeAdapter(fs).ensureCodexActivityHooks();
+
+    const json = JSON.parse(fs._store[HOOKS]!);
+    expect(json.description).toBe("User safety hooks");
+    expect(json.hooks.PreToolUse).toEqual([userGroup]);
+    expect(json.hooks.Stop[0]).toEqual(userGroup);
+    expect(json.hooks.Stop[1].hooks).toEqual([{ type: "command", command: `node "${RELAY}"`, timeout: 5, statusMessage: "OpenRig activity" }]);
+    const config = parseToml(fs._store[CONFIG]!) as any;
+    expect(config.hooks.Stop).toBeUndefined();
+    expect(config.hooks.state[`${HOOKS}:stop:1:0`].trusted_hash).toMatch(/^sha256:/);
+    expect(config.hooks.state[`${HOOKS}:stop:0:0`]).toBeUndefined();
+  });
+
   it("writes inline [hooks] for all four events with the absolute relay command + timeout", () => {
     const fs = mockCodexFs({ [RELAY]: "// relay" });
     makeAdapter(fs).ensureCodexActivityHooks();
