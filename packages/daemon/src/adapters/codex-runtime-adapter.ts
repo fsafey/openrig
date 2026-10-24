@@ -227,8 +227,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
 
   /**
    * OPR.0.4.1.10 FR-A — write the OpenRig activity hooks into Codex's config layer
-   * (`~/.codex/config.toml` inline `[hooks]`) so an OpenRig-launched Codex seat is
-   * hook-PRIMARY from clean shipped config. Idempotent managed-block upsert for the
+   * using an existing `hooks.json`, otherwise inline `config.toml` hooks. This avoids
+   * introducing mixed representations. Idempotently provisions the
    * four events SessionStart / UserPromptSubmit / Stop / PermissionRequest; each
    * command is `node "<activityRelayPath>"` (the daemon's OWN shipped relay, FR-B —
    * cwd-independent, version-matched, NOT `${PLUGIN_ROOT}` nor a per-cwd copy). Also
@@ -256,6 +256,11 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
     const configPath = this.resolveCodexConfigPath();
     const existing = this.fs.exists(configPath) ? this.fs.readFile(configPath) : "";
+    const hooksPath = nodePath.join(nodePath.dirname(configPath), "hooks.json");
+    if (this.fs.exists(hooksPath)) {
+      this.ensureCodexJsonActivityHooks(existing, configPath, hooksPath, relay);
+      return;
+    }
     const withHooks = upsertCodexActivityHooks(existing, relay);
     if (withHooks !== existing) {
       this.fs.mkdirp(nodePath.dirname(configPath));
@@ -275,6 +280,61 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
   }
 
+  private ensureCodexJsonActivityHooks(existing: string, configPath: string, hooksPath: string, relay: string): void {
+    const originalJson = this.fs.readFile(hooksPath);
+    try {
+      const document = parseCodexHooksJson(originalJson);
+      const command = `node "${relay}"`;
+      const inline = parseToml(existing);
+      const legacyCommands = managedCodexActivityCommands(existing);
+      const groups = document.hooks as Record<string, unknown[]>;
+      let config = upsertCodexFeaturesHooksEnabled(safelyStripCodexActivityHooks(existing));
+      const remainingHooks = parseToml(config).hooks as Record<string, unknown> | undefined;
+      if (Object.values(remainingHooks ?? {}).some(value => Array.isArray(value) && value.length > 0)) {
+        console.error(`[openrig] user-authored inline Codex hooks remain in ${configPath}; Codex may still warn about mixed hook formats`);
+      }
+      for (const event of OPENRIG_ACTIVITY_HOOK_EVENTS) {
+        const entries = groups[event] ?? [];
+        // The native status label plus the exact generated shape identifies this one
+        // managed installation, including a relay moved by a package upgrade.
+        const index = entries.findIndex(group => isMarkedCodexActivityGroup(group)
+          || [command, ...legacyCommands].some(c => isCodexActivityGroup(group, c)));
+        const groupIndex = index < 0 ? entries.length : index;
+        const prior = index < 0 ? undefined : entries[index] as { hooks: { command: string; statusMessage?: string }[] };
+        const oldCommand = prior?.hooks[0]!.command ?? command;
+        entries[groupIndex] = codexActivityGroup(command, true);
+        groups[event] = entries;
+        const source = canonicalCodexHookSource(hooksPath);
+        const oldTrust = computeCodexHookTrust(event, { keySource: source, command: oldCommand, timeoutSec: 5, groupIndex, statusMessage: prior?.hooks[0]!.statusMessage });
+        const trust = computeCodexHookTrust(event, { keySource: source, command, timeoutSec: 5, groupIndex, statusMessage: OPENRIG_ACTIVITY_STATUS });
+        const priorHashes = [oldTrust.hash];
+        // Carry native state (including an explicit disable) from the exact legacy group.
+        const inlineGroups = ((inline.hooks as Record<string, unknown> | undefined)?.[event] ?? []) as unknown[];
+        const legacyIndex = inlineGroups.findIndex(group => legacyCommands.some(c => isCodexActivityGroup(group, c)));
+        if (legacyIndex >= 0) {
+          const legacy = computeCodexHookTrust(event, {
+            keySource: canonicalCodexHookSource(configPath),
+            command: (inlineGroups[legacyIndex] as { hooks: { command: string }[] }).hooks[0]!.command,
+            timeoutSec: 5, groupIndex: legacyIndex,
+          });
+          priorHashes.push(legacy.hash);
+          config = copyCodexHookState(config, legacy.key, trust.key);
+        }
+        config = upsertOwnedCodexHookTrust(config, trust.key, trust.hash, priorHashes);
+      }
+      const json = `${JSON.stringify(document, null, 2)}\n`;
+      parseToml(config); // Never publish JSON alongside malformed native trust tables.
+      // Write the replacement first. A failed JSON write must not remove legacy hooks.
+      if (json !== originalJson) this.fs.writeFile(hooksPath, json);
+      if (config !== existing) {
+        this.fs.mkdirp(nodePath.dirname(configPath));
+        this.fs.writeFile(configPath, config);
+      }
+    } catch (error) {
+      console.error(`[openrig] codex activity hooks skipped: ${hooksPath}: ${(error as Error).message}`);
+    }
+  }
+
   /**
    * OPR.0.4.3.33 — compute + splice Codex's `[hooks.state."<key>"] trusted_hash` for our 4
    * authored activity hooks into `content`. `key_source` is the canonicalized config path
@@ -286,17 +346,13 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
    * `node "<relay>"` WITHOUT the outer TOML quote delimiters. Timeout=5, matcher/status None.
    */
   private applyCodexActivityHookTrust(content: string, configPath: string, relay: string): string {
-    let keySource = configPath;
-    try {
-      keySource = fs.realpathSync.native(configPath);
-    } catch {
-      // config.toml not on the real filesystem (first write / unit-test mock fs) — the plain
-      // absolute path is the honest best guess; a canonicalization delta is fail-safe (gate reappears).
-    }
+    const keySource = canonicalCodexHookSource(configPath);
     const command = `node "${relay}"`;
+    const hooks = parseToml(content).hooks as Record<string, unknown[]>;
     let next = content;
     for (const event of OPENRIG_ACTIVITY_HOOK_EVENTS) {
-      const { key, hash } = computeCodexHookTrust(event, { keySource, command, timeoutSec: 5 });
+      const groupIndex = hooks[event]!.findIndex(group => isCodexActivityGroup(group, command));
+      const { key, hash } = computeCodexHookTrust(event, { keySource, command, timeoutSec: 5, groupIndex });
       next = upsertCodexHookTrust(next, key, hash);
     }
     return next;
@@ -304,16 +360,44 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
 
   /**
    * OPR.0.4.1.10 B3 — durable disable. When runtime.codex.hooks_enabled is false, strip the
-   * OpenRig-managed activity-hooks sentinel block from ~/.codex/config.toml so a seat that was
+   * OpenRig-managed groups from hooks.json and the config.toml sentinel block so a seat that was
    * previously provisioned with hooks does not keep firing them after the operator disables.
-   * Removes ONLY the managed block — preserves any user-owned hooks and leaves [features].hooks
+   * Preserves user-owned hooks and native enabled/trust state, and leaves [features].hooks
    * (the Codex 0.139 default) intact. Idempotent; no-op when the config or the block is absent.
    */
   removeCodexActivityHooks(): void {
     const configPath = this.resolveCodexConfigPath();
-    if (!this.fs.exists(configPath)) return;
-    const existing = this.fs.readFile(configPath);
-    const updated = stripCodexActivityHooks(existing);
+    const existing = this.fs.exists(configPath) ? this.fs.readFile(configPath) : "";
+    let config = existing;
+    const hooksPath = nodePath.join(nodePath.dirname(configPath), "hooks.json");
+    if (this.fs.exists(hooksPath)) {
+      try {
+        const original = this.fs.readFile(hooksPath);
+        const document = parseCodexHooksJson(original);
+        const commands = [this.activityRelayPath ? `node "${this.activityRelayPath}"` : undefined, ...managedCodexActivityCommands(existing)];
+        const hooks = document.hooks as Record<string, unknown[]>;
+        let changed = false;
+        for (const event of OPENRIG_ACTIVITY_HOOK_EVENTS) {
+          if (!hooks[event]) continue;
+          const entries = hooks[event]!;
+          const keep = entries.map(group => !isMarkedCodexActivityGroup(group)
+            && !commands.some(command => typeof command === "string" && isCodexActivityGroup(group, command)));
+          const remaining = entries.filter((_, index) => keep[index]);
+          if (remaining.length !== entries.length) {
+            changed = true;
+            config = reindexCodexHookState(config, canonicalCodexHookSource(hooksPath), event, keep);
+            hooks[event] = remaining;
+          }
+        }
+        config = safelyStripCodexActivityHooks(config);
+        parseToml(config);
+        if (changed) this.fs.writeFile(hooksPath, `${JSON.stringify(document, null, 2)}\n`);
+      } catch (error) {
+        console.error(`[openrig] codex activity hook removal skipped: ${hooksPath}: ${(error as Error).message}`);
+        return;
+      }
+    }
+    const updated = stripCodexActivityHooks(config);
     if (updated !== existing) {
       this.fs.writeFile(configPath, updated);
     }
@@ -1118,15 +1202,13 @@ function upsertCodexProjectTrust(content: string, projectPath: string): string {
 //
 // KEY — codex-rs/hooks/src/lib.rs `hook_key`:
 //   `{key_source}:{event_label}:{group_index}:{handler_index}`
-//   - key_source: `std::fs::canonicalize(~/.codex/config.toml).display()` (the config source
+//   - key_source: the canonicalized hooks.json or config.toml path (the config source
 //     layer identity; confirmed by codex-rs/app-server/tests/suite/v2/hooks_list.rs which keys
 //     `{canonicalize(config.toml).display()}:pre_tool_use:0:0`).
 //   - event_label: `hook_event_key_label()` — SessionStart→session_start,
 //     UserPromptSubmit→user_prompt_submit, Stop→stop, PermissionRequest→permission_request.
-//   - group_index/handler_index: positional. Our managed block writes exactly one
-//     `[[hooks.<Ev>]]` group (0) with one `[[hooks.<Ev>.hooks]]` handler (0) per event ⇒ 0:0.
-//     (Positional keying is a known upstream fragility (#23259); if a user pre-authored hooks
-//     for the same event in the same layer our index would shift → gate reappears → fail-safe.)
+//   - group_index/handler_index: positional. Provisioning computes the actual group
+//     index alongside user groups; our one generated handler is always index 0.
 //
 // HASH — codex-rs/hooks/src/engine/discovery.rs `command_hook_hash`
 //        → codex-rs/config/src/fingerprint.rs `version_for_toml`:
@@ -1168,7 +1250,7 @@ const CODEX_HOOK_EVENT_KEY_LABEL: Record<(typeof OPENRIG_ACTIVITY_HOOK_EVENTS)[n
 };
 
 export interface CodexHookTrustInput {
-  /** Codex hook_key source identity: canonicalized `~/.codex/config.toml` path. */
+  /** Codex hook_key source identity: canonicalized hooks.json or config.toml path. */
   keySource: string;
   /** The command as Codex DESERIALIZES it — `node "<relay>"` (no outer TOML quote delimiters). */
   command: string;
@@ -1178,7 +1260,7 @@ export interface CodexHookTrustInput {
   matcher?: string | null;
   /** None for our hooks; folded into the hash when present. */
   statusMessage?: string | null;
-  /** Positional group index within the event's matcher-group list (our hooks: 0). */
+  /** Positional group index within the event's matcher-group list. */
   groupIndex?: number;
   /** Positional handler index within the group's handler list (our hooks: 0). */
   handlerIndex?: number;
@@ -1321,12 +1403,182 @@ function upsertCodexHooksFeature(content: string): string {
 const OPENRIG_ACTIVITY_HOOKS_BEGIN = "# BEGIN OPENRIG MANAGED ACTIVITY HOOKS";
 const OPENRIG_ACTIVITY_HOOKS_END = "# END OPENRIG MANAGED ACTIVITY HOOKS";
 const OPENRIG_ACTIVITY_HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest"] as const;
+const OPENRIG_ACTIVITY_STATUS = "OpenRig activity";
+
+function canonicalCodexHookSource(path: string): string {
+  try { return fs.realpathSync.native(path); } catch { return path; }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseCodexHooksJson(content: string): Record<string, unknown> {
+  const value: unknown = JSON.parse(content);
+  if (isRecord(value) && value.hooks === undefined) value.hooks = {};
+  if (!isRecord(value) || !isRecord(value.hooks)
+    || Object.values(value.hooks).some(groups => !Array.isArray(groups)
+      || groups.some(group => !isRecord(group) || !Array.isArray(group.hooks)))) {
+    throw new Error("expected a hooks object containing matcher-group arrays; file left untouched");
+  }
+  return value;
+}
+
+function codexActivityGroup(command: string, marked = false): { hooks: Record<string, unknown>[] } {
+  return { hooks: [{ type: "command", command, timeout: 5, ...(marked ? { statusMessage: OPENRIG_ACTIVITY_STATUS } : {}) }] };
+}
+
+function isCodexActivityGroup(value: unknown, command: string, marked = false): boolean {
+  if (!isRecord(value) || Object.keys(value).length !== 1 || !Array.isArray(value.hooks) || value.hooks.length !== 1) return false;
+  const handler: unknown = value.hooks[0];
+  return isRecord(handler) && Object.keys(handler).length === (marked ? 4 : 3)
+    && handler.type === "command" && handler.command === command && handler.timeout === 5
+    && (!marked || handler.statusMessage === OPENRIG_ACTIVITY_STATUS);
+}
+
+function isMarkedCodexActivityGroup(value: unknown): boolean {
+  if (!isRecord(value) || !Array.isArray(value.hooks) || !isRecord(value.hooks[0])) return false;
+  const command = value.hooks[0].command;
+  return typeof command === "string" && /^node "(?:\/|[A-Za-z]:[\\/]).*activity-relay\.cjs"$/.test(command)
+    && isCodexActivityGroup(value, command, true);
+}
+
+/** Only sentinel-owned commands count as evidence of an old managed relay. */
+function managedCodexActivityCommands(content: string): string[] {
+  const begin = content.indexOf(OPENRIG_ACTIVITY_HOOKS_BEGIN);
+  const end = content.indexOf(OPENRIG_ACTIVITY_HOOKS_END, begin);
+  if (begin < 0 || end < 0) return [];
+  const parsed = parseToml(content.slice(begin, end));
+  const hooks = parsed.hooks as Record<string, unknown[]> | undefined;
+  return OPENRIG_ACTIVITY_HOOK_EVENTS.flatMap(event => (hooks?.[event] ?? []).flatMap(group => {
+    if (!isRecord(group) || !Array.isArray(group.hooks) || !isRecord(group.hooks[0])) return [];
+    const command = group.hooks[0].command;
+    return typeof command === "string" && isCodexActivityGroup(group, command) ? [command] : [];
+  }));
+}
+
+/** Preserve operator-authored state. Refresh only a hash that matches our previous identity. */
+function upsertOwnedCodexHookTrust(content: string, key: string, hash: string, previousHashes: string[]): string {
+  const state = (parseToml(content).hooks as { state?: Record<string, { trusted_hash?: string }> } | undefined)?.state?.[key];
+  if (state) codexHookStateSection(content, key);
+  if (state && state.trusted_hash !== undefined && !previousHashes.includes(state.trusted_hash)) return content;
+  const result = upsertCodexHookTrust(content, key, hash);
+  assertCodexHookStateChange(content, result, state => {
+    state[key] = { ...state[key], trusted_hash: hash };
+  });
+  return result;
+}
+
+/** Move the native state table verbatim, retaining enabled=false and future native fields. */
+function copyCodexHookState(content: string, from: string, to: string): string {
+  const state = (parseToml(content).hooks as { state?: Record<string, unknown> } | undefined)?.state;
+  if (state?.[to]) { codexHookStateSection(content, to); return content; }
+  if (!state?.[from]) return content;
+  const { body } = codexHookStateSection(content, from);
+  const result = `${content.trimEnd()}\n\n[hooks.state.${JSON.stringify(to)}]\n${body}\n`;
+  assertCodexHookStateChange(content, result, snapshot => { snapshot[to] = snapshot[from]!; });
+  return result;
+}
+
+/** Textual state edits must have exactly their intended parsed effect, even inside strings. */
+function assertCodexHookStateChange(content: string, result: string, change: (state: Record<string, Record<string, unknown>>) => void): void {
+  const expected = parseToml(content);
+  const hooks = (expected.hooks ??= {}) as Record<string, unknown>;
+  const state = (hooks.state ??= {}) as Record<string, Record<string, unknown>>;
+  change(state);
+  if (JSON.stringify(canonicalizeJsonValue(expected)) !== JSON.stringify(canonicalizeJsonValue(parseToml(result)))) {
+    throw new Error("hook state table overlaps user configuration; files left untouched");
+  }
+}
+
+function codexHookStateSection(content: string, key: string): { start: number; end: number; body: string } {
+  const lines = content.split("\n");
+  const start = lines.findIndex(line => line.trim() === `[hooks.state.${JSON.stringify(key)}]`);
+  if (start < 0) throw new Error("noncanonical hook state table spelling; files left untouched");
+  let end = start + 1;
+  while (end < lines.length && !lines[end]!.trim().startsWith("[")) end++;
+  const body = lines.slice(start + 1, end).join("\n").trimEnd();
+  return { start, end, body };
+}
+
+/** Move user state with its group, retaining our state at the future append position. */
+function reindexCodexHookState(content: string, source: string, event: (typeof OPENRIG_ACTIVITY_HOOK_EVENTS)[number], keep: boolean[]): string {
+  const state = (parseToml(content).hooks as { state?: Record<string, unknown> } | undefined)?.state ?? {};
+  const prefix = `${source}:${CODEX_HOOK_EVENT_KEY_LABEL[event]}:`;
+  const replacements: { start: number; end: number; text: string }[] = [];
+  let newIndex = 0;
+  const indices = keep.map(retained => retained ? newIndex++ : -1);
+  if (keep.filter(retained => !retained).length > 1) {
+    throw new Error("multiple managed hook groups have ambiguous native state; files left untouched");
+  }
+  const ownedIndex = indices.indexOf(-1);
+  if (ownedIndex >= 0) indices[ownedIndex] = newIndex;
+  for (const key of Object.keys(state)) {
+    if (!key.startsWith(prefix)) continue;
+    const match = /^(\d+):(\d+)$/.exec(key.slice(prefix.length));
+    if (!match) continue;
+    const oldIndex = Number(match[1]);
+    if (oldIndex >= keep.length || indices[oldIndex] === oldIndex) continue;
+    const section = codexHookStateSection(content, key);
+    const target = `${prefix}${indices[oldIndex]}:${match[2]}`;
+    replacements.push({ ...section, text: `[hooks.state.${JSON.stringify(target)}]\n${section.body}\n` });
+  }
+  const lines = content.split("\n");
+  for (const replacement of replacements.sort((a, b) => b.start - a.start)) {
+    lines.splice(replacement.start, replacement.end - replacement.start, replacement.text);
+  }
+  const result = lines.join("\n");
+  if (replacements.length) assertCodexHookStateChange(content, result, snapshot => {
+    const moved: Record<string, Record<string, unknown>> = {};
+    for (const [key, value] of Object.entries(snapshot)) {
+      if (!key.startsWith(prefix)) continue;
+      const match = /^(\d+):(\d+)$/.exec(key.slice(prefix.length));
+      if (!match) continue;
+      const oldIndex = Number(match[1]);
+      if (oldIndex >= keep.length || indices[oldIndex] === oldIndex) continue;
+      moved[`${prefix}${indices[oldIndex]}:${match[2]}`] = value;
+      delete snapshot[key];
+    }
+    Object.assign(snapshot, moved);
+  });
+  return result;
+}
+
+/** Refuse sentinel lookalikes in values and index changes to remaining inline user hooks. */
+function safelyStripCodexActivityHooks(content: string): string {
+  const stripped = stripCodexActivityHooks(content);
+  if (stripped === content) return content;
+  const before = parseToml(content);
+  const after = parseToml(stripped);
+  const commands = managedCodexActivityCommands(content);
+  const hooksBefore = before.hooks as Record<string, unknown> | undefined;
+  const hooksAfter = after.hooks as Record<string, unknown> | undefined;
+  if (!commands.length) throw new Error("ambiguous managed hook sentinel; files left untouched");
+  for (const event of OPENRIG_ACTIVITY_HOOK_EVENTS) {
+    const groups = hooksBefore?.[event];
+    if (!Array.isArray(groups)) continue;
+    const remaining = groups.filter(group => !commands.some(command => isCodexActivityGroup(group, command)));
+    if (JSON.stringify(remaining) !== JSON.stringify(hooksAfter?.[event] ?? [])) {
+      throw new Error("ambiguous managed hook sentinel; files left untouched");
+    }
+    if (remaining.some(group => groups.indexOf(group) !== remaining.indexOf(group))) {
+      throw new Error("removing managed inline hooks would shift user hook state; files left untouched");
+    }
+    if (remaining.length) hooksBefore![event] = remaining;
+    else delete hooksBefore![event];
+    if (Array.isArray(hooksAfter?.[event]) && hooksAfter![event].length === 0) delete hooksAfter![event];
+  }
+  if (JSON.stringify(canonicalizeJsonValue(before)) !== JSON.stringify(canonicalizeJsonValue(after))) {
+    throw new Error("managed hook sentinel overlaps user configuration; files left untouched");
+  }
+  return stripped;
+}
 
 /**
  * Idempotently write the OpenRig activity hooks into a Codex config.toml: pin
  * `[features].hooks = true` (canonical key) and a sentinel-wrapped managed block of
- * inline `[[hooks.<Event>]]` stanzas (one representation per layer — never a sibling
- * hooks.json). Re-running with the same relay path is a no-op; a changed daemon path
+ * inline `[[hooks.<Event>]]` stanzas when no sibling hooks.json exists.
+ * Re-running with the same relay path is a no-op; a changed daemon path
  * replaces the block. `command` is a TOML literal string so the absolute relay path
  * needs no escaping; the inner double-quotes quote the path arg for the shell Codex
  * runs the hook under. No matcher (verified on 0.139: no-matcher fires for every
