@@ -507,7 +507,7 @@ identity remains unverified; a version number alone cannot clear it.
   // Thin CLI over the daemon's SeatLifecycleService; refusals print message +
   // guidance + match list exactly as the daemon named them.
   const runLifecycleVerb = async (
-    path: "set-model" | "set-effort" | "set-permissions" | "launch" | "launch-plan" | "continue" | "stop" | "clean" | "restart" | "restart-plan" | "restart-verify",
+    path: "set-model" | "set-cwd" | "set-effort" | "set-permissions" | "launch" | "launch-plan" | "continue" | "stop" | "clean" | "restart" | "restart-plan" | "restart-verify",
     seat: string,
     body: Record<string, unknown>,
     opts: { json?: boolean },
@@ -685,6 +685,26 @@ resume/successor launch reads it at call time. Examples:
         }
         console.log(`Model for ${s?.logicalId}@${s?.rigName}: ${String(data["from"] ?? "none")} -> ${String(data["to"])} (audited).`);
         console.log("The next managed resume/successor launch composes the new model.");
+      });
+    });
+
+  cmd
+    .command("set-cwd")
+    .argument("<seat>", "Canonical session name or logical seat ref")
+    .requiredOption("--cwd <path>", "Absolute target checkout directory")
+    .requiredOption("--expected-cwd <path>", "Current stored cwd, checked before saving")
+    .requiredOption("--expected-node-id <id>", "Existing stable node id, checked before saving")
+    .requiredOption("--spec <path>", "Absolute maintained rig declaration with this member's target cwd")
+    .requiredOption("--reason <text>", "Audit reason for the cwd change")
+    .option("--operator <address>", "Operator identity when outside a managed seat")
+    .option("--json", "JSON output for agents")
+    .description("Save one seat's future launch cwd and refresh its startup selection; leave the running process unchanged")
+    .addHelpText("after", "\nThe declaration is read only for the selected member. Model, permissions, identity and history are retained.\nNo process is stopped or launched, no target file is projected, and context consumption is not claimed.\nUpdate the maintained declaration first. A later managed continuation and native cwd/context readback are separate steps.")
+    .action(async (seat: string, opts: { cwd: string; expectedCwd: string; expectedNodeId: string; spec: string; reason: string; operator?: string; json?: boolean }) => {
+      await runLifecycleVerb("set-cwd", seat, { cwd: opts.cwd, expectedCwd: opts.expectedCwd, expectedNodeId: opts.expectedNodeId,
+        spec: opts.spec, reason: opts.reason, operator: opts.operator }, opts, data => {
+        console.log(`Stored cwd: ${String(data["from"])} -> ${String(data["to"])} (${data["changed"] ? "audited" : "already saved"}).`);
+        console.log("Target startup selection prepared. The running process is unchanged; target context has not been consumed.");
       });
     });
 

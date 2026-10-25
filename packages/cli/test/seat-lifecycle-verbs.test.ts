@@ -73,6 +73,32 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("rig seat set-cwd", () => {
+  const args = ["node", "rig", "seat", "set-cwd", "design-aid@fixture", "--cwd", "/product", "--expected-cwd", "/operations",
+    "--expected-node-id", "stable-node", "--spec", "/team/rig.yaml", "--reason", "assigned worktree", "--operator", "lead@fixture"];
+  it("posts one scoped cwd change and distinguishes stored settings from the running process", async () => {
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const data = { ok: true, changed: true, from: "/operations", to: "/product", liveProcess: "unchanged", context: "prepared_not_consumed" };
+    const { logs, exitCode } = await captureLogs(() => makeCommand(makeDeps({ status: 200, data }, calls)).parseAsync(args).then(() => {}));
+    expect(exitCode).toBeUndefined();
+    expect(calls).toEqual([{ path: "/api/seat/set-cwd/design-aid%40fixture", body: {
+      cwd: "/product", expectedCwd: "/operations", expectedNodeId: "stable-node", spec: "/team/rig.yaml", reason: "assigned worktree", operator: "lead@fixture",
+    } }]);
+    expect(logs.join("\n")).toContain("running process is unchanged");
+    expect(logs.join("\n")).toContain("has not been consumed");
+  });
+  it("returns a nonzero exit and the original JSON on a stale baseline or older daemon", async () => {
+    for (const status of [404, 409]) {
+      const data = { ok: false, code: "cwd_baseline_changed", message: "Inspect current settings." };
+      const calls: Array<{ path: string; body: unknown }> = [];
+      const result = await captureLogs(() => makeCommand(makeDeps({ status, data }, calls)).parseAsync([...args, "--json"]).then(() => {}));
+      expect(result.exitCode).toBe(1);
+      expect(JSON.parse(result.logs[0]!)).toEqual(data);
+      expect(calls).toHaveLength(1);
+    }
+  });
+});
+
 describe("#729 startup warnings", () => {
   it.each([[200, false], [200, true], [409, false], [409, true]] as const)("seat launch retains warnings and HTTP %s (json=%s)", async (status, json) => {
     const warning = "Startup submission unverified: capture unavailable";

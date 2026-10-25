@@ -33,6 +33,8 @@ import {
 } from "./native-process-lineage.js";
 import { defaultInPlaceRestartIo } from "./seat-restart-in-place.js";
 import nodePath from "node:path";
+import { statSync } from "node:fs";
+import type { PodRigInstantiator } from "./rigspec-instantiator.js";
 import {
   CodexInPlaceRestart, type InPlaceCodexLauncher, type InPlaceRestartIo, type InPlaceRestartRefusal,
   type InPlaceRestartReport, type InPlaceRestartTarget, type InPlaceVerifyResult,
@@ -76,6 +78,7 @@ export interface SeatLifecycleDeps {
   inPlaceRestartDaemonStartedAt?: Date;
   /** Where a session's native transcript is (the context-usage store); without it native effort is NOT VERIFIED. */
   transcripts?: { readSidecar(sessionName: string): { ok: true; data: { transcript_path?: string | null; session_id?: string | null } } | { ok: false }; readCodexTranscriptPath(threadId: string): string | null };
+  cwdContextPreparer?: Pick<PodRigInstantiator, "prepareSeatCwd">;
 }
 
 interface ResolvedSeat {
@@ -115,7 +118,12 @@ export interface SeatRefusal {
     | "invalid_effort"
     | "effort_unsupported_runtime"
     | "effort_unavailable"
-    | "invalid_policy";
+    | "invalid_policy"
+    | "invalid_cwd"
+    | "cwd_baseline_changed"
+    | "cwd_context_unavailable"
+    | "cwd_change_failed"
+    | "missing_operator";
   message: string;
   guidance?: string;
   matches?: Array<{ rig_name: string; logical_id: string; current_occupant: string | null }>;
@@ -133,6 +141,11 @@ export interface SeatDescriptor {
 
 export type SetModelResult =
   | { ok: true; seat: SeatDescriptor; from: string | null; to: string; changed: boolean }
+  | SeatRefusal;
+
+export type SetCwdResult =
+  | { ok: true; seat: SeatDescriptor; from: string | null; to: string; changed: boolean;
+      liveProcess: "unchanged"; context: "prepared_not_consumed"; warnings: string[] }
   | SeatRefusal;
 
 export type SetPolicyResult =
@@ -249,6 +262,7 @@ export class SeatLifecycleService {
   private readonly inPlaceRestartTiming?: Partial<PaneCutoverTiming>;
   private readonly inPlaceRestartDaemonStartedAt?: Date;
   private readonly transcripts: SeatLifecycleDeps["transcripts"] | null;
+  private readonly cwdContextPreparer: SeatLifecycleDeps["cwdContextPreparer"];
 
   constructor(deps: SeatLifecycleDeps) {
     if (deps.db !== deps.rigRepo.db) throw new Error("SeatLifecycleService: rigRepo must share the same db handle");
@@ -269,6 +283,60 @@ export class SeatLifecycleService {
     this.inPlaceRestartTiming = deps.inPlaceRestartTiming;
     this.inPlaceRestartDaemonStartedAt = deps.inPlaceRestartDaemonStartedAt;
     this.transcripts = deps.transcripts ?? null;
+    this.cwdContextPreparer = deps.cwdContextPreparer;
+  }
+
+  async setCwd(input: { seatRef: string; cwd: string; expectedCwd: string; expectedNodeId: string; spec: string;
+    reason: string; operator: string }): Promise<SetCwdResult> {
+    const required = this.requireReason(input.reason);
+    if (required) return required;
+    if (!input.operator?.trim()) return { ok: false, code: "missing_operator", message: "A sender identity or --operator is required." };
+    if (!input.cwd || !nodePath.isAbsolute(input.cwd) || !input.expectedCwd || !nodePath.isAbsolute(input.expectedCwd)
+      || !input.expectedNodeId || !input.spec || !nodePath.isAbsolute(input.spec)) {
+      return { ok: false, code: "invalid_cwd", message: "Supply absolute --cwd, --expected-cwd and --spec paths, and --expected-node-id." };
+    }
+    try {
+      if (!statSync(input.cwd).isDirectory()) throw new Error("not a directory");
+    } catch {
+      return { ok: false, code: "invalid_cwd", message: "The target cwd must be an existing accessible directory." };
+    }
+    const resolved = this.resolveSeat(input.seatRef);
+    if ("code" in resolved) return resolved;
+    const guard = this.tmuxAdapter.deliveryGuard;
+    if (guard && !guard.ownsLifecycle(resolved.nodeId)) return guard.lifecycle([resolved.nodeId], () => this.setCwd(input));
+    const seat = this.describe(resolved);
+    const node = this.rigRepo.getRig(seat.rigId)?.nodes.find(n => n.id === seat.nodeId);
+    if (!node || node.id !== input.expectedNodeId || node.cwd !== input.expectedCwd) {
+      return { ok: false, code: "cwd_baseline_changed", message: "The seat identity or stored cwd differs from the expected baseline; inspect it before retrying." };
+    }
+    if (!this.cwdContextPreparer) return { ok: false, code: "cwd_context_unavailable", message: "This daemon cannot prepare startup context for a cwd change." };
+    const cwd = nodePath.resolve(input.cwd);
+    const prepared = this.cwdContextPreparer.prepareSeatCwd({ rigId: seat.rigId, nodeId: node.id, cwd, spec: input.spec });
+    if (!prepared.ok) return { ok: false, code: "cwd_context_unavailable", message: prepared.message };
+    const contextValues = [JSON.stringify(prepared.context.projectionEntries), JSON.stringify(prepared.context.resolvedStartupFiles),
+      JSON.stringify(prepared.context.startupActions), prepared.context.runtime];
+    const currentContext = this.db.prepare("SELECT projection_entries_json, resolved_files_json, startup_actions_json, runtime FROM node_startup_context WHERE node_id = ?")
+      .get(node.id) as { projection_entries_json: string; resolved_files_json: string; startup_actions_json: string; runtime: string } | undefined;
+    if (node.cwd === cwd && currentContext && JSON.stringify(Object.values(currentContext)) === JSON.stringify(contextValues)) {
+      return { ok: true, seat, from: node.cwd, to: cwd, changed: false,
+        liveProcess: "unchanged", context: "prepared_not_consumed", warnings: prepared.warnings };
+    }
+    let event: PersistedEvent | null = null;
+    try {
+      this.db.transaction(() => {
+        if (!this.rigRepo.setNodeCwd(node.id, input.expectedCwd, cwd)) throw new Error("Stored cwd changed during preparation.");
+        this.db.prepare("INSERT OR REPLACE INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)")
+          .run(node.id, ...contextValues);
+        event = this.eventBus.persistWithinTransaction({ type: "node.cwd_changed", rigId: seat.rigId, nodeId: node.id,
+          logicalId: seat.logicalId, from: node.cwd, to: cwd, reason: input.reason.trim(), operator: input.operator.trim(), spec: input.spec,
+          contextHash: createHash("sha256").update(JSON.stringify(prepared.context)).digest("hex") });
+      })();
+    } catch (error) {
+      return { ok: false, code: "cwd_change_failed", message: `The cwd, startup context and audit were not committed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (event) this.eventBus.notifySubscribers(event);
+    return { ok: true, seat, from: node.cwd, to: cwd, changed: true, liveProcess: "unchanged",
+      context: "prepared_not_consumed", warnings: prepared.warnings };
   }
 
   async setModel(input: { seatRef: string; model: string; reason: string; operator?: string | null }): Promise<SetModelResult> {

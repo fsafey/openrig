@@ -450,6 +450,10 @@ directory's `CLAUDE.md`, including blocks written by other rigs.
 | `starter_ref` | object | no | — | `{ name }` of an agent starter (`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`) whose files lead the seat's startup. Not valid on terminal members or with a fork. |
 | `startup` | StartupBlock | no | — | Member-level startup files and actions. Applied only to this member. |
 
+For an existing seat, editing `cwd` here does not change its stored launch
+setting. Use [seat set-cwd](seat-working-directory.md) to apply that setting and
+prepare its startup selection without interrupting the incumbent process.
+
 ### Pi (`runtime: pi`)
 
 `runtime: pi` launches the Pi coding agent (`pi --mode rpc`) through OpenRig's RPC runner.
