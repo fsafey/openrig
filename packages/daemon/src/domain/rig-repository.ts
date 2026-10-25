@@ -349,6 +349,13 @@ export class RigRepository {
     this.db.prepare("UPDATE nodes SET permission_policy = ? WHERE id = ?").run(permissionPolicy, nodeId);
   }
 
+  /** Compare-and-set for the seat cwd command. Startup selection and audit are
+   * committed by its caller in the same transaction. */
+  setNodeCwd(nodeId: string, expected: string | null, cwd: string): boolean {
+    return this.db.prepare("UPDATE nodes SET cwd = ? WHERE id = ? AND cwd IS ?")
+      .run(cwd, nodeId, expected).changes === 1;
+  }
+
   /** Seam B (R2) — read a node's persisted policy provenance; null when none attached
    *  (or pre-057 DB). Restore consumers re-derive posture from this without the spec. */
   getNodePolicyProvenance(nodeId: string): {

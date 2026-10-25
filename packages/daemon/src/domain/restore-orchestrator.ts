@@ -846,8 +846,35 @@ export class RestoreOrchestrator {
     warnings?: string[],
   ): Promise<RestoreNodeResult> {
     // Compare against the live logical target without changing saved post-launch inputs.
+    const liveNode = this.rigRepo.getRig(rigId)?.nodes.find(current => current.logicalId === entry.node.logicalId);
+    // A supported cwd change is a current launch setting, like the stored model
+    // or permission selection. An older continuity snapshot must not send a
+    // resumed history back to its previous checkout or replay its old selection.
+    // Apply only to the same stable node; an identically named replacement is
+    // never authority to borrow this seat's context or native history.
+    if (liveNode?.id === entry.node.id) {
+      const change = this.db.prepare("SELECT payload FROM events WHERE node_id = ? AND type = 'node.cwd_changed' ORDER BY seq DESC LIMIT 1")
+        .get(liveNode.id) as { payload: string } | undefined;
+      if (change) {
+        try {
+          const saved = JSON.parse(change.payload) as { to: string };
+          if (saved.to !== liveNode.cwd) throw new Error("Stored cwd differs from its last audited change.");
+          const context = this.db.prepare("SELECT projection_entries_json, resolved_files_json, startup_actions_json, runtime FROM node_startup_context WHERE node_id = ?")
+            .get(liveNode.id) as { projection_entries_json: string; resolved_files_json: string; startup_actions_json: string; runtime: string } | undefined;
+          if (!context) throw new Error("The target startup selection is missing.");
+          const current = { projectionEntries: JSON.parse(context.projection_entries_json), resolvedStartupFiles: JSON.parse(context.resolved_files_json),
+            startupActions: JSON.parse(context.startup_actions_json), runtime: context.runtime };
+          if (current.runtime !== liveNode.runtime || !Array.isArray(current.projectionEntries)
+            || !Array.isArray(current.resolvedStartupFiles) || !Array.isArray(current.startupActions)) throw new Error("The target startup selection is malformed.");
+          entry = { ...entry, node: { ...entry.node, cwd: liveNode.cwd } };
+          data = { ...data, nodeStartupContext: { ...data.nodeStartupContext, [liveNode.id]: current } };
+        } catch (error) {
+          return { nodeId: liveNode.id, logicalId: liveNode.logicalId, status: "failed",
+            error: `Cannot restore changed cwd: ${error instanceof Error ? error.message : String(error)}` };
+        }
+      }
+    }
     const node = entry.node;
-    const liveNode = this.rigRepo.getRig(rigId)?.nodes.find(current => current.logicalId === node.logicalId);
     const nodeId = node.id;
 
     // OPR.0.5.7.1 (bought ordering blocker, baton 0efd154d): D1 present-map

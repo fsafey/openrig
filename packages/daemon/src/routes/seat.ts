@@ -241,16 +241,17 @@ export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifec
     occupantInvalidator: (c.get("occupantInvalidator" as never) as import("../domain/occupant-invalidator.js").OccupantInvalidator | undefined) ?? undefined,
     activityOracle: (c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined) ?? undefined,
     transcripts: (c.get("contextUsageStore" as never) as ContextUsageStore | undefined) ?? undefined,
+    cwdContextPreparer: (c.get("podInstantiator" as never) as import("../domain/rigspec-instantiator.js").PodRigInstantiator | undefined) ?? undefined,
   });
 }
 
 function seatLifecycleStatus(code: string): 400 | 404 | 409 | 500 | 502 {
   if (code === "seat_ref_required" || code === "missing_model" || code === "missing_reason" || code === "fresh_required"
-    || code === "missing_effort" || code === "invalid_effort" || code === "invalid_policy") return 400;
+    || code === "missing_effort" || code === "invalid_effort" || code === "invalid_policy" || code === "invalid_cwd" || code === "missing_operator") return 400;
   if (code === "seat_not_found") return 404;
   if (code === "tmux_probe_failed") return 502;
   if (code === "launch_unavailable" || code === "runtime_adapter_missing" || code === "launch_failed" || code === "startup_failed"
-    || code === "effort_unavailable") return 500;
+    || code === "effort_unavailable" || code === "cwd_change_failed") return 500;
   // seat_ambiguous / session_live / session_not_live / no_session / claimed_session /
   // nothing_to_clean — state conflicts, not client syntax errors.
   return 409;
@@ -290,6 +291,16 @@ seatRoutes.post("/set-model/:seatRef", async (c) => {
   });
   if (result.ok) return c.json(result);
   return c.json(result, seatLifecycleStatus(result.code));
+});
+
+seatRoutes.post("/set-cwd/:seatRef", async (c) => {
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  if (!body || Array.isArray(body)) return c.json({ error: "Expected a cwd change object." }, 400);
+  const text = (key: string) => typeof body[key] === "string" ? body[key] as string : "";
+  const result = await seatLifecycleService(c).setCwd({ seatRef: c.req.param("seatRef"), cwd: text("cwd"),
+    expectedCwd: text("expectedCwd"), expectedNodeId: text("expectedNodeId"), spec: text("spec"), reason: text("reason"),
+    operator: transportSenderSession(c) ?? text("operator") });
+  return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));
 });
 
 // OPR.0.7.0.7 — save (or, with clear: true, remove) one seat's effort choice for its next

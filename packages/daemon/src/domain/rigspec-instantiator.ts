@@ -487,6 +487,61 @@ export class PodRigInstantiator {
     this.deps = deps;
   }
 
+  /** Resolve one existing seat's startup selection against an explicitly supplied
+   * declaration and target checkout. Planning only: no projection, launch, policy
+   * mutation or change to any other member of the declaration. */
+  prepareSeatCwd(input: { rigId: string; nodeId: string; cwd: string; spec: string }):
+    { ok: true; context: import("./types.js").NodeStartupSnapshot; warnings: string[] }
+    | { ok: false; message: string } {
+    try {
+      const rig = this.deps.rigRepo.getRig(input.rigId);
+      const node = rig?.nodes.find(n => n.id === input.nodeId);
+      if (!rig || !node) return { ok: false, message: "The selected seat no longer exists." };
+      if (!nodePath.isAbsolute(input.spec)) return { ok: false, message: "Supply an absolute --spec path to the maintained rig declaration." };
+      const raw = PodRigSpecCodec.parse(this.deps.fsOps.readFile(input.spec));
+      const validation = PodRigSpecSchema.validate(raw);
+      if (!validation.valid) return { ok: false, message: validation.errors.join("; ") };
+      const spec = PodRigSpecSchema.normalize(raw as Record<string, unknown>);
+      const rigRoot = nodePath.dirname(input.spec);
+      const pod = spec.pods.find(p => p.members.some(m => `${p.id}.${m.id}` === node.logicalId));
+      const member = pod?.members.find(m => `${pod.id}.${m.id}` === node.logicalId);
+      if (spec.name !== rig.rig.name || !pod || !member || member.runtime !== node.runtime
+        || member.agentRef !== node.agentRef || member.profile !== node.profile
+        || (member.codexConfigProfile ?? null) !== (node.codexConfigProfile ?? null)) {
+        return { ok: false, message: "The declaration does not match the existing seat's rig, logical identity, runtime, agent reference and profile." };
+      }
+      if (resolveLaunchCwd(member.cwd, rigRoot) !== input.cwd) {
+        return { ok: false, message: "The maintained declaration's member cwd must agree with --cwd." };
+      }
+      if (member.starterRef || member.sessionSource || member.agentRef === "builtin:terminal") {
+        return { ok: false, message: "This context refresh supports ordinary agent seats; terminal and artifact-seeded startup selections require their own preparation." };
+      }
+      const resolved = resolveAgentRef(member.agentRef, rigRoot, this.deps.fsOps);
+      if (!resolved.ok) return { ok: false, message: resolved.code === "validation_failed" ? resolved.errors.join("; ") : resolved.error };
+      const config = resolveNodeConfig({ baseSpec: resolved.resolved, importedSpecs: resolved.imports, collisions: resolved.collisions,
+        profileName: member.profile, specRoot: rigRoot, cwdOverride: input.cwd,
+        member: { ...member, model: node.model ?? undefined }, pod, rig: spec,
+        skillsRoot: this.resolveSkillsRoot(), ...this.systemWorldResolutionContext() });
+      if (!config.ok) return { ok: false, message: config.errors.join("; ") };
+      const planned = planProjection({ config: config.config, collisions: resolved.collisions, fsOps: this.deps.fsOps });
+      if (!planned.ok) return { ok: false, message: planned.errors.join("; ") };
+      const files = this.dedupeProjectedManagedStartupFiles(planned.plan, this.buildResolvedStartupFiles(
+        resolved.resolved.spec, resolved.resolved.sourcePath, resolved.resolved.spec.profiles[member.profile], spec, rigRoot, pod, member,
+      ));
+      const missing = files.filter(f => f.required && !this.deps.fsOps.exists(f.absolutePath));
+      if (missing.length) return { ok: false, message: `Required startup files are missing: ${missing.map(f => f.absolutePath).join(", ")}` };
+      return { ok: true, context: {
+        runtime: member.runtime,
+        projectionEntries: planned.plan.entries,
+        resolvedStartupFiles: files,
+        startupActions: [...config.config.startup.actions, this.buildSessionIdentityAction({ rigName: spec.name, pod, member,
+          runtime: member.runtime, sessionName: deriveCanonicalSessionName(pod.id, member.id, spec.name), resolvedSpecName: config.config.resolvedSpecName })],
+      }, warnings: config.config.skillWarnings ?? [] };
+    } catch (error) {
+      return { ok: false, message: `Could not resolve the target startup context: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
   /** One configured catalog root for preflight, materialization, and launch. */
   resolveSkillsRoot(): string | undefined {
     return this.deps.skillsRootResolver?.();
