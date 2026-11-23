@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { prepareHermeticEnv, type HermeticScaffold } from "./helpers/hermetic-env.js";
+import { shellQuote } from "../src/adapters/shell-quote.js";
 import { runRig, spawnScenarioDaemon, type ScenarioDaemon } from "./helpers/scenario-daemon.js";
 import { stageTopologyRoot } from "./helpers/scenario-stage.js";
 import type { TmuxServerSelection } from "../src/domain/tmux-server-selection.js";
@@ -62,7 +63,7 @@ describe.skipIf(!nativeAvailable)("daemon tmux server selection with a real stub
     // The seat pane runs a login shell, and macOS path_helper (/etc/profile, /etc/zprofile) puts /etc/paths.d ahead of
     // the inherited PATH. On a Homebrew host that includes /opt/homebrew/bin, so a host's own pi or omp would run instead
     // of this fixture's backend. The user profiles run after the system ones and restore the scaffold's PATH.
-    const scaffoldPath = `PATH='${String(scaffold.env.PATH).replace(/'/g, "'\\''")}'\nexport PATH\n`;
+    const scaffoldPath = `PATH=${shellQuote(String(scaffold.env.PATH))}\nexport PATH\n`;
     for (const profile of [".profile", ".zprofile"]) writeFileSync(join(scaffold.home, profile), scaffoldPath);
     const common = `#!${process.execPath}\nif(process.argv.includes('--version')){console.log('offline-${kind}');process.exit(0);}const fs=require('node:fs');const send=x=>console.log(JSON.stringify(x));const log=x=>fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(x)+'\\n');log({pid:process.pid,ppid:process.ppid,token:!!process.env.OPENRIG_ACTIVITY_HOOK_TOKEN,run:!!process.env.OPENRIG_RUN_ID});`;
     writeFileSync(backend, kind !== "dsh" ? `${common}
