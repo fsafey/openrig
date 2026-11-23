@@ -702,7 +702,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     let config = stripped;
     for (const event of OPENRIG_ACTIVITY_HOOK_EVENTS) {
       const groups = document.hooks[event] ?? [];
-      const found = groups.findIndex(isOpenRigActivityGroup);
+      const labeled = groups.findIndex(isOpenRigActivityGroup);
+      const found = labeled >= 0 ? labeled : groups.findIndex((group) => isUnlabeledOpenRigActivityGroup(group, command));
       const groupIndex = found < 0 ? groups.length : found;
       groups[groupIndex] = openRigActivityGroup(command);
       document.hooks[event] = groups;
@@ -800,7 +801,9 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         for (const event of OPENRIG_ACTIVITY_HOOK_EVENTS) {
           const groups = document.hooks[event];
           if (!groups) continue;
-          const kept = groups.flatMap((group, index) => isOpenRigActivityGroup(group) ? [] : [index]);
+          const isOurs = (group: unknown) => isOpenRigActivityGroup(group)
+            || (current !== undefined && isUnlabeledOpenRigActivityGroup(group, current));
+          const kept = groups.flatMap((group, index) => isOurs(group) ? [] : [index]);
           if (kept.length === groups.length) continue;
           const newIndexOf = (index: number) => {
             if (index >= groups.length) return index; // Stale or unfamiliar state is not one of the groups we removed.
@@ -810,7 +813,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           const prefix = `${keySource}:${CODEX_HOOK_EVENT_KEY_LABEL[event]}:`;
           // A person's disable of OpenRig's group is a choice about OpenRig's activity, so it waits at the position the
           // group comes back to (after the kept groups); its trust and any other state leave with the group.
-          const disabled = groups.some((group, index) => isOpenRigActivityGroup(group)
+          const disabled = groups.some((group, index) => isOurs(group)
             && codexHookStateOf(expected)[`${prefix}${index}:0`]?.enabled === false);
           config = rekeyCodexHookStateText(config, prefix, newIndexOf);
           if (expected.hooks?.state) expected.hooks.state = rekeyCodexHookState(expected.hooks.state, prefix, newIndexOf);
@@ -2584,6 +2587,19 @@ function isOpenRigActivityGroup(group: unknown): boolean {
   const { type, command, timeout, statusMessage, ...extra } = handler as Record<string, unknown>;
   return Object.keys(extra).length === 0 && type === "command" && timeout === 5 && statusMessage === OPENRIG_ACTIVITY_STATUS
     && isOpenRigRelayCommand(command);
+}
+
+/** OpenRig's group as its inline block writes it (this install's relay command, timeout 5, no status label), as a
+ *  hooks.json can hold it from before OpenRig labeled its groups: OpenRig's, so it's upgraded or removed rather than run
+ *  twice beside OpenRig's labeled group. Any other field, value or relay path makes it a person's. */
+function isUnlabeledOpenRigActivityGroup(group: unknown, command: string): boolean {
+  if (group === null || typeof group !== "object") return false;
+  const { hooks, ...rest } = group as { hooks?: unknown };
+  if (Object.keys(rest).length > 0 || !Array.isArray(hooks) || hooks.length !== 1) return false;
+  const handler = hooks[0];
+  if (handler === null || typeof handler !== "object") return false;
+  const { type, command: handlerCommand, timeout, ...extra } = handler as Record<string, unknown>;
+  return Object.keys(extra).length === 0 && type === "command" && timeout === 5 && handlerCommand === command;
 }
 
 type CodexHookState = Record<string, Record<string, unknown>>;
