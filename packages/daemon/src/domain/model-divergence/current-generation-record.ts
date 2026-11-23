@@ -10,6 +10,7 @@ import { piSeatPaths } from "../../adapters/pi-runner-protocol.js";
 import { canonicalModelPin, modelsMatch } from "./model-divergence-monitor.js";
 import { isShellForeground } from "../shell-classifier.js";
 import { commandNamesClaude } from "../native-process-lineage.js";
+import { lstartToMinTs } from "../codex-thread-id.js";
 
 export interface ProcessRow {
   pid: number;
@@ -224,6 +225,33 @@ function cleanString(value: string | undefined): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+/** Whether a census row started before a verdict's `observedAt` second. A verdict records PIDs, not start times; both
+ *  writers of a verified verdict (the identity reconciler and `rebindAndVerifyPaneIdentity`) stamp `observedAt` before
+ *  they sample processes, and a live PID names one process, so a row whose `ps` start second ends before that stamp is
+ *  the process they saw. A later one reuses its PID; one started within the stamp's own second waits for the next verdict. */
+export function startedBeforeVerdict(row: ProcessRow | undefined, observedAt: string): boolean {
+  const started = lstartToMinTs(row?.startedAt);
+  return started !== undefined && started < Math.floor(Date.parse(observedAt) / 1000);
+}
+
+/** The Codex process chain a generation-record read proved, from one census snapshot: every link from the verified native
+ *  process (or, for a legacy verdict that names only the pane root, from each Codex under the pane) up to the pane root,
+ *  by PID, parent, start time and command. A later snapshot with another value means a link was replaced or its PID
+ *  reused in between. Children a Codex spawns for its tools aren't part of it. */
+export function codexPaneChain(processes: ProcessRow[], panePid: number, nativePid?: number): string {
+  const byPid = new Map(processes.map((row) => [row.pid, row]));
+  const leaves = nativePid !== undefined ? [nativePid] : findDescendants(processes, panePid, commandBasenameIs("codex"));
+  return JSON.stringify(leaves.map((leaf) => {
+    const chain: Array<[number, number, string | null, string]> = [];
+    const seen = new Set<number>();
+    for (let row = byPid.get(leaf); row && !seen.has(row.pid); row = row.pid === panePid ? undefined : byPid.get(row.ppid)) {
+      seen.add(row.pid);
+      chain.push([row.pid, row.ppid, row.startedAt ?? null, row.command]);
+    }
+    return chain;
+  }));
 }
 
 /** The live codex occupant's thread id, via its own pid's log join — bypasses the stored resume
