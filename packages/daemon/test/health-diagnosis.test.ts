@@ -95,6 +95,23 @@ it("ignores a canceled topical Markdown receipt in the census and scheduled eval
   expect(t.queue.listTransitions(foreignId)).toEqual(transitions);
 });
 
+it("reads the census without projecting non-owned topical rows, and still refuses a full census before ownership", async () => {
+  const t = setup(); const p = t.policy.read().policy;
+  t.policy.apply({ ...p, diagnosis: { ...p.diagnosis, enabled: true, owner: "owner@rig" } }, "actor@rig");
+  const id = (await t.service.evaluate("actor@rig", true)).actions[0]!.qitemId;
+  // A topical row (not an occurrence) whose unrelated structured field is malformed: only a full row projection reads it.
+  const foreign = await t.queue.create({ sourceSession: "peer@rig", destinationSession: "owner@rig", nudge: false,
+    body: "topical note", tags: ["health-diagnosis"] });
+  t.db.prepare("UPDATE queue_items SET chain_of_record = ? WHERE qitem_id = ?").run("{not json", foreign.qitemId);
+  expect(t.service.list().map((o) => o.row.qitemId)).toEqual([id]);
+
+  // Exactly 10000 tagged rows refuses the census even though none of the extra rows is owned.
+  const insert = t.db.prepare(`INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, body, tags)
+    VALUES (?, ?, ?, 'peer@rig', 'owner@rig', 'done', 'x', '["health-diagnosis"]')`);
+  t.db.transaction(() => { for (let i = 0; i < 9998; i++) insert.run(`qitem-topical-${i}`, "2026-09-01T00:00:00Z", "2026-09-01T00:00:00Z"); })();
+  expect(() => t.service.list()).toThrow("health_diagnosis_census_truncated");
+});
+
 it.each(["markdown", "null", "schema", "finding-id", "authority", "presentedAt"])("refuses corrupt owned occurrence state (%s) instead of hiding or certifying it", async (defect) => {
   const t = setup(); const p = t.policy.read().policy;
   t.policy.apply({ ...p, diagnosis: { ...p.diagnosis, enabled: true, owner: "owner@rig" } }, "actor@rig");
@@ -285,6 +302,8 @@ it("human escalation requires both an admitted agent disposition and ready deliv
   const first = await service.notify(id, "owner@rig");
   const second = await service.notify(id, "owner@rig");
   expect(second.qitemId).toBe(first.qitemId);
+  // Selected for the person by the health policy: an alert, not only a place on Steering.
+  expect(t.queue.transitionLog.latestOwnerNotificationForQitem(first.qitemId)).toMatchObject({ ownerNotificationKind: "human-required", ownerNotificationLevel: "ALERT" });
   expect(first.deliveryOutcome).not.toBe("posted");
   expect(t.queue.list({ limit: 100 })).toHaveLength(2);
   const key = `${first.qitemId}:${t.queue.transitionLog.latestOwnerNotificationForQitem(first.qitemId)!.transitionId}`;
@@ -435,4 +454,20 @@ it("binds authority categories and slice IDs to the finding scope", async () => 
   expect(JSON.stringify(changed)).not.toContain("Changed identity marker");
   const unscoped = healthAuthority(workspace, t.source, { ...finding, scope: { type: "rig", rigId: "rig" } });
   expect(unscoped.filter((a) => (a as { level?: string }).level !== "project").every((a) => a.state === "unavailable")).toBe(true);
+});
+
+// A maintenance hold must not spend a representation receipt without a send.
+it("defers a drained diagnosis representation before its receipt, then resumes on END", async () => {
+  const t=setup(); const p=t.policy.read().policy;
+  t.db.prepare("INSERT OR IGNORE INTO rigs (id,name) VALUES ('drain-rig','rig')").run();
+  const send=vi.fn(async()=>({ok:true,verified:true}));t.queue.attachTransport({send});
+  t.policy.apply({...p,freshnessSeconds:86400,diagnosis:{...p.diagnosis,enabled:true,owner:"owner@rig",cooldownSeconds:60}},"actor@rig");
+  const first=await t.service.evaluate("actor@rig",true);const id=first.actions[0]!.qitemId!;
+  const jobs=new (await import("../src/domain/watchdog-jobs-repository.js")).WatchdogJobsRepository(t.db);
+  const drain=t.queue.deliveryDrains.begin("drain-rig",{drainId:"window",owner:"owner@rig",reviewAt:"2026-11-15T00:00:00Z"},jobs);
+  const receipts=t.service.show(id).receipts.filter(r=>r.action==="presented"); t.tick("2026-09-05T21:01:01Z");
+  expect((await t.service.evaluate("actor@rig",true)).actions[0]?.action).toBe("deferred");
+  expect(t.service.show(id).receipts.filter(r=>r.action==="presented")).toEqual(receipts);expect(send).toHaveBeenCalledTimes(1);
+  t.queue.deliveryDrains.end(drain.rigId,drain.drainId,jobs);expect((await t.service.evaluate("actor@rig",true)).actions[0]?.action).toBe("represent");
+  expect(send).toHaveBeenCalledTimes(2);
 });

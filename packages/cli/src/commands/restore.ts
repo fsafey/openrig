@@ -3,19 +3,20 @@ import { DaemonClient } from "../client.js";
 import { getDaemonStatus, getDaemonUrl, type LifecycleDeps , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
+import { rigIdForHandle } from "../rig-handle.js";
 
 const LONG_RUNNING_TIMEOUT_MS = 45_000;
 
 export function restoreCommand(depsOverride?: StatusDeps): Command {
   const cmd = new Command("restore")
     .description("Restore a rig from a snapshot")
-    .addHelpText("after", "\nDirect restore: rig restore <snapshotId> --rig <rigId>");
+    .addHelpText("after", "\nDirect restore: rig restore <snapshotId> --rig <rig>");
   const getDeps = () => depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
 
   cmd
     .command("apply <snapshotId>", { isDefault: true, hidden: true })
     .description("Restore a rig from a snapshot")
-    .requiredOption("--rig <rigId>", "Rig ID to restore into")
+    .requiredOption("--rig <rig>", "Rig name or ID to restore into")
     .action(async (snapshotId: string, opts: { rig: string }) => {
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
@@ -24,6 +25,8 @@ export function restoreCommand(depsOverride?: StatusDeps): Command {
 
       const client = deps.clientFactory(getDaemonUrl(status));
       const rigId = opts.rig;
+      const target = await rigIdForHandle(client, rigId);
+      if (!target.ok) { console.error(target.message); process.exitCode = 1; return; }
 
       // L3: install a SIGINT/SIGTERM handler that prints an honest message —
       // interrupting the CLI client does NOT stop daemon-side restore work.
@@ -62,13 +65,13 @@ export function restoreCommand(depsOverride?: StatusDeps): Command {
         attachCommand?: string;
         warnings?: string[];
       }>(
-        `/api/rigs/${encodeURIComponent(rigId)}/restore/${encodeURIComponent(snapshotId)}`,
+        `/api/rigs/${encodeURIComponent(target.id)}/restore/${encodeURIComponent(snapshotId)}`,
         undefined,
         { timeoutMs: LONG_RUNNING_TIMEOUT_MS },
       );
 
       if (res.status === 404) {
-        console.error(`Snapshot "${snapshotId}" or rig "${rigId}" not found. List snapshots with: rig snapshot list --rig ${rigId}`);
+        console.error(`Snapshot "${snapshotId}" or rig "${rigId}" not found. List snapshots with: rig snapshot list ${rigId}`);
         process.exitCode = 1;
       } else if (res.status === 409) {
         if ((res.data as { code?: string }).code === "pre_restore_validation_failed") {
@@ -90,7 +93,7 @@ export function restoreCommand(depsOverride?: StatusDeps): Command {
         console.log(`Restore attempt id: ${res.data.attemptId}`);
         console.log(`Status: ${res.data.status ?? "started"}`);
         console.log("Daemon is restoring per-node in the background; follow progress with 'rig ps --nodes' or 'rig restore-check'.");
-        console.log(`Read the completed attempt and its startup warnings with: rig restore status ${res.data.attemptId} --rig ${rigId}`);
+        console.log(`Read the completed attempt and its startup warnings with: rig restore status ${res.data.attemptId} --rig ${target.id}`);
       } else {
         // Defensive: server responded ok=true but didn't include attemptId.
         // Fall back to the legacy summary if it's present (back-compat with
@@ -119,13 +122,21 @@ export function restoreCommand(depsOverride?: StatusDeps): Command {
   cmd
     .command("status <attemptId>")
     .description("Show the derived current receipt for one restore attempt")
-    .requiredOption("--rig <rigId>", "Rig ID containing the restore attempt")
+    .requiredOption("--rig <rig>", "Rig name or ID containing the restore attempt")
     .option("--json", "JSON output")
     .action(async (attemptId: string, opts: { rig: string; json?: boolean }) => {
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
       if (!daemonStatusGuard(status)) return;
       const client = deps.clientFactory(getDaemonUrl(status));
+      const target = await rigIdForHandle(client, opts.rig);
+      if (!target.ok) {
+        // The same --json shape rig grow, remove, shrink and expand give for a shared name.
+        if (opts.json) console.log(JSON.stringify({ ok: false, code: "rig_ambiguous", message: target.message, candidates: target.candidates }, null, 2));
+        else console.error(target.message);
+        process.exitCode = 1;
+        return;
+      }
       const res = await client.get<{
         ok?: boolean;
         error?: string;
@@ -134,9 +145,9 @@ export function restoreCommand(depsOverride?: StatusDeps): Command {
         originalResult?: { rigResult: string; warnings?: string[] };
         currentIntendedSetVerdict?: string;
         intendedRoster?: unknown[];
-        excludedNodes?: unknown[];
+        excludedNodes?: Array<{ logicalId?: string; reason?: string }>;
         unresolvedIntendedSeats?: Array<{ logicalId: string; status: string }>;
-      }>(`/api/rigs/${encodeURIComponent(opts.rig)}/restore/status/${encodeURIComponent(attemptId)}`);
+      }>(`/api/rigs/${encodeURIComponent(target.id)}/restore/status/${encodeURIComponent(attemptId)}`);
       if (res.status >= 400 || !res.data.ok) {
         console.error(res.data.error ?? `Restore attempt status failed (HTTP ${res.status})`);
         process.exitCode = 1;
@@ -154,7 +165,11 @@ export function restoreCommand(depsOverride?: StatusDeps): Command {
       console.log(`Original verdict: ${res.data.originalResult?.rigResult ?? "unknown"}`);
       for (const warning of res.data.originalResult?.warnings ?? []) console.warn(`Original attempt warning: ${warning}`);
       console.log(`Current intended-set verdict: ${res.data.currentIntendedSetVerdict ?? "unknown"}`);
-      console.log(`Intended: ${res.data.intendedRoster?.length ?? 0}; excluded historical: ${res.data.excludedNodes?.length ?? 0}; unresolved: ${res.data.unresolvedIntendedSeats?.length ?? 0}`);
+      // A current seat outside the snapshot's roster (claimed after the topology was recorded) was skipped, not historical.
+      const excluded = res.data.excludedNodes ?? [];
+      const skipped = excluded.filter((node) => node.reason === "current_seat_not_in_intended_roster");
+      console.log(`Intended: ${res.data.intendedRoster?.length ?? 0}; excluded historical: ${excluded.length - skipped.length}; skipped current seats: ${skipped.length}; unresolved: ${res.data.unresolvedIntendedSeats?.length ?? 0}`);
+      for (const node of skipped) console.log(`  ${node.logicalId ?? "unknown"}: skipped — not in this restore's roster`);
       for (const node of res.data.unresolvedIntendedSeats ?? []) console.log(`  ${node.logicalId}: ${node.status}`);
     });
 

@@ -4,8 +4,11 @@ import type { ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { startDaemon, STATE_FILE, type LifecycleDeps } from "../src/daemon-lifecycle.js";
-import { acquireDaemonStartLock } from "../src/daemon-start-lock.js";
+import { startDaemon, getDaemonStatus, STATE_FILE, type LifecycleDeps } from "../src/daemon-lifecycle.js";
+import { acquireDaemonStartLock, currentBootId } from "../src/daemon-start-lock.js";
+// Resolve the startup import before a fake clock can finish with no timer yet scheduled.
+import "@openrig/daemon/instance-initialization";
+import { createProcessLiveness, readProcessState } from "../src/commands/daemon.js";
 
 afterEach(() => vi.useRealTimers());
 function fixture() {
@@ -67,15 +70,190 @@ describe("child-bound startup", () => {
       ? { ok: true, json: async () => ({ ...f.body, pid: 888 }) } : fetch(url);
     await expect(startDaemon(opts, f.deps)).rejects.toThrow(/identity mismatch.*127.0.0.2/);
     expect(f.files.has(STATE_FILE)).toBe(false);
+    expect(f.deps.kill).toHaveBeenCalledWith(12345, "SIGTERM");
+    expect(f.lock.release).toHaveBeenCalledWith(false);
   });
-  it("does not convert an indeterminate required listener into success", async () => {
+  it("publishes the verified child, naming the unverified listener, when only a secondary listener stays uncertain", async () => {
     vi.useFakeTimers();
-    const f = fixture(); f.body.bind.hosts.push("127.0.0.2");
-    const fetch = f.deps.fetch;
-    f.deps.fetch = async (url) => { if (url.includes("127.0.0.2")) throw new Error("timeout"); return fetch(url); };
-    const result = startDaemon(opts, f.deps).catch((e: Error) => e);
-    await vi.runAllTimersAsync();
-    expect(await result).toBeInstanceOf(Error); expect(f.files.has(STATE_FILE)).toBe(false);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const f = fixture(); f.body.bind.hosts.push("127.0.0.2");
+      const fetch = f.deps.fetch;
+      f.deps.fetch = async (url) => { if (url.includes("127.0.0.2")) throw new Error("timeout"); return fetch(url); };
+      const result = startDaemon(opts, f.deps).catch((e: Error) => e);
+      await vi.runAllTimersAsync();
+      const outcome = await result;
+      expect(outcome instanceof Error ? outcome.message : outcome.pid).toBe(f.child.pid);
+      expect(JSON.parse(f.files.get(STATE_FILE)!)).toMatchObject({ pid: f.child.pid, port: opts.port });
+      expect(f.lock.release).toHaveBeenLastCalledWith(false);
+      expect(errors.mock.calls.flat().join(" ")).toMatch(/127\.0\.0\.2 could not be verified/);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+  describe("slow startup health", () => {
+    const later = <T>(ms: number, value: T) => new Promise<T>((resolve) => setTimeout(() => resolve(value), ms));
+    const settle = async (f: ReturnType<typeof fixture>) => {
+      const started = Date.now();
+      const result = startDaemon(opts, f.deps).catch((e: Error) => e);
+      await vi.runAllTimersAsync();
+      return { outcome: await result, elapsed: Date.now() - started };
+    };
+    it.each([
+      ["headers", 400], ["headers", 1000], ["JSON", 400], ["JSON", 1000],
+    ] as const)("accepts the child when its valid health %s take %ims", async (part, ms) => {
+      vi.useFakeTimers();
+      const f = fixture(); const fetch = f.deps.fetch;
+      f.deps.fetch = async (url) => (await fetch(url), part === "headers")
+        ? later(ms, { ok: true, json: async () => f.body })
+        : { ok: true, json: () => later(ms, f.body) };
+      const { outcome } = await settle(f);
+      expect(outcome instanceof Error ? outcome.message : outcome.pid).toBe(f.child.pid);
+      expect(JSON.parse(f.files.get(STATE_FILE)!)).toMatchObject({ pid: f.child.pid });
+    });
+    it("rejects a slow response naming another PID", async () => {
+      vi.useFakeTimers();
+      const f = fixture(); const fetch = f.deps.fetch;
+      f.deps.fetch = async (url) => (await fetch(url), later(1000, { ok: true, json: async () => ({ ...f.body, pid: 888 }) }));
+      const { outcome } = await settle(f);
+      expect((outcome as Error).message).toMatch(/identity mismatch.*observed 888/);
+      expect(f.files.has(STATE_FILE)).toBe(false);
+    });
+    it("keeps waiting for the same child after 20 seconds and publishes its verified readiness at 45 seconds", async () => {
+      vi.useFakeTimers();
+      const progress = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const f = fixture(); const fetch = f.deps.fetch; const began = Date.now();
+        f.deps.fetch = async (url) => {
+          const response = await fetch(url);
+          if (Date.now() - began < 45_000) throw Object.assign(new Error("still initializing"), { code: "ECONNREFUSED" });
+          return response;
+        };
+        const pending = startDaemon(opts, f.deps).catch((error: Error) => error);
+        await vi.advanceTimersByTimeAsync(25_000);
+        expect(f.files.has(STATE_FILE)).toBe(false);
+        expect(f.deps.spawn).toHaveBeenCalledTimes(1);
+        expect(f.lock.recordChild).toHaveBeenCalledWith(f.child.pid, expect.objectContaining({ host: "127.0.0.1", port: expect.any(Number) }));
+        expect(f.lock.release).not.toHaveBeenCalled();
+        expect(progress).toHaveBeenCalledWith(expect.stringContaining("Waiting for daemon child 12345 readiness"));
+        await vi.runAllTimersAsync();
+        const outcome = await pending;
+        expect(outcome instanceof Error ? outcome.message : outcome.pid).toBe(f.child.pid);
+        expect(Date.now() - began).toBe(45_000);
+        expect(JSON.parse(f.files.get(STATE_FILE)!)).toMatchObject({ pid: f.child.pid, port: opts.port, host: opts.host });
+        expect(f.deps.spawn).toHaveBeenCalledTimes(1);
+        expect(f.lock.release).toHaveBeenCalledWith(false);
+        expect(f.deps.kill).not.toHaveBeenCalled();
+        expect(progress.mock.calls.length).toBeLessThanOrEqual(3);
+      } finally { progress.mockRestore(); }
+    });
+    it("stops on a child exit after the old deadline instead of waiting out the new cap", async () => {
+      vi.useFakeTimers();
+      const progress = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const f = fixture(); const fetch = f.deps.fetch;
+        f.deps.fetch = async (url) => (await fetch(url), new Promise(() => {}));
+        setTimeout(() => { f.child.exitCode = 1; f.child.emit("exit", 1, null); }, 35_000);
+        const { outcome, elapsed } = await settle(f);
+        expect((outcome as Error).message).toMatch(/exited/);
+        expect(elapsed).toBe(35_000);
+        expect(f.files.has(STATE_FILE)).toBe(false);
+        expect(f.deps.spawn).toHaveBeenCalledTimes(1);
+        expect(f.deps.kill).not.toHaveBeenCalled();
+        expect(f.lock.release).toHaveBeenCalledWith(false);
+      } finally { progress.mockRestore(); }
+    });
+    it("keeps a quick verified start immediate without a waiting progress line", async () => {
+      vi.useFakeTimers();
+      const progress = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const f = fixture(); const { outcome, elapsed } = await settle(f);
+        expect(outcome instanceof Error ? outcome.message : outcome.pid).toBe(f.child.pid);
+        expect(elapsed).toBe(0);
+        expect(f.deps.spawn).toHaveBeenCalledTimes(1);
+        expect(progress).not.toHaveBeenCalled();
+      } finally { progress.mockRestore(); }
+    });
+    it("returns pending within one readiness deadline without stopping its still-starting child", async () => {
+      vi.useFakeTimers();
+      const f = fixture(); const fetch = f.deps.fetch;
+      const probeStarts: number[] = [];
+      const began = Date.now();
+      f.deps.fetch = async (url) => {
+        await fetch(url);
+        probeStarts.push(Date.now());
+        return new Promise(() => {});
+      };
+      const { outcome, elapsed } = await settle(f);
+      expect(elapsed).toBe(180_000);
+      expect(probeStarts.length).toBeGreaterThan(60);
+      expect(probeStarts.every(at => at < began + 180_000)).toBe(true);
+      expect(probeStarts.slice(1).every((at, i) => at - probeStarts[i]! <= 2_250)).toBe(true);
+      expect((outcome as Error).message).toMatch(/Last probe: .*timed out|Last probe: .*healthz/);
+      expect(elapsed).toBeLessThanOrEqual(180_000);
+      expect(f.files.has(STATE_FILE)).toBe(false);
+      expect(f.deps.kill).not.toHaveBeenCalled();
+      expect(f.lock.release).toHaveBeenCalledWith(true);
+      expect((outcome as Error).message).toMatch(/pending.*12345/);
+      expect((outcome as Error).message).toContain("Launch endpoint: http://127.0.0.1:19873/healthz");
+      expect((outcome as Error).message).toContain("daemon.log");
+    });
+    // Synchronous work crossing the deadline is modelled by a clock jump inside one fetch, before
+    // any timer runs. Post-spawn fetches: 0 primary read, 1 primary listener check, 2 secondary check.
+    const jumpAt = (f: ReturnType<typeof fixture>, at: number, secondary?: "timeout") => {
+      const fetch = f.deps.fetch; const urls: string[] = [];
+      f.deps.fetch = async (url) => {
+        const res = await fetch(url);
+        if (urls.push(url) - 1 === at) vi.setSystemTime(Date.now() + 181_000);
+        if (secondary && url.includes("127.0.0.2")) throw new Error("timeout");
+        return res;
+      };
+      return urls;
+    };
+    it("publishes a verified child whose last listener answer lands after the deadline", async () => {
+      vi.useFakeTimers();
+      const f = fixture(); const urls = jumpAt(f, 1);
+      const { outcome } = await settle(f);
+      expect(outcome instanceof Error ? outcome.message : outcome.pid).toBe(f.child.pid);
+      expect(JSON.parse(f.files.get(STATE_FILE)!)).toMatchObject({ pid: f.child.pid });
+      expect(f.deps.kill).not.toHaveBeenCalled();
+      expect(urls).toHaveLength(2);
+    });
+    it("starts no listener check after the deadline, so a late primary read cannot publish through an uncertain secondary", async () => {
+      vi.useFakeTimers();
+      const f = fixture(); f.body.bind.hosts.push("127.0.0.2");
+      const urls = jumpAt(f, 0, "timeout");
+      const { outcome } = await settle(f);
+      expect((outcome as Error).message).toMatch(/listener verification is incomplete.*reservation retained/);
+      expect(f.files.has(STATE_FILE)).toBe(false);
+      expect(f.deps.kill).not.toHaveBeenCalled();
+      expect(urls).toHaveLength(1);
+    });
+    it("still publishes with a warning when only the secondary check runs past the deadline", async () => {
+      vi.useFakeTimers();
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const f = fixture(); f.body.bind.hosts.push("127.0.0.2");
+        const urls = jumpAt(f, 2, "timeout");
+        const { outcome } = await settle(f);
+        expect(outcome instanceof Error ? outcome.message : outcome.pid).toBe(f.child.pid);
+        expect(errors.mock.calls.flat().join(" ")).toMatch(/127\.0\.0\.2 could not be verified/);
+        expect(urls).toHaveLength(3);
+      } finally {
+        errors.mockRestore();
+      }
+    });
+    it("retains the child when the deadline runs out during the primary listener's check", async () => {
+      vi.useFakeTimers();
+      const f = fixture(); const fetch = f.deps.fetch; let calls = 0;
+      // After spawn, each primary read names the child; each listener check after it never answers.
+      f.deps.fetch = async (url) => (await fetch(url), calls++ % 2 === 0 ? { ok: true, json: async () => f.body } : new Promise(() => {}));
+      const { outcome, elapsed } = await settle(f);
+      expect((outcome as Error).message).toMatch(/listener verification is incomplete.*reservation retained/);
+      expect(elapsed).toBeLessThanOrEqual(180_000);
+      expect(f.files.has(STATE_FILE)).toBe(false);
+      expect(f.deps.kill).not.toHaveBeenCalled();
+    });
   });
   it("tracks child exit while the health response is pending", async () => {
     const f = fixture(); const fetch = f.deps.fetch;
@@ -86,6 +264,8 @@ describe("child-bound startup", () => {
     };
     await expect(startDaemon(opts, f.deps)).rejects.toThrow(/exited/);
     expect(f.files.has(STATE_FILE)).toBe(false);
+    expect(f.deps.kill).not.toHaveBeenCalled();
+    expect(f.lock.release).toHaveBeenCalledWith(false);
   });
   it("handles an asynchronous native spawn error without a PID", async () => {
     const f = fixture();
@@ -156,8 +336,8 @@ describe("local startup reservation", () => {
   it("excludes the second launcher and releases after the owner completes", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-start-lock-"));
     try {
-      const lock = acquireDaemonStartLock(home); lock.recordChild(1234);
-      expect(fs.readFileSync(path.join(home, "daemon-start.lock"), "utf8")).toContain('"childPid":1234');
+      const lock = acquireDaemonStartLock(home); lock.recordChild(1234, { startToken: "linux:42", pidNamespace: "host", host: "127.0.0.1", port: 7433 });
+      expect(fs.readFileSync(path.join(home, "daemon-start.lock"), "utf8")).toContain('{"childPid":1234,"startToken":"linux:42","pidNamespace":"host","host":"127.0.0.1","port":7433}');
       expect(() => acquireDaemonStartLock(home)).toThrow(/already reserved/);
       lock.release(); const next = acquireDaemonStartLock(home); next.release();
       expect(fs.existsSync(path.join(home, "daemon-start.lock"))).toBe(false);
@@ -175,4 +355,163 @@ describe("local startup reservation", () => {
       expect(fs.existsSync(file)).toBe(true); third.release();
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
+  describe("a reservation from before this boot", () => {
+    const startedAt = "2026-11-10T20:05:59.662Z", bootedAtMs = Date.parse("2026-11-10T20:46:15Z");
+    const dead = () => "dead" as const, alive = () => "alive" as const;
+    const leftover = (home: string, at = startedAt, bootId?: string) => {
+      const file = path.join(home, "daemon-start.lock");
+      fs.writeFileSync(file, JSON.stringify({ launcherPid: 35905, startedAt: at, ...(bootId ? { bootId } : {}) }) + "\n" + JSON.stringify({ childPid: 36449 }) + "\n");
+      const written = new Date(Date.parse(at) + 1000);
+      fs.utimesSync(file, written, written);
+      return file;
+    };
+    const archiveOf = (file: string, stamp: string) => `${file}.abandoned-${stamp}-${fs.statSync(file).ino}`;
+    const withHome = (body: (home: string) => void) => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-start-lock-"));
+      try { body(home); } finally { fs.rmSync(home, { recursive: true, force: true }); }
+    };
+    it("is archived and the launch goes on when every recorded PID is dead", () => withHome((home) => {
+      const file = leftover(home), archive = archiveOf(file, "20261110T200559Z"), liveness = vi.fn(dead);
+      const lock = acquireDaemonStartLock(home, { bootedAtMs, processLiveness: liveness });
+      expect(lock.archived).toBe(archive);
+      expect(fs.readFileSync(archive, "utf8")).toContain('"childPid":36449');
+      expect(liveness).toHaveBeenCalledWith(35905); expect(liveness).toHaveBeenCalledWith(36449);
+      expect(fs.readFileSync(file, "utf8")).toContain(`"launcherPid":${process.pid}`);
+      lock.release();
+      expect(fs.existsSync(file)).toBe(false);
+    }));
+    it("stays when a recorded PID is alive, in case the clock moved after boot", () => withHome((home) => {
+      const file = leftover(home);
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness: (pid) => pid === 36449 ? "alive" : "dead" })).toThrow(/already reserved/);
+      expect(fs.readFileSync(file, "utf8")).toContain('"childPid":36449');
+    }));
+    it("stays when a recorded PID can't be inspected (EPERM)", () => withHome((home) => {
+      const file = leftover(home);
+      const processLiveness = createProcessLiveness({ signal: () => "not-permitted", readProcessState: () => "S" });
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness })).toThrow(/already reserved/);
+      expect(fs.readdirSync(home)).toEqual(["daemon-start.lock"]);
+      expect(fs.readFileSync(file, "utf8")).toContain('"launcherPid":35905');
+    }));
+    it("stays when ps can't run for a recorded PID", () => withHome((home) => {
+      leftover(home);
+      const processLiveness = createProcessLiveness({
+        signal: () => "sent",
+        readProcessState: (pid) => readProcessState(pid, "darwin", () => { throw new Error("ps: not permitted"); }),
+      });
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness })).toThrow(/already reserved/);
+      expect(fs.readdirSync(home)).toEqual(["daemon-start.lock"]);
+    }));
+    it("stays when it was written during this boot", () => withHome((home) => {
+      leftover(home, "2026-11-10T20:50:00.000Z");
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness: dead })).toThrow(/already reserved/);
+    }));
+    it("stays when it was modified during this boot", () => withHome((home) => {
+      const file = leftover(home), later = new Date(bootedAtMs + 60_000);
+      fs.utimesSync(file, later, later);
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness: dead })).toThrow(/already reserved/);
+    }));
+    it("stays when it can't be read as a reservation", () => withHome((home) => {
+      const file = path.join(home, "daemon-start.lock");
+      fs.writeFileSync(file, "not json\n");
+      fs.utimesSync(file, new Date(bootedAtMs - 60_000), new Date(bootedAtMs - 60_000));
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness: dead })).toThrow(/already reserved/);
+      expect(fs.readFileSync(file, "utf8")).toBe("not json\n");
+    }));
+    it("is archived when it records an earlier boot's ID, even if a recorded PID is now someone else's", () => withHome((home) => {
+      const file = leftover(home, "2026-11-10T20:50:00.000Z", "boot-a"), archive = archiveOf(file, "20261110T205000Z");
+      const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: alive });
+      expect(lock.archived).toBe(archive);
+      expect(fs.readFileSync(file, "utf8")).toContain('"bootId":"boot-b"');
+      lock.release();
+    }));
+    it("stays when it records this boot's ID, whatever its times and PIDs", () => withHome((home) => {
+      leftover(home, startedAt, "boot-b");
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead })).toThrow(/already reserved/);
+    }));
+    it("without a boot ID of its own, falls back to the boot time and PID checks", () => withHome((home) => {
+      const file = leftover(home), archive = archiveOf(file, "20261110T200559Z");
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: () => "unknown" })).toThrow(/already reserved/);
+      const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead });
+      expect(lock.archived).toBe(archive);
+      lock.release();
+    }));
+    it("has one winner when another launch archives it and takes the lock between this one's inspection and its claim", () => withHome((home) => {
+      const file = leftover(home, startedAt, "boot-a"), archive = archiveOf(file, "20261110T200559Z");
+      let b: ReturnType<typeof acquireDaemonStartLock> | undefined;
+      const afterInspect = () => { b = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead }); };
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, afterInspect })).toThrow(/already reserved/);
+      expect(b?.archived).toBe(archive);
+      expect(fs.readFileSync(archive, "utf8")).toContain('"launcherPid":35905'); // the archive still holds the abandoned reservation
+      const current = fs.readFileSync(file, "utf8");
+      expect(current).toContain(`"launcherPid":${process.pid}`); // B's fresh lock is still in place, not moved by A
+      expect(fs.readdirSync(home).sort()).toEqual([path.basename(archive), "daemon-start.lock"].sort());
+      b!.release();
+      expect(fs.existsSync(file)).toBe(false); // B still owns its file
+    }));
+    it("is not moved when the path holds a different file than the one inspected", () => withHome((home) => {
+      const file = leftover(home, startedAt, "boot-a");
+      const afterInspect = () => { fs.renameSync(file, file + ".moved"); fs.writeFileSync(file, '{"launcherPid":1,"startedAt":"2026-11-10T21:00:00.000Z","bootId":"boot-b"}\n'); };
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, afterInspect })).toThrow(/already reserved/);
+      expect(fs.readFileSync(file, "utf8")).toContain('"launcherPid":1');
+      expect(fs.readdirSync(home).sort()).toEqual(["daemon-start.lock", "daemon-start.lock.moved"]);
+    }));
+    it.runIf(process.platform === "darwin" || process.platform === "linux")("reads this boot's ID from the OS", () => {
+      const id = currentBootId();
+      expect(id).toMatch(/^[0-9a-f-]{32,36}$/i);
+      expect(currentBootId()).toBe(id);
+    });
+    it("stays without the boot check, as before", () => withHome((home) => {
+      leftover(home);
+      expect(() => acquireDaemonStartLock(home)).toThrow(/already reserved/);
+    }));
+  });
+});
+
+
+it.each(["missing", "stale"] as const)("keeps a slow child discoverable with %s old state and excludes a duplicate launch", async (oldState) => {
+  vi.useFakeTimers();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-pending-start-"));
+  const f = fixture(), fetch = f.deps.fetch;
+  const previousState = oldState === "stale"
+    ? JSON.stringify({ pid: 999, host: "127.0.0.2", port: 19874, db: "old.sqlite", startedAt: "old" })
+    : undefined;
+  if (previousState) f.files.set(STATE_FILE, previousState);
+  f.deps.isProcessAlive = pid => pid === f.child.pid && f.child.exitCode === null;
+  let ready = false;
+  f.deps.acquireStartLock = () => acquireDaemonStartLock(home);
+  f.deps.fetch = async url => {
+    const response = await fetch(url);
+    if (!ready) throw Object.assign(new Error("still initializing"), { code: "ECONNREFUSED" });
+    return response;
+  };
+  vi.stubEnv("OPENRIG_URL", `http://127.0.0.1:${opts.port}`);
+  vi.stubEnv("RIGGED_URL", "");
+  try {
+    const began = Date.now(), result = startDaemon(opts, f.deps).catch((error: Error) => error);
+    await vi.runAllTimersAsync();
+    const outcome = await result;
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toMatch(/pending.*12345/);
+    const message = (outcome as Error).message;
+    expect(message).toContain("Launch endpoint: http://127.0.0.1:19873/healthz");
+    expect(message).not.toContain("127.0.0.2:19874");
+    expect(message).toContain("this check does not publish readiness, adopt the child or release the reservation");
+    expect(message).toContain("stop child PID 12345 and wait for exit");
+    expect(message).toContain(path.join(path.dirname(STATE_FILE), "daemon-start.lock"));
+    expect(message).toContain("only after both recorded launcher and child PIDs are absent, archive it and run 'rig daemon start'");
+    expect(message).toContain("Once this launcher has exited, 'rig daemon stop' can check this child against this reservation");
+    expect(Date.now() - began).toBeLessThanOrEqual(180_000);
+    expect(f.deps.kill).not.toHaveBeenCalled();
+    expect(f.child.exitCode).toBeNull();
+    expect(f.files.get(STATE_FILE)).toBe(previousState);
+    expect(fs.readFileSync(path.join(home, "daemon-start.lock"), "utf8")).toContain('"childPid":12345');
+    ready = true;
+    await expect(getDaemonStatus(f.deps)).resolves.toMatchObject({ state: "running", healthy: true, port: opts.port });
+    expect(f.files.get(STATE_FILE)).toBe(previousState); // A status probe never retroactively publishes start readiness.
+    await expect(startDaemon(opts, f.deps)).rejects.toThrow(/already reserved/);
+    expect(f.deps.spawn).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.unstubAllEnvs();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

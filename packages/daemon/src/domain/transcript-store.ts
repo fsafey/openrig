@@ -1,8 +1,8 @@
 import { mkdirSync, appendFileSync, existsSync, openSync, readSync, closeSync, statSync, fstatSync, readFileSync } from "node:fs";
 import { join, dirname, relative, isAbsolute, sep } from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import { getCompatibleOpenRigPath } from "../openrig-compat.js";
 import { getLastCaptureAt, getLastCheckedAt, DEFAULT_TRANSCRIPT_STALE_AFTER_MS } from "./transcript-rotation.js";
+import { scanTranscriptGrep } from "./transcript-grep.js";
 
 export interface TranscriptStoreOpts {
   transcriptsRoot?: string;
@@ -132,7 +132,10 @@ function readTailChunked(filePath: string, rawLines: number): string | null {
   try {
     const stat = fstatSync(fd);
     if (stat.size === 0) return null;
-    let text = "";
+    // Count each chunk once and join only after the backwards scan. Rescanning
+    // the accumulated tail makes long lines quadratic in the number of chunks.
+    const chunks: string[] = [];
+    let newlineCount = 0;
     let offset = stat.size;
 
     while (offset > 0) {
@@ -159,15 +162,15 @@ function readTailChunked(filePath: string, rawLines: number): string | null {
       }
 
       const chunk = buf.subarray(skipBytes).toString("utf-8");
-      text = chunk + text;
+      chunks.push(chunk);
+      newlineCount += countNewlines(chunk);
 
-      const newlineCount = countNewlines(text);
       // A trailing newline terminates the last line; it does not establish
       // the start of the first requested line when this chunk starts mid-line.
-      if (newlineCount >= rawLines + (text.endsWith("\n") ? 1 : 0)) break;
+      if (newlineCount >= rawLines + (chunks[0]!.endsWith("\n") ? 1 : 0)) break;
     }
 
-    const lines = text.split("\n");
+    const lines = chunks.reverse().join("").split("\n");
     if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
     const tail = lines.slice(-rawLines);
     return tail.join("\n");
@@ -389,60 +392,14 @@ export class TranscriptStore {
     }
   }
 
-  grep(rigName: string, sessionName: string, pattern: string): string[] | null {
-    try {
-      const filePath = this.getTranscriptPath(rigName, sessionName);
-      if (!existsSync(filePath)) return null;
-      return this.grepSync(filePath, pattern);
-    } catch {
-      return null;
-    }
-  }
-
-  private grepSync(filePath: string, pattern: string): string[] {
-    const regex = new RegExp(pattern);
-    const matches: string[] = [];
-    const fd = openSync(filePath, "r");
-    const decoder = new StringDecoder("utf-8");
-    try {
-      const stat = fstatSync(fd);
-      const CHUNK_SIZE = 64 * 1024;
-      let remainder = "";
-
-      for (let offset = 0; offset < stat.size; offset += CHUNK_SIZE) {
-        const readSize = Math.min(CHUNK_SIZE, stat.size - offset);
-        const buf = readTranscriptChunk(fd, readSize, offset);
-        // StringDecoder handles incomplete multibyte sequences at chunk boundaries
-        const chunk = remainder + decoder.write(buf);
-        const lines = chunk.split("\n");
-        remainder = lines.pop() ?? "";
-
-        for (const rawLine of lines) {
-          const stripped = this.stripAnsi(rawLine);
-          for (const subLine of stripped.split("\n")) {
-            const cleaned = stripShellPromptPrefix(subLine);
-            if (cleaned && regex.test(cleaned)) {
-              matches.push(cleaned);
-            }
-          }
-        }
-      }
-
-      // Flush any remaining bytes from the decoder
-      const finalChunk = remainder + decoder.end();
-      if (finalChunk) {
-        const stripped = this.stripAnsi(finalChunk);
-        for (const subLine of stripped.split("\n")) {
-          const cleaned = stripShellPromptPrefix(subLine);
-          if (cleaned && regex.test(cleaned)) {
-            matches.push(cleaned);
-          }
-        }
-      }
-    } finally {
-      closeSync(fd);
-    }
-
-    return matches;
+  /** Scan this session's transcript for a pattern.
+   *
+   *  The scan runs on its own thread with a deadline (domain/transcript-grep.ts): a pattern the route
+   *  accepts as valid syntax can backtrack catastrophically, and on this thread that would stop every
+   *  other request and every sweep for as long as it ran. Returns null when the file is missing, and
+   *  rejects with TranscriptGrepTimeoutError when the scan outlived its bound.
+   */
+  async grep(rigName: string, sessionName: string, pattern: string): Promise<string[] | null> {
+    return scanTranscriptGrep(this.getTranscriptPath(rigName, sessionName), pattern);
   }
 }

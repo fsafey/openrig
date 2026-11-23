@@ -470,11 +470,14 @@ describe("CodexRuntimeAdapter.launchHarness fork branch", () => {
     const adapter = new CodexRuntimeAdapter({
       tmux: mockShellCommand(tmux),
       fsOps: makeMinimalCodexFs(),
+      // A real fork child: the pane's foreground Codex forks the requested parent, and its own record,
+      // read for its start time, supplies the new id (the launch verifies both).
       listProcesses: () => [
-        { pid: 900, ppid: 1, command: "-zsh" },
-        { pid: 901, ppid: 900, command: "codex" },
+        { pid: 900, ppid: 1, pgid: 900, tpgid: 901, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000", command: "-zsh" },
+        { pid: 901, ppid: 900, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000",
+          command: "codex fork PARENT-THREAD-ABC", argv: ["codex", "fork", "PARENT-THREAD-ABC"] },
       ],
-      readThreadIdByPid: (pid) => (pid === 901 && captureThreadId ? captureThreadId : undefined),
+      readThreadIdByPid: (pid, identity) => (pid === 901 && identity && captureThreadId ? captureThreadId : undefined),
       sleep: async () => {},
     });
     return { tmux, adapter };
@@ -489,8 +492,8 @@ describe("CodexRuntimeAdapter.launchHarness fork branch", () => {
     expect(result.ok).toBe(true);
     const sendText = tmux.sendText as ReturnType<typeof vi.fn>;
     const sentCmd = sendText.mock.calls[0]?.[1] as string;
-    // The no-profile floor and managed update setting precede the fork subcommand.
-    expect(sentCmd).toMatch(/^codex -s workspace-write '-c' 'check_for_update_on_startup=false' fork/);
+    // The no-profile floor, managed update setting and non-login tool shells precede the fork subcommand.
+    expect(sentCmd).toMatch(/^codex -s workspace-write '-c' 'check_for_update_on_startup=false' -c 'allow_login_shell=false' fork/);
     expect(sentCmd).toContain("PARENT-THREAD-ABC");
     if (result.ok) {
       expect(result.resumeToken).toBe("NEW-CODEX-THREAD-XYZ");
@@ -581,10 +584,11 @@ describe("CodexRuntimeAdapter.launchHarness fork branch", () => {
       tmux: mockShellCommand(tmux),
       fsOps: makeMinimalCodexFs(),
       listProcesses: () => [
-        { pid: 900, ppid: 1, command: "-zsh" },
-        { pid: 901, ppid: 900, command: "codex" },
+        { pid: 900, ppid: 1, pgid: 900, tpgid: 901, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000", command: "-zsh" },
+        { pid: 901, ppid: 900, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000",
+          command: "codex fork PARENT-THREAD-ABC", argv: ["codex", "fork", "PARENT-THREAD-ABC"] },
       ],
-      readThreadIdByPid: (pid) => (pid === 901 ? "NEW-THREAD-AFTER-TRUST" : undefined),
+      readThreadIdByPid: (pid, identity) => (pid === 901 && identity ? "NEW-THREAD-AFTER-TRUST" : undefined),
       sleep: async () => {},
     });
 

@@ -7,6 +7,10 @@ without daemon-internal knowledge.
 This subtree is part of the wider [OpenRig Instance Layout](instance-layout.md).
 The instance initializer delegates these exact workspace bytes to this owner.
 
+To inspect or read an exact reconstruction under a selected work home, use
+[`rig context reconstruction`](reconstructions.md). It shares catalog and work-home
+resolution with `context work-install` and performs no installation or projection.
+
 ## Default Shape
 
 `rig config init-workspace` creates the default workspace at
@@ -108,6 +112,24 @@ ownership receipt. A later seat start with no project-world input preserves it;
 an explicit install whose `install.skills` is empty clears it. This keeps
 "project not supplied" distinct from "project deliberately selects no skills."
 
+Before refreshing a skill copy, don't take `rig skill audit` as the answer. The
+audit reports declared provenance, date freshness (its `stale` is a verified date
+past 90 days or one with no evidence source) and copy hashes. It doesn't say
+whether a copy is safe to refresh, and two copies with different hashes aren't
+evidence of a deliberate fork. For a managed copy in a working folder, the
+read-only check is `rig skill loadout --runtime <claude-code|codex> --cwd
+<target> --project-root <project> --json`, without `--apply`. It reports
+`current`; `stale`, still OpenRig's last projection, so `--apply` can refresh it;
+`conflicting`; `shadowed`; or `missing`. Read the detail of `conflicting` and
+`shadowed`: `conflicting` can mean the bytes differ or that the target couldn't
+be inspected, which leaves any difference unknown, and a confirmed difference
+doesn't prove a deliberate local edit. A seat's own skills, kept outside the
+project (0.7.1 and later), are listed with where they're stored by
+`rig skill loadout --seat <session|self> --json`; that read doesn't classify
+them. A global or untracked copy has no install
+record, so its origin stays unknown: ask the skill's owner, and don't move global
+skills into a project just to get one.
+
 ## Work-install project selection
 
 `rig context work-install` picks one project from the catalog at
@@ -145,6 +167,15 @@ deepest root, leave the choice to `--project`. Step 3 reads the seat's
 `OPENRIG_SESSION_NAME`, so a plain shell skips it. `--json` reports the step
 that chose the project as `position.selectedBy`.
 
+With no explicit project, `rig scope`, `rig proof add` and daemon-backed
+`rig proof show`/`judge` use the one project whose `workspace.yaml` entry lists
+the caller's rig under `rigs`, and say which. `rig scope` and `rig proof add`
+skip this for an explicit `--workspace`, `OPENRIG_WORK_ROOT` or absolute target
+path, and `rig proof show`/`judge` for `--project` or a `<project>:` prefix;
+those two refuse `--workspace` and use the daemon's own workspace. When no
+project lists the rig, they use the configured default; when several do, or the
+one that does can't be used, they warn and use the configured default.
+
 ## TUI project selection
 
 Open **PROJECTS** (or enter `projects`) to choose an ID and root from the
@@ -159,14 +190,51 @@ unavailable; another project's matching work ID is never a fallback.
 existing file-reader allowlist. Catalog membership does not grant file-read or
 execution permission. These views only read; they do not select a lifecycle
 operation or activate a mission. Execution and slice queue membership require
-an exact `project:<id>` tag; lifecycle instances use their authored project
-identity. Unscoped historical tasks and global review artifacts without
-project binding are excluded from project-specific claims.
+an exact `project:<id>` tag, for the project's id or a former id it declares
+(see [Renaming a project](#renaming-a-project)); lifecycle instances use their
+authored project identity, matched the same way. Unscoped historical tasks and
+global review artifacts without project binding are excluded from
+project-specific claims.
 
 The read API adds `GET /api/scopes/projects` and optional `project` and
 `projectRoot` parameters to scopes, execution and slice-detail reads. Slice
 detail also requires the selected mission directory. Existing reads without a
 project parameter keep their legacy contract.
+
+`GET /api/scopes?counts=1` is the light list: each mission's slices with only
+their `dirName`, `id`, `displayName`, `status`, `stage` and `locks` (and
+`sourcePath` for a selected project), read from each slice's node file alone. It
+leaves out readiness and proof pairing, which are most of the work and bytes of
+the default list. `detail=1` takes precedence when both are given.
+
+## Renaming a project
+
+Queue tags are written when a row is created and never rewritten, so a project's
+earlier rows keep the id they were tagged with. When you change a project's id
+in `workspace.yaml` and `project.yaml`, list the former id in `project.yaml`:
+
+```yaml
+id: default
+aliases: [oc-beacon]
+```
+
+Rows tagged `project:oc-beacon`, and workflow instances compiled under it, then
+count as `default` in the execution view, slice detail and queue counts,
+attention, operating posture and current-work roots. Nothing is rewritten. A
+workspace with no `workspace.yaml` lists former ids in its own `project.yaml` the
+same way.
+
+A declared former id that is another catalogued project's current id stays that
+project's, and one that two projects both declare belongs to neither. Either way
+the declaration is ignored, not refused: the project read (`aliasWarnings` on
+`GET /api/scopes/projects`) and the execution view (`alias_warnings`, shown in the
+TUI's execution pane) name the ignored id and the project it conflicts with.
+
+With a project selected, the execution view reports `uncatalogued_project_tags`
+(`{ rows, ids }`): the mission's rows whose project tag no catalogued project
+claims, by current or former id. Those rows aren't shown, and the TUI's
+execution pane says how many and which tags. Declaring the former id under
+`aliases:` brings them back.
 
 ## UI Mapping
 
@@ -303,3 +371,9 @@ If Project shows a mission discovery warning:
 
 No daemon restart is required for most config reads. Restart when changing
 startup-time roots such as `files.allowlist` or progress scan roots.
+
+Setting or resetting `files.allowlist` or `progress.scan_roots` through the
+daemon's settings API (`POST`/`DELETE /api/config/<key>`, as the web settings
+page does) attempts to record a `settings.changed` event (the key, set or reset)
+after the write; the write stands even if recording fails. `rig config set` and
+direct edits write the config file and record no event.

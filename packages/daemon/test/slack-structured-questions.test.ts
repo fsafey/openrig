@@ -23,11 +23,11 @@ import { resolveSlackHandle } from "../src/domain/gateway/human-registry.js";
 import { MissionControlActionLog } from "../src/domain/mission-control/mission-control-action-log.js";
 import { MissionControlWriteContract } from "../src/domain/mission-control/mission-control-write-contract.js";
 import { DeadLetterStore, InboundReceiptStore, SeenStore } from "../src/domain/gateway/slack/state-store.js";
-import { formatHumanAnswers, unansweredQuestions } from "../src/domain/human-questions.js";
+import { chosenAnswers, formatHumanAnswers, unansweredQuestions } from "../src/domain/human-questions.js";
 
 const human = "human-founder@external";
 const registry = { ok: true as const, entities: [{ entityId: "human-founder", class: "human" as const, displayName: "Founder", address: human, connectorBindings: [{ kind: "slack" as const, connectorRef: "primary", secretsRef: "env:SLACK_BOT_TOKEN", role: "primary" as const, handle: "UFOUNDER" }], prefs: { deliveryClass: "A" as const } }] };
-const request = { sourceSession: "author@rig", destinationSession: human, summary: "Two quick questions", body: "Pick one for each; my recommendation is marked.", evidenceRef: "/private/proof.md", nudge: false };
+const request = { humanAlert: true, sourceSession: "author@rig", destinationSession: human, summary: "Two quick questions", body: "Pick one for each; my recommendation is marked.", evidenceRef: "/private/proof.md", nudge: false };
 const questions = [
   { id: "db", question: "Which database?", options: [{ id: "pg", label: "Postgres", recommended: true }, { id: "sqlite", label: "SQLite" }] },
   { id: "ship", question: "Ship this week?", options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }] },
@@ -99,6 +99,109 @@ describe("structured human questions (#193)", () => {
     });
   });
 
+  it("dead-letters an answer-recording failure and retries the same click", async () => {
+    const { qitemId } = await repo.create({ ...request, humanIntent: "decision", humanQuestions: questions });
+    const payload = { type: "block_actions", user: { id: "UFOUNDER" }, channel: { id: "C-TEST" },
+      container: { message_ts: "1.1" },
+      actions: [{ block_id: "or-q:db", action_id: "or-opt:pg", action_ts: "1000.5" }] };
+    const actions = new DeadLetterStore<typeof payload>(join(home, "actions.jsonl"));
+    const log = vi.fn();
+    const record = vi.spyOn(repo, "recordHumanAnswer").mockImplementationOnce(() => { throw new Error("answer write failed"); });
+    try {
+      const router = new InboundRouter({
+        queue: makeQueuePorts(repo, { loadHumanRegistry: () => registry }),
+        seen: new SeenStore(join(home, "seen.jsonl")), deadLetter: new DeadLetterStore(join(home, "events.jsonl")),
+        actionDeadLetter: actions, destination: request.sourceSession,
+        resolveSender: () => ({ admitted: true, source: human }),
+        resolveRoute: () => ({ destination: request.sourceSession, correlationQitemId: qitemId }),
+        recordHumanAnswer: (input) => repo.recordHumanAnswer(input), log,
+      });
+      await expect(router.routeAction(payload)).resolves.toEqual({ status: "handler-failed", reason: "answer-recording-failed" });
+      expect(actions.readAll()).toMatchObject([{ ev: payload, attempts: 1 }]);
+      expect(repo.getById(qitemId)?.humanAnswers).toBeNull();
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("answer write failed"));
+      await expect(router.retryDeadLetters()).resolves.toMatchObject({ retried: 1, landed: 1 });
+      expect(actions.readAll()).toEqual([]);
+      expect(repo.getById(qitemId)?.humanAnswers).toEqual({ db: "pg" });
+      expect(record).toHaveBeenCalledTimes(2);
+    } finally { record.mockRestore(); }
+  });
+
+  it("keeps a newer partial answer when an older failed click retries", async () => {
+    const { qitemId } = await repo.create({ ...request, humanIntent: "decision", humanQuestions: questions });
+    const payload = { type: "block_actions", user: { id: "UFOUNDER" }, channel: { id: "C-TEST" },
+      container: { message_ts: "1.1" },
+      actions: [{ block_id: "or-q:db", action_id: "or-opt:pg", action_ts: "1000.5" }] };
+    const actions = new DeadLetterStore<typeof payload>(join(home, "actions.jsonl"));
+    const acknowledge = vi.fn(async () => true);
+    const record = vi.spyOn(repo, "recordHumanAnswer").mockImplementationOnce(() => { throw new Error("answer write failed"); });
+    try {
+      const router = new InboundRouter({
+        queue: makeQueuePorts(repo, { loadHumanRegistry: () => registry }),
+        seen: new SeenStore(join(home, "seen.jsonl")), deadLetter: new DeadLetterStore(join(home, "events.jsonl")),
+        actionDeadLetter: actions, destination: request.sourceSession,
+        resolveSender: () => ({ admitted: true, source: human }),
+        resolveRoute: () => ({ destination: request.sourceSession, correlationQitemId: qitemId }),
+        recordHumanAnswer: (input) => repo.recordHumanAnswer(input), acknowledgeAnswer: acknowledge,
+      });
+      expect(await router.routeAction(payload)).toMatchObject({ status: "handler-failed" });
+      await router.routeAction({ ...payload, actions: [{ ...payload.actions[0]!, action_id: "or-opt:sqlite", action_ts: "1001.5" }] });
+      expect(repo.getById(qitemId)?.humanAnswers).toEqual({ db: "sqlite" });
+      await expect(router.retryDeadLetters()).resolves.toMatchObject({ retried: 1, landed: 1 });
+      expect(repo.getById(qitemId)?.humanAnswers).toEqual({ db: "sqlite" });
+      expect(actions.readAll()).toEqual([]);
+      expect(acknowledge).toHaveBeenCalledWith(expect.objectContaining({ text: "Your answer reached OpenRig but wasn't recorded yet. OpenRig will retry it if this question has no answer yet; to change an answer you already gave, click it again." }));
+      await router.routeAction({ ...payload, actions: [{ ...payload.actions[0]!, action_ts: "1002.5" }] });
+      expect(repo.getById(qitemId)?.humanAnswers).toEqual({ db: "pg" });
+    } finally { record.mockRestore(); }
+  });
+
+  it("retains a same-value acceptance in the current park when another click retries", async () => {
+    const { qitemId } = await repo.create({ ...request, humanIntent: "decision", humanQuestions: questions });
+    const park = (messageTs: string) => {
+      repo.update({ qitemId, actorSession: request.sourceSession, state: "blocked", blockedOn: human });
+      const episode = repo.currentHumanRequiredEpisode(qitemId)!;
+      repo.update({ qitemId, actorSession: "openrig-slack",
+        transitionNote: `slack-owner-notification-posted notification_key=${episode.key} kind=human-required thread_ts=${messageTs} message_ts=${messageTs}` });
+      return Number(episode.key.slice(episode.key.lastIndexOf(":") + 1));
+    };
+    park("1.0");
+    repo.recordHumanAnswer({ qitemId, actorSession: human, questionId: "db", optionId: "sqlite", clickedTs: "1.1" });
+    repo.update({ qitemId, actorSession: request.sourceSession, state: "in-progress" });
+    const episodeStart = park("2.0");
+    const trail = () => repo.transitionLog.listForQitem(qitemId)
+      .filter(t => t.transitionId > episodeStart && t.transitionNote?.startsWith("human-answer-recorded:"));
+    const payload = { type: "block_actions", user: { id: "UFOUNDER" }, channel: { id: "C-TEST" },
+      container: { message_ts: "2.0" },
+      actions: [{ block_id: "or-q:db", action_id: "or-opt:sqlite", action_ts: "2.1" }] };
+    const actions = new DeadLetterStore<typeof payload>(join(home, "actions.jsonl"));
+    const router = new InboundRouter({
+      queue: makeQueuePorts(repo, { loadHumanRegistry: () => registry }),
+      seen: new SeenStore(join(home, "seen.jsonl")), deadLetter: new DeadLetterStore(join(home, "events.jsonl")),
+      actionDeadLetter: actions, destination: request.sourceSession,
+      resolveSender: () => ({ admitted: true, source: human }),
+      resolveRoute: () => ({ destination: request.sourceSession, correlationQitemId: qitemId }),
+      recordHumanAnswer: (input) => repo.recordHumanAnswer(input),
+    });
+    expect(await router.routeAction(payload)).toMatchObject({ status: "accepted" });
+    const firstAcceptanceCount = trail().length;
+    const firstAcceptanceTime = repo.getById(qitemId)!.tsUpdated;
+    await router.routeAction(payload);
+    expect(repo.getById(qitemId)!.tsUpdated).toBe(firstAcceptanceTime);
+    const duplicateCount = trail().length;
+    const record = vi.spyOn(repo, "recordHumanAnswer").mockImplementationOnce(() => { throw new Error("answer write failed"); });
+    try {
+      expect(await router.routeAction({ ...payload, actions: [{ ...payload.actions[0]!, action_id: "or-opt:pg", action_ts: "2.2" }] }))
+        .toMatchObject({ status: "handler-failed" });
+      await expect(router.retryDeadLetters()).resolves.toMatchObject({ retried: 1, landed: 1 });
+      expect(repo.getById(qitemId)?.humanAnswers).toEqual({ db: "sqlite" });
+      expect(firstAcceptanceCount).toBe(1);
+      expect(duplicateCount).toBe(1);
+      expect(trail()).toHaveLength(1);
+      expect(actions.readAll()).toEqual([]);
+    } finally { record.mockRestore(); }
+  });
+
   describe("recording answers", () => {
     const answer = (qitemId: string, questionId: string, optionId: string, actorSession = human) => repo.recordHumanAnswer({ qitemId, actorSession, questionId, optionId });
 
@@ -159,7 +262,8 @@ describe("structured human questions (#193)", () => {
       const { text } = render();
       for (const s of ["Which database?", "Postgres (recommended)", "SQLite", "Ship this week?", "Yes", "No"]) expect(text).toContain(s);
       expect(text).toMatch(/reply in this thread/i);
-      expect(JSON.stringify(render().blocks)).toMatch(/reply in this thread/i);
+      expect(text).toContain("A typed reply submits your answer without waiting for every question");
+      expect(JSON.stringify(render().blocks)).toContain("A typed reply submits your answer without waiting for every question");
     });
 
     it("escapes question and option text like any other queue-authored field", () => {
@@ -167,6 +271,24 @@ describe("structured human questions (#193)", () => {
       const json = JSON.stringify(blocks);
       expect(json).not.toContain("<!channel>");
       expect(json).toContain("&lt;!channel&gt;");
+    });
+
+    it.each([{ sharedChannel: false }, { sharedChannel: true }])("a resolved notice carries no buttons and no reply hint, in blocks or fallback (sharedChannel=$sharedChannel)", ({ sharedChannel }) => {
+      const resolved = buildOutboundMessage({ qitemId: "q", summary: "Two quick questions", body: "Pick one for each.", humanQuestions: questions, ownerNotificationKind: "human-decision-resolved", sharedChannel }, { sourceLabel: "proof" });
+      expect((resolved.blocks as Block[]).some((b) => b.type === "actions")).toBe(false);
+      expect(JSON.stringify(resolved.blocks)).not.toMatch(/reply in this thread|Or reply in this thread/i);
+      expect(resolved.text).not.toMatch(/reply in this thread/i);
+      // The question still reads as history: its text and options are kept, without the live controls.
+      for (const s of ["Which database?", "Postgres (recommended)", "Ship this week?", "No"]) expect(resolved.text).toContain(s);
+    });
+
+    it("an open ask keeps its buttons and reply hint, and so does a shared-channel ask", () => {
+      for (const sharedChannel of [false, true]) {
+        const open = buildOutboundMessage({ qitemId: "q", summary: "S", body: "B", humanQuestions: questions, ownerNotificationKind: "human-required", sharedChannel }, { sourceLabel: "proof" });
+        const hasButtons = (open.blocks as Block[]).some((b) => b.type === "actions");
+        expect(hasButtons).toBe(!sharedChannel);
+        expect(open.text).toMatch(/reply in this thread/i);
+      }
     });
 
     it("renders a plain decision exactly as before", () => {
@@ -271,6 +393,32 @@ describe("structured human questions (#193)", () => {
       } } }) });
       await vi.waitFor(() => expect(finals(envelopeId).length).toBe(before + 1));
     }
+
+    it("answer trail: each partial Slack click records its mapped person", async () => {
+      await click("db", "pg");
+      const trail = repo.transitionLog.listForQitem(decisionId).filter(t => t.transitionNote?.startsWith("human-answer-recorded:"));
+      expect(trail).toEqual([expect.objectContaining({ actorSession: human,
+        identityProvenance: "gateway:slack:v1", identityPrincipal: registry.entities[0]!.entityId })]);
+      expect(repliesToSeat()).toEqual([]);
+    });
+
+    it("answer trail: a completed Slack reply exposes the mapped person's provenance", async () => {
+      await click("db", "pg");
+      await click("ship", "yes");
+      expect(repo.answersForAsk(decisionId)).toEqual([expect.objectContaining({ by: human,
+        recordedIdentity: { provenance: "gateway:slack:v1", principal: registry.entities[0]!.entityId } })]);
+      const reply = repliesToSeat()[0]!;
+      const before = repo.transitionLog.listForQitem(decisionId).length;
+      await click("ship", "yes");
+      expect(repliesToSeat().map(row => row.qitemId)).toEqual([reply.qitemId]);
+      expect(repo.transitionLog.listForQitem(decisionId)).toHaveLength(before);
+    });
+
+    it("answer trail: a typed Slack answer uses the same mapped person on its reply", async () => {
+      await typeReply("Use Postgres and ship this week");
+      expect(repo.answersForAsk(decisionId)).toEqual([expect.objectContaining({ by: human,
+        recordedIdentity: { provenance: "gateway:slack:v1", principal: registry.entities[0]!.entityId } })]);
+    });
 
     it("posts the buttons, records each click, and resolves back to the seat once every question is answered", async () => {
       expect(JSON.stringify(posts[0]?.blocks)).toContain("or-opt:pg");
@@ -384,9 +532,35 @@ describe("structured human questions (#193)", () => {
       await click("ship", "yes", { actionTs: "2001.1" }); // a real late click
       await click("ship", "yes", { actionTs: "2001.1" }); // and its redelivery
       await vi.waitFor(() => expect(threadAcks()).toHaveLength(3));
-      expect(threadAcks()[2]).toBe(CLICK_REPLIES.closed);
-      expect(threadAcks().filter((t) => t === CLICK_REPLIES.closed)).toHaveLength(1);
+      expect(threadAcks()[2]).toContain("Already answered; the original answer went to author@rig as ");
+      expect(threadAcks().filter((t) => t.startsWith("Already answered"))).toHaveLength(1);
       expect(repliesToSeat()).toHaveLength(1);
+    });
+
+    it("a late click on a decision made on the person's behalf names who decided it, under which mode, and what", async () => {
+      repo.db.prepare("UPDATE queue_items SET delegated_decision = ? WHERE qitem_id = ?").run(JSON.stringify({ applicationId: "a-1", modeName: "asleep",
+        decisionRoom: { words: "database choices", exclusions: [] }, decidedBy: "builder@rig", decidedAt: "2026-10-21T02:00:00.000Z", reason: "recommended", reversible: false,
+        choices: [{ questionId: "db", question: "Which database?", options: [{ id: "pg", label: "Postgres" }], chosen: "pg" },
+          { questionId: "ship", question: "Ship this week?", options: [{ id: "yes", label: "Yes" }], chosen: "yes" }] }), decisionId);
+      await repo.update({ qitemId: decisionId, actorSession: "builder@rig", state: "done", closureReason: "no-follow-on" } as never);
+      await click("db", "mysql");
+      await vi.waitFor(() => expect(threadAcks()).toHaveLength(1));
+      expect(threadAcks()[0]).toBe("This was decided on your behalf by builder@rig under asleep: Postgres, Yes (it can't be undone). "
+        + "Your click wasn't recorded; it's listed in that mode's account.");
+      expect(repo.getById(decisionId)?.humanAnswers).toBeNull();
+    });
+
+    it("the reply naming a decision made for the person goes through the same escaping and redaction as other replies", async () => {
+      repo.db.prepare("UPDATE queue_items SET delegated_decision = ? WHERE qitem_id = ?").run(JSON.stringify({ applicationId: "a-1", modeName: "asleep <!channel>",
+        decisionRoom: { words: "database choices", exclusions: [] }, decidedBy: "builder@rig", decidedAt: "2026-10-21T02:00:00.000Z", reason: "recommended", reversible: true,
+        choices: [{ questionId: "db", question: "Which database?", options: [{ id: "pg", label: "Notify <!here>" }], chosen: "pg" },
+          { questionId: "ship", question: "Ship this week?", options: [{ id: "yes", label: "Use xoxb-LEAK-label" }], chosen: "yes" }] }), decisionId);
+      await repo.update({ qitemId: decisionId, actorSession: "builder@rig", state: "done", closureReason: "no-follow-on" } as never);
+      await click("db", "mysql");
+      await vi.waitFor(() => expect(threadAcks()).toHaveLength(1));
+      expect(threadAcks()[0]).toContain("under asleep &lt;!channel&gt;: Notify &lt;!here&gt;, ");
+      expect(threadAcks()[0]).toContain("[redacted-secret]");
+      expect(threadAcks()[0]).not.toMatch(/<!here>|<!channel>|xoxb-LEAK/);
     });
 
     it("tells the person when a button no longer matches the decision, or its message can't be matched", async () => {
@@ -416,7 +590,7 @@ describe("structured human questions (#193)", () => {
       expect(threadAcks()).toHaveLength(1);
       await click("ship", "yes", { actionTs: "2200.1" }); // Socket Mode redelivery of that click
       await vi.waitFor(() => expect(threadAcks()).toHaveLength(2));
-      expect(threadAcks()[1]).toBe(CLICK_REPLIES.onRecord);
+      expect(threadAcks()[1]).toContain("Already answered; the original answer went to author@rig as ");
       await click("ship", "yes", { actionTs: "2200.1" }); // and once posted, never again
       expect(threadAcks()).toHaveLength(2);
       expect(repliesToSeat()).toHaveLength(1);
@@ -494,6 +668,22 @@ describe("structured human questions (#193)", () => {
       );
       expect(repliesToSeat()).toHaveLength(1);
       expect(repliesToSeat()[0]?.body).toContain(text);
+      expect(repliesToSeat()[0]?.body).toContain("Read the person's words; closing the decision does not mean approval.");
+    });
+
+    it("#2299 recognizes an old-footer answer replay after the ask closes, but not a different event", async () => {
+      const text = "Not yet, revise the plan.";
+      await typeReply(text, { ts: "3001.1" });
+      const answer = repliesToSeat()[0]!;
+      const oldBody = answer.body.replace("\nRead the person's words; closing the decision does not mean approval.", "");
+      repo.db.prepare("UPDATE queue_items SET body = ? WHERE qitem_id = ?").run(oldBody, answer.qitemId);
+      rmSync(join(home, "state", "slack-inbound-seen.jsonl"), { force: true });
+      await typeReply(text, { ts: "3001.1" });
+      expect(repliesToSeat()).toHaveLength(1);
+      expect(repliesToSeat()[0]!.body).toBe(oldBody);
+      await typeReply("A different follow-up.", { ts: "3002.1" });
+      expect(repliesToSeat()).toHaveLength(2);
+      expect(repliesToSeat().some((row) => row.body.includes("A different follow-up."))).toBe(true);
     });
 
     it("preserves a previous button answer when the remaining question gets a typed reply", async () => {
@@ -597,5 +787,21 @@ describe("a click reply with nothing to post it", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// C8: what a settled card names, in question order: a clicked option's label (its id if the label is gone), null for a
+// typed reply, nothing for an unanswered question or an inherited key.
+describe("chosenAnswers", () => {
+  const asked = [
+    { id: "db", question: "Which database?", options: [{ id: "pg", label: "Postgres" }, { id: "lite", label: "SQLite" }] },
+    { id: "ship", question: "Ship this week?", options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }] },
+    { id: "constructor", question: "Owner?", options: [{ id: "me", label: "Me" }, { id: "you", label: "You" }] },
+  ];
+  it("labels clicks, marks a typed reply, and skips the unanswered", () => {
+    const typed = { kind: "typed-reply" as const, text: "Not yet", placement: "first-unanswered" as const, unansweredCount: 1 };
+    expect(chosenAnswers(asked, { ship: "yes", db: "pg" })).toEqual(["Postgres", "Yes"]);
+    expect(chosenAnswers(asked, { db: "gone", ship: typed })).toEqual(["gone", null]);
+    expect(chosenAnswers(asked, {})).toEqual([]);
   });
 });

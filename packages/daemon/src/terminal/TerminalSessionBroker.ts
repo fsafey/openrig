@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { TmuxResult, TmuxCursorPosition } from "../adapters/tmux.js";
+import { newPinHolder, readPinSizing, recordPin, releasePin, WINDOW_SIZE_PRIOR_OPTION, withWindowPin } from "./window-pin.js";
 
 // OPR.0.4.0.38 - real-terminal session broker.
 //
@@ -14,8 +15,8 @@ import type { TmuxResult, TmuxCursorPosition } from "../adapters/tmux.js";
 // for the same session (the per-connection bug): a second viewer of one seat
 // fought the first for output. The broker fixes that: ONE tmux pipe per
 // session, MANY subscribers, output fanned out to all, each subscriber seeded
-// with a cursor-safe snapshot of the current screen on attach, fixed geometry
-// (no client-driven resize), honest session-death reporting to ALL subscribers,
+// with a cursor-safe snapshot of the current screen on attach, optional fixed geometry,
+// honest session-death reporting to ALL subscribers,
 // and full cleanup when the last subscriber leaves.
 
 const PIPE_PANE_POLL_MS = 50;
@@ -32,15 +33,9 @@ const DEFAULT_LIVENESS_MS = 2000;
 const MAX_HISTORY_BYTES = 64 * 1024;
 
 /**
- * Canonical fixed terminal geometry (FR-7). 90 cols (OPR.0.4.0.39, founder-directed):
- * Claude Code (Ink) + Codex CLI are RESPONSIVE TUIs that reflow to whatever width they
- * are given - they have no required width; 80 is the legacy fallback that users find
- * too narrow, so 90 sits comfortably above the 80 floor while being narrower than 120 so
- * the scaled static/live mirror reads bigger (more legible) in the topology grid cells.
- * 27 rows gives the classic-terminal 1.72:1 landscape shape (90x27 = ~650x378px, matching the canonical 80x24 aspect) (founder: classic terminal rectangle) while staying a workable agent-TUI height; subscribers fit/scroll/pan their
- * viewport but never resize the pane - so multiple viewers cannot shrink the session to
- * the smallest one. MUST stay in sync with the client mirror LIVE_TERMINAL_COLS
- * (packages/ui/.../terminal/terminal-geometry.ts) - the xterm grid must match the pane.
+ * Browser rendering grid and explicit fixed-geometry opt-in size. The default broker does not resize the
+ * agent PTY; native clients control it. Keep these browser grid values in sync with LIVE_TERMINAL_COLS/ROWS
+ * in packages/ui/src/terminal/terminal-geometry.ts. This does not make the browser a native sizing client.
  */
 export const CANONICAL_COLS = 90;
 export const CANONICAL_ROWS = 27;
@@ -59,19 +54,27 @@ export interface BrokerTmux {
   humanInput?<T>(name: string, fn: () => Promise<T>): Promise<T>;
   hasSession(name: string): Promise<boolean>;
   setWindowOption(name: string, option: string, value: string): Promise<TmuxResult>;
+  /** The window's own value (null: none set, so it inherits; undefined: unreadable). */
+  getWindowLocalOption?(name: string, option: string): Promise<string | null | undefined>;
+  /** The window a session name (its current window) or `@N` names: its immutable id and one of its user options ("" when
+   *  unset); null: unreadable. */
+  readWindow?(target: string, userOption: string): Promise<{ id: string; userOption: string } | null>;
+  restoreWindowOption?(name: string, option: string, value: string | null): Promise<TmuxResult>;
   resizeWindow(name: string, cols: number, rows: number): Promise<TmuxResult>;
   startPipePane(name: string, outputPath: string): Promise<TmuxResult>;
   stopPipePane(name: string): Promise<TmuxResult>;
   sendKeys(name: string, keys: string[]): Promise<TmuxResult>;
   sendText(name: string, text: string): Promise<TmuxResult>;
-  capturePaneScreen(name: string): Promise<string | null>;
+  capturePaneScreen(name: string, opts?: { escapeSequences?: boolean }): Promise<string | null>;
   getPaneCursorPosition(name: string): Promise<TmuxCursorPosition | null>;
   /** Capture the last `lines` lines INCLUDING scrollback history (tmux
    *  capture-pane -S -lines). Used for the per-subscriber scroll-back window. */
-  capturePaneContent(name: string, lines: number): Promise<string | null>;
+  capturePaneContent(name: string, lines: number, opts?: { escapeSequences?: boolean }): Promise<string | null>;
 }
 
 export interface BrokerOptions {
+  /** Explicit web fixed-geometry opt-in. Default false; native clients otherwise own the PTY size. */
+  fixedGeometry?: boolean | (() => boolean);
   /** File-tail poll interval (ms). Default 50. */
   pollMs?: number;
   /** Session-liveness probe interval (ms). Default 2000. */
@@ -102,26 +105,25 @@ export function cursorPositionEscape(x: number, y: number): string {
  * exact same rows tmux has it - never a relative append that drifts as content
  * scrolls. Normalizes CRLF, drops one trailing print newline, and (when a pane
  * height is known and the capture is taller) keeps only the last `height` rows.
- * Lifted from the FR-4 seed work.
+ * SGR carries across captured rows. Replay skipped rows' SGR, and reset only at the paint boundaries.
  */
 export function screenSnapshotEscape(
   snapshot: string,
   cursor: { x: number; y: number; height?: number } | null,
+  priorRows = "",
 ): string {
   const normalized = snapshot.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const withoutTrailingPrintNewline = normalized.endsWith("\n")
     ? normalized.slice(0, -1)
     : normalized;
   const rows = withoutTrailingPrintNewline.split("\n");
-  const visibleRows = cursor?.height && rows.length > cursor.height
-    ? rows.slice(rows.length - cursor.height)
-    : rows;
-
-  const paintedRows = visibleRows
+  const firstRow = cursor?.height ? Math.max(0, rows.length - cursor.height) : 0;
+  const priorStyle = `${priorRows}\n${rows.slice(0, firstRow).join("\n")}`.match(/\x1b\[[0-9;:]*m/g)?.join("") ?? "";
+  const paintedRows = rows.slice(firstRow)
     .map((row, index) => `\x1b[${index + 1};1H${row}`)
     .join("");
 
-  return `\x1b[2J${paintedRows}${cursor ? cursorPositionEscape(cursor.x, cursor.y) : "\x1b[H"}`;
+  return `\x1b[0m\x1b[2J${priorStyle}${paintedRows}\x1b[0m${cursor ? cursorPositionEscape(cursor.x, cursor.y) : "\x1b[H"}`;
 }
 
 /**
@@ -185,10 +187,16 @@ export class TerminalSessionBroker {
   private openPromise: Promise<{ ok: true } | { ok: false; code: number; reason: string }> | null = null;
   private tailStarted = false;
   private torndown = false;
+  private teardownPromise: Promise<void> | null = null;
   // The honest close reason a subscriber should get if it resumes (after an
   // async open/seed) to find the broker already torn down. Set on every
   // teardown path so a late/racing attach never goes silently live.
   private lastClose: { code: number; reason: string } | null = null;
+  // The window this broker pinned, by its immutable id, and listed itself as a holder of. When the last live holder lets
+  // go, the window gets back its own `window-size`, so native clients (Herdr, attach) size it again. Null: nothing held.
+  private pinnedWindow: string | null = null;
+  private readonly fixedGeometry: boolean;
+  private readonly holder = newPinHolder();
 
   constructor(sessionName: string, tmux: BrokerTmux, opts: BrokerOptions = {}) {
     this.sessionName = sessionName;
@@ -197,6 +205,7 @@ export class TerminalSessionBroker {
     this.livenessMs = opts.livenessMs ?? DEFAULT_LIVENESS_MS;
     this.cols = opts.cols ?? CANONICAL_COLS;
     this.rows = opts.rows ?? CANONICAL_ROWS;
+    this.fixedGeometry = typeof opts.fixedGeometry === "function" ? opts.fixedGeometry() : opts.fixedGeometry === true;
     this.maxHistoryBytes = opts.maxHistoryBytes ?? MAX_HISTORY_BYTES;
     this.onEmpty = opts.onEmpty;
   }
@@ -213,6 +222,14 @@ export class TerminalSessionBroker {
   /** The session-scoped pipe output file (one per session). Null until open. */
   get pipeOutputPath(): string | null {
     return this.outputPath;
+  }
+
+  get isTorndown(): boolean {
+    return this.torndown;
+  }
+
+  get teardownComplete(): Promise<void> {
+    return this.teardownPromise ?? Promise.resolve();
   }
 
   /**
@@ -248,7 +265,11 @@ export class TerminalSessionBroker {
       this.lastClose = { code: open.code, reason: open.reason };
       this.torndown = true;
       this.teardownResources();
-      this.onEmpty?.(this.sessionName);
+      this.teardownPromise = (async () => {
+        await this.restoreWindowSize();
+        this.onEmpty?.(this.sessionName);
+      })();
+      await this.teardownPromise;
       sub.close(open.code, open.reason);
       return;
     }
@@ -285,6 +306,10 @@ export class TerminalSessionBroker {
   async input(msg: TerminalInputMessage): Promise<void> {
     if (this.torndown) return;
     await this.enqueueInput(async () => {
+      // A caller may have queued this write while an earlier input was in
+      // flight. Drop it if the last subscriber detached before its turn;
+      // otherwise stale terminal input would reach the seat after teardown.
+      if (this.torndown) return;
       const write = async () => {
         if (msg.type === "keys") await this.tmux.sendKeys(this.sessionName, msg.keys);
         else if (msg.type === "text") await this.tmux.sendText(this.sessionName, msg.text);
@@ -305,8 +330,14 @@ export class TerminalSessionBroker {
     if (this.torndown || !this.subscribers.has(sub)) return;
     const clamped = Math.max(0, Math.floor(offset));
     if (clamped === 0) {
-      this.scrollOffsets.delete(sub);
-      await this.repaintScreen(sub);
+      // Keep the subscriber out of live fanout until the screen repaint is complete.
+      // Otherwise new pipe bytes can arrive before the snapshot and be overwritten.
+      this.scrollOffsets.set(sub, 1);
+      try {
+        await this.repaintScreen(sub);
+      } finally {
+        this.scrollOffsets.delete(sub);
+      }
       return;
     }
     this.scrollOffsets.set(sub, clamped);
@@ -318,7 +349,7 @@ export class TerminalSessionBroker {
     // the TOP `rows` would jump a whole extra screen up on the first wheel notch.
     let content: string | null = null;
     try {
-      content = await this.tmux.capturePaneContent(this.sessionName, clamped + this.rows);
+      content = await this.tmux.capturePaneContent(this.sessionName, clamped + this.rows, { escapeSequences: true });
     } catch {
       content = null;
     }
@@ -328,11 +359,10 @@ export class TerminalSessionBroker {
     // element is the true live-bottom row and the offset stays honest.
     if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
     const bottom = lines.length - clamped; // exclusive end: the window sits `offset` up
-    const window = bottom <= this.rows
-      ? lines.slice(0, this.rows) // scrolled at/past the top of history: oldest screenful
-      : lines.slice(bottom - this.rows, bottom);
+    const firstRow = Math.max(0, bottom - this.rows);
+    const window = lines.slice(firstRow, firstRow + this.rows);
     try {
-      sub.send(screenSnapshotEscape(window.join("\n"), null));
+      sub.send(screenSnapshotEscape(window.join("\n"), null, lines.slice(0, firstRow).join("\n")));
     } catch { /* dead subscriber */ }
   }
 
@@ -340,7 +370,7 @@ export class TerminalSessionBroker {
   private async repaintScreen(sub: TerminalSubscriber): Promise<void> {
     let snapshot: string | null = null;
     let cursor: TmuxCursorPosition | null = null;
-    try { snapshot = await this.tmux.capturePaneScreen(this.sessionName); } catch { snapshot = null; }
+    try { snapshot = await this.tmux.capturePaneScreen(this.sessionName, { escapeSequences: true }); } catch { snapshot = null; }
     try { cursor = await this.tmux.getPaneCursorPosition(this.sessionName); } catch { cursor = null; }
     if (snapshot !== null) {
       try { sub.send(screenSnapshotEscape(snapshot, cursor)); } catch { /* dead */ }
@@ -359,19 +389,26 @@ export class TerminalSessionBroker {
     }
   }
 
-  /** Force teardown (used by the registry/route on shutdown and by tests). */
-  dispose(): void {
-    if (this.torndown) return;
+  /** Force teardown (used by the registry/route on shutdown and by tests). Resolves once the sizing is given back. */
+  async dispose(): Promise<void> {
+    if (this.torndown) return this.teardownPromise ?? Promise.resolve();
     this.lastClose = { code: 1011, reason: "terminal broker unavailable" };
     this.torndown = true;
     this.subscribers.clear();
     this.scrollOffsets.clear();
-    if (this.pipeActive) {
-      this.pipeActive = false;
-      void this.tmux.stopPipePane(this.sessionName).catch(() => {});
-    }
     this.teardownResources();
-    this.onEmpty?.(this.sessionName);
+    this.teardownPromise = (async () => {
+      if (this.pipeActive) {
+        this.pipeActive = false;
+        await this.tmux.stopPipePane(this.sessionName).catch(() => {});
+      }
+      // An open still in flight finishes its pin first, so the release below sees it. Then, before onEmpty as in
+      // teardown, the release: a broker created next reads the given-back value, not this one's pin.
+      await this.openPromise?.catch(() => {});
+      await this.restoreWindowSize();
+      this.onEmpty?.(this.sessionName);
+    })();
+    return this.teardownPromise;
   }
 
   private async openPipe(): Promise<{ ok: true } | { ok: false; code: number; reason: string }> {
@@ -381,11 +418,14 @@ export class TerminalSessionBroker {
     const alive = await this.tmux.hasSession(this.sessionName);
     if (!alive) return { ok: false, code: 1008, reason: `session not found: ${this.sessionName}` };
 
-    // FR-7 fixed geometry: window-size manual so tmux will NOT auto-shrink the
-    // window to the smallest attached client; then the canonical width/height
-    // ONCE. Deliberately NOT aggressive-resize, which does the opposite.
-    await this.tmux.setWindowOption(this.sessionName, "window-size", "manual").catch(() => {});
-    await this.tmux.resizeWindow(this.sessionName, this.cols, this.rows).catch(() => {});
+    // Fixed web geometry is explicit opt-in. Record each holder on the immutable window id;
+    // the last release unsets the temporary override so native clients size it again.
+    // Unknown sizing is observed without making an untracked manual pin.
+    if (this.fixedGeometry) {
+      const window = (await this.tmux.readWindow?.(this.sessionName, WINDOW_SIZE_PRIOR_OPTION).catch(() => null))?.id ?? null;
+      const pinned = await (window ? withWindowPin(window, () => this.pinWindow(window)) : this.pinWindow(null));
+      if (!pinned || this.torndown) return { ok: false, code: 1011, reason: "terminal broker unavailable" };
+    }
 
     const outputPath = path.join(
       os.tmpdir(),
@@ -410,6 +450,21 @@ export class TerminalSessionBroker {
     return { ok: true };
   }
 
+  /** Read the window's sizing, record this broker as a holder, then pin the window (FR-7). False: disposed first. */
+  private async pinWindow(window: string | null): Promise<boolean> {
+    const sizing = window ? await readPinSizing(this.tmux, window) : null;
+    if (this.torndown) return false; // disposed: pin nothing
+    if (!sizing) return true; // Unknown geometry: observe normally rather than leave an untracked manual pin.
+    // A person's fixed window is not an OpenRig pin to take over or unset.
+    if (sizing.live === "manual" && !(await this.tmux.readWindow?.(sizing.window, WINDOW_SIZE_PRIOR_OPTION).catch(() => null))?.userOption.trim()) return true;
+    this.pinnedWindow = sizing.window;
+    if (!(await recordPin(this.tmux, sizing, this.holder))) { this.pinnedWindow = null; return true; }
+    const target = sizing.window;
+    await this.tmux.setWindowOption(target, "window-size", "manual").catch(() => {});
+    await this.tmux.resizeWindow(target, this.cols, this.rows).catch(() => {});
+    return true;
+  }
+
   private async seed(sub: TerminalSubscriber): Promise<void> {
     // AC-5: replay the broker-owned recent-output ring FIRST so the late
     // subscriber's xterm builds the same scrollback the earlier subscribers
@@ -427,7 +482,7 @@ export class TerminalSessionBroker {
     let snapshot: string | null = null;
     let cursor: TmuxCursorPosition | null = null;
     try {
-      snapshot = await this.tmux.capturePaneScreen(this.sessionName);
+      snapshot = await this.tmux.capturePaneScreen(this.sessionName, { escapeSequences: true });
     } catch {
       snapshot = null;
     }
@@ -512,25 +567,21 @@ export class TerminalSessionBroker {
       this.tmux
         .hasSession(this.sessionName)
         .then((alive) => {
-          if (!alive) this.handleSessionDeath();
+          if (!alive) void this.handleSessionDeath();
         })
         .catch(() => {
-          this.handleSessionDeath();
+          void this.handleSessionDeath();
         });
     }, this.livenessMs);
   }
 
   /** FR-5: a dead session closes ALL subscribers honestly - never silent stale-live. */
-  private handleSessionDeath(): void {
-    if (this.torndown) return;
+  private async handleSessionDeath(): Promise<void> {
+    if (this.torndown) return this.teardownPromise ?? Promise.resolve();
     this.lastClose = { code: 1001, reason: "tmux session terminated" };
     this.torndown = true;
     const subs = [...this.subscribers];
     this.subscribers.clear();
-    if (this.pipeActive) {
-      this.pipeActive = false;
-      void this.tmux.stopPipePane(this.sessionName).catch(() => {});
-    }
     this.teardownResources();
     for (const sub of subs) {
       try {
@@ -539,19 +590,42 @@ export class TerminalSessionBroker {
         // already-closed subscriber is fine
       }
     }
-    this.onEmpty?.(this.sessionName);
+    this.teardownPromise = (async () => {
+      if (this.pipeActive) {
+        this.pipeActive = false;
+        await this.tmux.stopPipePane(this.sessionName).catch(() => {});
+      }
+      // A probe that couldn't reach tmux isn't proof the window is gone, so give the sizing back anyway. It acts only on a
+      // window that still lists this broker, so a gone window or one on a restarted tmux server is left alone.
+      await this.restoreWindowSize();
+      this.onEmpty?.(this.sessionName);
+    })();
+    return this.teardownPromise;
   }
 
   private async teardown(): Promise<void> {
-    if (this.torndown) return;
+    if (this.torndown) return this.teardownPromise ?? Promise.resolve();
     this.lastClose = { code: 1011, reason: "terminal broker unavailable" };
     this.torndown = true;
-    if (this.pipeActive) {
-      this.pipeActive = false;
-      await this.tmux.stopPipePane(this.sessionName).catch(() => {});
-    }
     this.teardownResources();
-    this.onEmpty?.(this.sessionName);
+    this.teardownPromise = (async () => {
+      if (this.pipeActive) {
+        this.pipeActive = false;
+        await this.tmux.stopPipePane(this.sessionName).catch(() => {});
+      }
+      // Before onEmpty: a later broker for this window then reads the restored value, not this one's pin.
+      await this.restoreWindowSize();
+      this.onEmpty?.(this.sessionName);
+    })();
+    return this.teardownPromise;
+  }
+
+  /** Let go of the pinned window, once: drop this broker from its holders, and when no live holder is left, give back
+   *  the `window-size` it had before the first pin. */
+  private async restoreWindowSize(): Promise<void> {
+    const window = this.pinnedWindow;
+    this.pinnedWindow = null;
+    if (window) await releasePin(this.tmux, window, this.holder);
   }
 
   private teardownResources(): void {
@@ -592,6 +666,7 @@ export class TerminalSessionBroker {
  */
 export class TerminalBrokerRegistry {
   private readonly brokers = new Map<string, TerminalSessionBroker>();
+  private readonly pendingTeardown = new Map<string, Promise<void>>();
 
   constructor(private readonly tmux: BrokerTmux, private readonly opts: BrokerOptions = {}) {}
 
@@ -600,28 +675,51 @@ export class TerminalBrokerRegistry {
   }
 
   get(sessionName: string): TerminalSessionBroker | undefined {
-    return this.brokers.get(sessionName);
+    const broker = this.brokers.get(sessionName);
+    return broker && !broker.isTorndown ? broker : undefined;
   }
 
   /** Get-or-create the broker for a session, attach the subscriber, return the broker. */
   async attach(sessionName: string, sub: TerminalSubscriber): Promise<TerminalSessionBroker> {
     let broker = this.brokers.get(sessionName);
-    if (!broker) {
+    if (!broker || broker.isTorndown) {
+      const priorTeardown = broker?.teardownComplete;
       broker = new TerminalSessionBroker(sessionName, this.tmux, {
         ...this.opts,
         onEmpty: (name) => {
-          this.brokers.delete(name);
+          if (this.brokers.get(name) === broker) {
+            this.brokers.delete(name);
+          }
           this.opts.onEmpty?.(name);
         },
       });
       this.brokers.set(sessionName, broker);
+      if (priorTeardown) {
+        const pending = this.pendingTeardown.get(sessionName);
+        const p = Promise.allSettled(
+          pending ? [pending, priorTeardown] : [priorTeardown],
+        ).then((results) => {
+          for (const result of results) {
+            if (result.status === "rejected") throw result.reason;
+          }
+        }).finally(() => {
+          if (this.pendingTeardown.get(sessionName) === p) {
+            this.pendingTeardown.delete(sessionName);
+          }
+        });
+        this.pendingTeardown.set(sessionName, p);
+      }
+    }
+    const pending = this.pendingTeardown.get(sessionName);
+    if (pending) {
+      await pending;
     }
     try {
       await broker.attach(sub);
     } catch (error) {
       // A rejected open never registers the subscriber, so detach cannot evict
       // this broker or remove a partially created output file.
-      broker.dispose();
+      await broker.dispose();
       throw error;
     }
     return broker;

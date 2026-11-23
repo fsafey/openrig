@@ -310,6 +310,20 @@ it("picks the project the bundle's rig claims for a row that names only its miss
   expect(result.context!.sources).toContain(join(t.home, "workspace.yaml") + "#selected-by=rig:bundle-rig");
 });
 
+it.each(["0", "person-terminal", "custom@other-rig"])("keeps rig project inference with physical binding %s", async physical => {
+  const t = await inferenceSetup();
+  const address = t.seat("bundle-rig", join(t.home, "mine", "missions"));
+  const sessions = new SessionRegistry(t.db);
+  const nodeId = (t.db.prepare("SELECT node_id FROM sessions WHERE session_name=?").get(address) as { node_id: string }).node_id;
+  sessions.markSuperseded((t.db.prepare("SELECT id FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1").get(nodeId) as { id: string }).id);
+  sessions.registerClaimedSession(nodeId, physical);
+  sessions.updateBinding(nodeId, { tmuxSession: physical, tmuxPane: "%42" });
+  await t.row("claimed", address, ["mission:release"]);
+  const result = t.service.resolve({ qitemId: "claimed" });
+  expect(result).toMatchObject({ posture: "human-led", source: "product-default", context: { projectId: "bundle", missionId: "release", paths: { project: join(t.home, "bundle") } } });
+  expect(result.context!.sources).toContain(join(t.home, "workspace.yaml") + "#selected-by=rig:bundle-rig");
+});
+
 it("picks the user's own project for its unclaimed rig by working folder, then as the only unclaimed entry", async () => {
   const t = await inferenceSetup();
   await t.row("by-folder", t.seat("user-rig", join(t.home, "mine", "missions")), ["mission:release"]);
@@ -342,4 +356,35 @@ it("leaves explicit projects alone and stays unknown when no single project is i
   const unclaimedPair = await inferenceSetup("projects: [{id: bundle, root: bundle}, {id: mine, root: mine}]\n");
   await unclaimedPair.row("pair", unclaimedPair.seat("user-rig", join(unclaimedPair.home, "elsewhere")), ["mission:release"]);
   expect(unclaimedPair.service.resolve({ qitemId: "pair" })).toMatchObject({ posture: "unknown", reason: expect.stringContaining("multiple projects are declared") });
+});
+
+it("resolves a row tagged with a project's former id as that project, and records the mapping (#3261)", async () => {
+  const t = await setup();
+  t.write("alpha/project.yaml", "metadata: {id: alpha}\naliases: [old-alpha]\n");
+  await t.queue.create({ qitemId: "renamed", sourceSession: "author@demo", destinationSession: "owner@demo", body: "Tagged before the rename", tags: ["project:old-alpha", "mission:release", "slice:work-1"], nudge: false });
+  expect((await t.put("delegated", "project", "alpha")).status).toBe(200);
+  const result = t.service.resolve({ qitemId: "renamed" });
+  expect(result).toMatchObject({ posture: "delegated", binding: { id: "project:alpha" }, context: { projectId: "alpha", workstreamId: "alpha/release/work-1" } });
+  expect(result.context!.sources).toContain(join(realpathSync(t.home), "workspace.yaml") + "#former-id=old-alpha");
+});
+
+it("reads a current project and a row tagged with its former id as one project, and keeps a real conflict (#3261)", async () => {
+  const t = await setup();
+  t.write("alpha/project.yaml", "metadata: {id: alpha}\naliases: [old-alpha]\n");
+  await t.queue.create({ qitemId: "renamed", sourceSession: "author@demo", destinationSession: "owner@demo", body: "Tagged before the rename", tags: ["project:old-alpha", "mission:release", "slice:work-1"], nudge: false });
+  expect((await t.put("delegated", "project", "alpha")).status).toBe(200);
+  expect(t.service.resolve({ projectId: "alpha", qitemId: "renamed" })).toMatchObject({ posture: "delegated", binding: { id: "project:alpha" }, context: { projectId: "alpha" } });
+  expect(t.service.resolve({ projectId: "beta", qitemId: "renamed" })).toMatchObject({ posture: "unknown", reason: expect.stringContaining("conflicting projectId") });
+});
+
+it("resolves a workspace's former id from its own project.yaml when there's no catalog, without changing stored tags (#3261)", async () => {
+  const t = await setup();
+  rmSync(join(t.home, "workspace.yaml"));
+  t.write("project.yaml", "metadata: {id: alpha}\naliases: [old-alpha]\nmissions: {root: alpha/missions}\n");
+  await t.queue.create({ qitemId: "renamed", sourceSession: "author@demo", destinationSession: "owner@demo", body: "Tagged before the rename", tags: ["project:old-alpha", "mission:release", "slice:work-1"], nudge: false });
+  expect((await t.put("delegated", "project", "alpha")).status).toBe(200);
+  const result = t.service.resolve({ qitemId: "renamed" });
+  expect(result).toMatchObject({ posture: "delegated", binding: { id: "project:alpha" }, context: { projectId: "alpha", workstreamId: "alpha/release/work-1" } });
+  expect(result.context!.sources).toContain(join(realpathSync(t.home), "project.yaml") + "#former-id=old-alpha");
+  expect(JSON.parse((t.db.prepare("SELECT tags FROM queue_items WHERE qitem_id = 'renamed'").get() as { tags: string }).tags)).toContain("project:old-alpha");
 });

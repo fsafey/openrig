@@ -380,7 +380,7 @@ describe("Lifecycle reboot/recovery scenario matrix (Tier 1)", () => {
 
         const r = await adapter.resume("r99-worker", "codex_id", "tok-abc", "/tmp");
 
-        expect(tmux.sendShellCommand).toHaveBeenCalledWith("r99-worker", "codex -s workspace-write '-c' 'check_for_update_on_startup=false' resume 'tok-abc'");
+        expect(tmux.sendShellCommand).toHaveBeenCalledWith("r99-worker", "codex -s workspace-write '-c' 'check_for_update_on_startup=false' -c 'allow_login_shell=false' resume 'tok-abc'");
         expect(tmux.sendText).not.toHaveBeenCalled();
         expect(r).toEqual({
           ok: true,
@@ -427,7 +427,7 @@ describe("Lifecycle reboot/recovery scenario matrix (Tier 1)", () => {
       // Codex auth-refusal → attention_required end-to-end. Closes the
       // deferral previously documented in this file. Implemented by the
       // codex-auth-refusal-attention-required slice via:
-      //   (a) `looksLikeCodexAuthRefusal` in native-resume-probe.ts;
+      //   (a) `currentCodexAuthRefusal` in native-resume-probe.ts;
       //   (b) `attention_required` pass-through in codex-resume.ts;
       //   (c) Codex-branch translation in restore-orchestrator.ts:944-960.
       // The runtime-agnostic per-node mapping at restore-orchestrator.ts:725-735
@@ -820,6 +820,7 @@ describe("Lifecycle reboot/recovery scenario matrix (Tier 1)", () => {
             executableName: opts.runtime === "codex" ? "codex" : "claude",
             startedAt: "Sat Jan  1 12:00:00 2000",
             command: opts.runtime === "codex" ? "codex resume tok-abc" : "claude --resume tok-abc",
+            ...(opts.runtime === "codex" ? { argv: ["codex", "resume", "tok-abc"] } : {}),
           }]),
         ],
       });

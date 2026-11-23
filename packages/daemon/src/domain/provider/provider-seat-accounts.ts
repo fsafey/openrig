@@ -2,7 +2,8 @@
 //
 // A pure function over facts the provider service already has: the live seat universe, the codex-auth
 // registry METADATA (profile names and the seat TSV, via readCodexAuthMetadata: no profile contents are
-// ever opened), the usage rows already in memory, and the daemon's own Codex home and Claude config dir.
+// ever opened), the usage rows already in memory, the daemon's own Codex home and Claude config dir, and the
+// home each seat's own `env:` declares, which its launches use instead of the daemon's.
 //
 // What it never does: join a configured profile to an observed allowance. A registry profile name and an
 // observed account are different kinds of fact, and a shared home says which login a seat STARTED on, not
@@ -13,6 +14,7 @@ import type { ClaudeWindowSample } from "./claude-usage-windows.js";
 import type { CodexAuthMetadata } from "./codex-auth-reader.js";
 import type { ProviderSeat } from "./provider-collect.js";
 import type { ProviderUsageAllowance, SeatConfiguredAccount } from "./provider-types.js";
+import { RUNTIME_HOME_VAR, type HomeRuntime } from "../seat-runtime-home.js";
 
 export interface SeatAccountsInput {
   seats: ProviderSeat[];
@@ -20,7 +22,7 @@ export interface SeatAccountsInput {
   usage: ProviderUsageAllowance[];
   /** Each Claude seat's own latest status-line samples (ClaudeUsageWindows.seatSamples()); null when not available. */
   claudeSamples: ClaudeWindowSample[] | null;
-  /** The CODEX_HOME every Codex seat on this daemon launches with. */
+  /** The CODEX_HOME a Codex seat on this daemon launches with when its `env:` declares none of its own. */
   codexHome: string;
   /** The daemon's CLAUDE_CONFIG_DIR as set (may be relative), and its HOME. */
   claudeConfigDir: string | undefined;
@@ -31,6 +33,10 @@ const REGISTRY_NOT_LINKED =
   "a registry profile name and an observed account are different kinds of fact; nothing supported links them without reading the profile's contents";
 const DEFAULT_LOGIN_NOT_LINKED =
   "the usage read reads the login this home holds now; the seat runs the login that was active when it launched";
+const TOKEN_NOT_LINKED =
+  "an operator's token label and an observed account are different kinds of fact; nothing supported links them";
+const CLAUDE_TOKEN_NOTE =
+  "the seat's own credential file, read when it next launches; not proof the running process uses it, and the label is the operator's name for it";
 const DIFFERS_NOTE =
   "possibly a different login: this seat's status line reports windows that differ from another seat's (a reset more than 60 s apart); not a verdict";
 
@@ -57,11 +63,29 @@ export function configuredSeatAccounts(input: SeatAccountsInput): SeatConfigured
     const row = registryBySeat.get(seat.seatSession);
     const notes: string[] = [];
     const shared = sharedBySession.get(seat.seatSession) ?? 1;
+    // The seat's own home (seat.runtimeHome) is what its launches use; a declared value that isn't absolute is
+    // reported and otherwise ignored, so the seat reads as if it declared none.
+    const own = seat.runtimeHome;
+    const ignored = own?.ignored && Object.hasOwn(RUNTIME_HOME_VAR, seat.runtime)
+      ? { ignoredHome: { from: own.ignored.source, variable: RUNTIME_HOME_VAR[seat.runtime as HomeRuntime], value: own.ignored.value } }
+      : {};
     if (row && seat.runtime !== "codex") {
       notes.push(`stale registry row: names profile ${row.authProfile} (recorded ${row.updatedTs}) for runtime ${row.runtime}; not applied: this seat now runs ${seat.runtime}`);
     }
 
     if (seat.runtime === "codex") {
+      if (own?.home && own.source) {
+        // The registry lives in the daemon's CODEX_HOME and `rig auth` switches that home's login, so a row there
+        // says nothing about the home this seat launches with.
+        if (row) notes.push(`the registry in the daemon's CODEX_HOME names profile ${row.authProfile} (recorded ${row.updatedTs}); not applied: this seat launches with its own CODEX_HOME`);
+        return {
+          ...base,
+          configured: { source: "default_login", home: own.home, homeFrom: own.source, homeNote: `the login active in this seat's own CODEX_HOME (from its ${own.source} env) when it next launches` },
+          ...(notes.length ? { registryNotes: notes } : {}),
+          allowance: { linked: false, reason: DEFAULT_LOGIN_NOT_LINKED },
+          observed: { note: "no per-seat observation for Codex" },
+        };
+      }
       if (row) {
         if (row.runtime !== "codex") notes.push(`the registry row's runtime column says ${row.runtime}, not codex`);
         // An unreadable profile folder can't say either way: profileSaved is null, never "not saved".
@@ -75,6 +99,7 @@ export function configuredSeatAccounts(input: SeatAccountsInput): SeatConfigured
           ...base,
           configured: { source: "registry", profileRef: row.authProfile, recordedAt: row.updatedTs, profileSaved },
           ...(notes.length ? { registryNotes: notes } : {}),
+          ...ignored,
           allowance: { linked: false, reason: REGISTRY_NOT_LINKED },
           observed: { note: "no per-seat observation for Codex" },
         };
@@ -84,13 +109,15 @@ export function configuredSeatAccounts(input: SeatAccountsInput): SeatConfigured
         return {
           ...base,
           configured: { source: "unknown", reason: registryGap },
+          ...ignored,
           allowance: { linked: false, reason: "no configured account" },
           observed: { note: "no per-seat observation for Codex" },
         };
       }
       return {
         ...base,
-        configured: { source: "default_login", home: input.codexHome, homeNote: "the login active in the daemon's CODEX_HOME when this seat launched" },
+        configured: { source: "default_login", home: input.codexHome, homeNote: "the login active in the daemon's CODEX_HOME when this seat next launches" },
+        ...ignored,
         allowance: { linked: false, reason: DEFAULT_LOGIN_NOT_LINKED },
         observed: { note: "no per-seat observation for Codex" },
       };
@@ -98,11 +125,18 @@ export function configuredSeatAccounts(input: SeatAccountsInput): SeatConfigured
 
     if (seat.runtime === "claude-code") {
       const differs = claudeDiffers.get(seat.seatSession);
+      const token = seat.claudeToken;
       return {
         ...base,
-        configured: { source: "default_login", home: claudeHome.home, homeNote: claudeHome.note },
+        // The seat's own token reference is what its launch gives Claude, ahead of any config dir's stored login.
+        configured: token
+          ? { source: "claude_token", label: token.label, ...(token.kind ? { kind: token.kind } : {}), note: CLAUDE_TOKEN_NOTE }
+          : own?.home && own.source
+          ? { source: "default_login", home: own.home, homeFrom: own.source, homeNote: `the login in this seat's own Claude config dir (from its ${own.source} env)` }
+          : { source: "default_login", home: claudeHome.home, homeNote: claudeHome.note },
         ...(notes.length ? { registryNotes: notes } : {}),
-        allowance: { linked: false, reason: DEFAULT_LOGIN_NOT_LINKED },
+        ...ignored,
+        allowance: { linked: false, reason: token ? TOKEN_NOT_LINKED : DEFAULT_LOGIN_NOT_LINKED },
         observed: shared > 1
           ? { withheld: true, note: `observation withheld: ${shared} seats share session name ${seat.seatSession}; status-line samples are keyed by session name and cannot be attributed to one seat` }
           : !claudeSampled
@@ -127,7 +161,7 @@ export function configuredSeatAccounts(input: SeatAccountsInput): SeatConfigured
 }
 
 function claudeConfigHome(configDir: string | undefined, home: string | undefined): { home: string | null; note: string } {
-  const shared = "the login in the daemon's Claude config dir, shared by every Claude seat on this daemon";
+  const shared = "the login in the daemon's Claude config dir, shared by every Claude seat here without its own token or config dir";
   // As the launch resolver does (claude-managed-launch.ts:59, `CLAUDE_CONFIG_DIR ?? HOME/.claude`, resolved against
   // the seat's cwd): only an unset value falls back to HOME; an empty one resolves to each seat's working directory.
   if (configDir === undefined) {

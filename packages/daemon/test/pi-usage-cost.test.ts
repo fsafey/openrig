@@ -10,6 +10,7 @@ import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { extractPiUsageFacts, parsePiSessionHeader, type PiSessionBoundary } from "../src/domain/pi-usage-facts.js";
 import { PiUsageEntriesStore, validPiUsageFact } from "../src/domain/pi-usage-entries-store.js";
 import { computeCostView, PI_COST_COVERAGE } from "../src/domain/usage-series.js";
+import { UsageSamplesStore } from "../src/domain/usage-samples-store.js";
 import { activityRoutes } from "../src/routes/activity.js";
 import { RunnerCore, parseRunnerArgs, readPiSessionEntryIds, type RunnerIo } from "../src/adapters/pi-runner.js";
 import { appendFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
@@ -357,6 +358,23 @@ describe("computeCostView, Pi seats", () => {
     expect((d.prepare("SELECT COUNT(*) AS n FROM pi_usage_entries").get() as { n: number }).n).toBe(8);
   });
 
+  it("a seat name that ran Pi and now runs Claude shows its Claude estimate; one that moved to Pi shows Pi", () => {
+    const d = db();
+    const claudeSample = (seatSession: string, sampledAt: string, cost: number) => new UsageSamplesStore(d).appendContextSample({ nodeId: "n",
+      seatSession, source: "claude_statusline_json", sampledAt, totalInputTokens: 100, totalOutputTokens: 10, usedPercentage: 5,
+      nativeSessionId: "claude-1", clientCostEstimateUsd: cost }, sampledAt);
+    const store = new PiUsageEntriesStore(d);
+    // Pi first (entries at 16:00:02-10), then Claude under the same name.
+    store.record({ seatSession: SESSION, nodeId: null, generation: null, piSessionId: "0197a2f0", facts: facts(OWN) }, at(20));
+    claudeSample(SESSION, at(50), 0.9);
+    // Claude first, then Pi under the same name.
+    claudeSample("moved@rig", new Date(Date.UTC(2026, 9, 13, 15, 0, 0)).toISOString(), 0.4);
+    store.record({ seatSession: "moved@rig", nodeId: null, generation: null, piSessionId: "s-moved", facts: facts(OWN) }, at(20));
+    const seats = Object.fromEntries(computeCostView(d, { nowIso: at(60) }).seats.map((s) => [s.seatSession, s as Record<string, any>]));
+    expect(seats[SESSION]).toMatchObject({ runtime: "claude-code", status: "reported", costUsd: 0.9 });
+    expect(seats["moved@rig"]).toMatchObject({ runtime: "pi", status: "reported", window: { piSessionId: "s-moved" } });
+  });
+
   it("without the table, no Pi rows appear and nothing fails", () => {
     const d = createDb();
     dbs.push(d);
@@ -520,14 +538,35 @@ describe("runner → authenticated route → SQLite → cost view", () => {
       const cut = valid.indexOf("\n"); // the header without its newline
       writeFileSync(file, valid.slice(0, cut));
       let grown = false;
-      const p = pipeline(() => forkHeader(at(7), file), () => readPiSessionEntryIds(file, undefined, {
-        afterStat: () => { if (!grown) { grown = true; appendFileSync(file, valid.slice(cut)); } } }));
+      const reads: Array<Promise<ReadonlySet<string> | null>> = []; // each parent read the runner starts
+      const p = pipeline(() => forkHeader(at(7), file), () => {
+        const read = readPiSessionEntryIds(file, undefined, {
+          afterStat: async () => {
+            if (grown) return;
+            grown = true;
+            appendFileSync(file, valid.slice(cut));
+            // Hold this read past the first refresh, as a loaded runner can, so every run meets the read in flight.
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          } });
+        reads.push(read);
+        return read;
+      });
       await p.refresh(forkEntries);
+      expect(reads).toHaveLength(1);
       expect(p.view()).toMatchObject({ entries: { own: 2, unknownOrigin: { count: 2 } } });
       expect(p.view().costUsd).toBeCloseTo(0.05, 10); // the copied b1 is not charged
+      // The runner starts no second read while one is in flight, so wait for this one's outcome (the file grew under it,
+      // so it answers nothing) before the next refresh, not for a number of ticks. The runner takes that outcome in
+      // promise callbacks only, so one timer turn runs them all.
+      await expect(reads[0]).resolves.toBeNull();
+      await settle();
+      // Answered with nothing, the tie is still unknown and uncharged.
+      expect(p.view()).toMatchObject({ entries: { own: 2, unknownOrigin: { count: 2 } } });
+      expect(p.view().costUsd).toBeCloseTo(0.05, 10);
       await p.refresh(forkEntries);
       // The parent read is real file I/O; wait for its outcome to reach the store, not for a number of ticks.
       await eventually(() => expect(p.view()).toMatchObject({ entries: { own: 3, inherited: { count: 5 }, unknownOrigin: { count: 0 } } }));
+      expect(reads).toHaveLength(2);
       expect(p.d.prepare("SELECT origin FROM pi_usage_entries WHERE entry_id = 'b1'").get()).toEqual({ origin: "inherited" });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

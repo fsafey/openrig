@@ -1,8 +1,9 @@
 import { existsSync, realpathSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type Database from "better-sqlite3";
 import { getDefaultOpenRigPath } from "../openrig-compat.js";
 import type { SeatEnv } from "./seat-env.js";
+import { homePluginPath } from "./builtin-startup-files.js";
 
 // What a Claude seat needs so it loads the vendored openrig-core plugin (its refocus, compaction-restore and
 // activity hooks). Claude reads CLAUDE_CODE_PLUGIN_DIRS, a colon-separated list, so this has to be the vendored copy
@@ -37,13 +38,18 @@ function canonical(path: string): string {
   try { return realpathSync(absolute); } catch { return absolute; }
 }
 
-/** The resolved plugin locations in a node's persisted startup context (what the profile resolver selected for it). */
-export function pluginPathsOf(entries: ReadonlyArray<{ category: string; absolutePath: string }>): string[] {
-  return entries.filter((entry) => entry.category === "plugin").map((entry) => entry.absolutePath);
+/** The resolved plugin locations in a node's persisted startup context (what the profile resolver selected for it). A
+ *  plugin selected under the OpenRig home (`openrig-home:`) is read in `openrigHome`, the running home by default, so a
+ *  home that moved still names its own plugins. */
+export function pluginPathsOf(
+  entries: ReadonlyArray<{ category: string; absolutePath: string; resourcePath?: string | null; sourcePath?: string | null }>,
+  openrigHome?: string,
+): string[] {
+  return entries.filter((entry) => entry.category === "plugin").map((entry) => homePluginPath(entry, openrigHome));
 }
 
 /** The plugin locations the node's last launch resolved, or undefined when none were saved (or they can't be read). */
-export function persistedPluginPaths(db: Database.Database, nodeId: string): string[] | undefined {
+export function persistedPluginPaths(db: Database.Database, nodeId: string, openrigHome?: string): string[] | undefined {
   try {
     const row = db.prepare("SELECT projection_entries_json FROM node_startup_context WHERE node_id = ?")
       .get(nodeId) as { projection_entries_json: string } | undefined;
@@ -51,10 +57,16 @@ export function persistedPluginPaths(db: Database.Database, nodeId: string): str
     const entries = JSON.parse(row.projection_entries_json) as unknown;
     return Array.isArray(entries) ? pluginPathsOf(entries.filter((e): e is { category: string; absolutePath: string } =>
       typeof e === "object" && e !== null && typeof (e as { category?: unknown }).category === "string"
-      && typeof (e as { absolutePath?: unknown }).absolutePath === "string")) : undefined;
+      && typeof (e as { absolutePath?: unknown }).absolutePath === "string"), openrigHome) : undefined;
   } catch {
     return undefined;
   }
+}
+
+/** Saved selection, even when the vendored manifest is missing; inspection must not call that intentional hooklessness. */
+export function selectedCorePluginDir(paths: readonly string[], pluginsDir: string = getDefaultOpenRigPath("plugins")): string | undefined {
+  const dir = join(pluginsDir, "openrig-core");
+  return paths.some((path) => canonical(path) === canonical(dir)) ? dir : undefined;
 }
 
 /**
@@ -71,19 +83,51 @@ export function seatCorePluginDir(
   if (node.runtime !== "claude-code") return undefined;
   const dir = vendoredCorePluginDir(pluginsDir);
   if (!dir) return undefined;
-  const paths = selectedPaths ?? persistedPluginPaths(db, node.id) ?? [];
-  const want = canonical(dir);
-  return paths.some((path) => canonical(path) === want) ? dir : undefined;
+  const paths = selectedPaths ?? persistedPluginPaths(db, node.id, pluginsDir ? dirname(pluginsDir) : undefined) ?? [];
+  return selectedCorePluginDir(paths, pluginsDir);
+}
+
+/** The explicit interpreter a selected seat's plugin hooks run with, so they never depend on `node` resolving on PATH. */
+export const SEAT_NODE_ENV = "OPENRIG_NODE";
+
+/**
+ * Codex: the vendored plugin directory when this node is a Codex seat whose resolved plugin selection includes it, else
+ * undefined. Codex loads the plugin from its own installation, not from this directory, so this only decides the seat's
+ * signal: OPENRIG_SEAT_PROJECT_DIR and OPENRIG_NODE, which the plugin's Codex hook commands check before running anything.
+ */
+export function seatCodexCorePluginDir(
+  node: { id: string; runtime: string | null },
+  db: Database.Database,
+  selectedPaths?: readonly string[],
+  pluginsDir?: string,
+): string | undefined {
+  if (node.runtime !== "codex") return undefined;
+  const dir = vendoredCorePluginDir(pluginsDir);
+  if (!dir) return undefined;
+  return selectedCorePluginDir(selectedPaths ?? persistedPluginPaths(db, node.id, pluginsDir ? dirname(pluginsDir) : undefined) ?? [], pluginsDir);
 }
 
 /** The seat's declared env with the vendored plugin added after any list the seat declared itself. */
 export function withCorePlugin(seatEnv: SeatEnv, dir: string | undefined): SeatEnv {
-  if (!dir) return seatEnv;
-  const own = seatEnv[CLAUDE_PLUGIN_DIRS_ENV];
-  if (!own) return { ...seatEnv, [CLAUDE_PLUGIN_DIRS_ENV]: dir };
-  // Claude skips a relative entry in the list, so only an absolute one can already be the vendored plugin. The seat's
-  // entries stay as written and the vendored plugin's absolute path goes after them.
-  const want = canonical(dir);
-  if (own.split(":").some((entry) => isAbsolute(entry) && canonical(entry) === want)) return seatEnv;
-  return { ...seatEnv, [CLAUDE_PLUGIN_DIRS_ENV]: `${own}:${dir}` };
+  return withPluginDirs(seatEnv, [dir]);
+}
+
+/** The seat's declared env with OpenRig's plugin directories (the vendored openrig-core, the seat's own skill plugin)
+ *  added, in order, after any list the seat declared itself. */
+export function withPluginDirs(seatEnv: SeatEnv, dirs: ReadonlyArray<string | undefined>): SeatEnv {
+  let env = seatEnv;
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const own = env[CLAUDE_PLUGIN_DIRS_ENV];
+    if (!own) {
+      env = { ...env, [CLAUDE_PLUGIN_DIRS_ENV]: dir };
+      continue;
+    }
+    // Claude skips a relative entry in the list, so only an absolute one can already be this plugin. The seat's
+    // entries stay as written and the plugin's absolute path goes after them.
+    const want = canonical(dir);
+    if (own.split(":").some((entry) => isAbsolute(entry) && canonical(entry) === want)) continue;
+    env = { ...env, [CLAUDE_PLUGIN_DIRS_ENV]: `${own}:${dir}` };
+  }
+  return env;
 }

@@ -59,7 +59,9 @@ rig queue block <task> --on external:<what you check> --wake-after 1h \
 ```
 
 `--on` is always required; `external:<what>` names the outside thing you're waiting on. The timer first fires after
-the interval, not now.
+the interval, not now. Left without `--wake-after` (or `--wake-watchdog`), the task is still set aside, but nothing
+will wake you, and the reply says so with a `park_without_wake` advisory. Set it aside again with `--wake-after` to add
+the timer.
 
 **4. Say back what you set, in one or two plain lines:** what you'll check, how often, how they'll be told, and when
 it stops. For example: "I'll check the release PR every hour and message you here once it merges. Then I'll stop."
@@ -90,8 +92,8 @@ rig queue block <task> --on external:<what> --wake-after 1h --note "checked <tim
 
 A new set-aside replaces the old one and retires any earlier timer, so a task never carries two live timers.
 
-**Put what changed in `--note` or `--continuation`, not both.** When `rig queue block` gets `--continuation`, that is
-the note it records, and `--note` is dropped.
+When `rig queue block` gets both, it records the continuation first and the note after a blank line.
+A wake's preview of the continuation shows both, so keep the note short.
 
 Each check costs one of your turns on the person's subscription. **Use the longest interval that serves the ask.**
 
@@ -106,6 +108,30 @@ rig queue create --destination <entityId>@external --human-intent update \
 - Later messages about the same watch can thread with `--reply-to <earlier message's id>`.
 - **`posted` means the connector posted it, not that they read it.** Don't say they saw it.
 - **If delivery fails or is indeterminate,** inspect that task before anything else. Never resend blindly.
+
+## If the timer cannot reach its recipient
+
+A `periodic-reminder` occurrence that definitely fails before input remains owed. The watchdog
+retries through its existing loop, using `queue.wake_retry_interval_seconds` and
+`queue.wake_retry_cap` (by default, three retries five minutes apart). A failed attempt does not
+advance the reminder to its next regular cycle. A confirmed send advances the normal interval;
+recovery does not replay every elapsed cycle.
+
+`rig watchdog show <jobId> --json` includes the failed attempt, its retained outbox IDs, retry
+time and next action. If input may have reached the recipient, that occurrence ends unconfirmed
+and is not automatically sent again. Inspect the recipient and exact outbox record before any
+manual replay. A recurring reminder keeps its next normal cycle under a new occurrence identity. A confirmed receipt survives a daemon restart, so
+finishing its accounting does not type the same occurrence twice.
+
+Exhausted retries end only the failed occurrence, with its cause and next action; a recurring
+reminder keeps its next normal cycle, and a permanent transport failure leaves it a terminal job:
+correct the destination and register a replacement reminder. A one-shot park timer (`--wake-after`)
+has no later cycle, so neither the retry limit nor a permanent transport failure ends it while its
+task is still set aside: each failure before input is recorded on the parked row while the timer
+stays armed, and it retries until it's delivered or the park ends. If input may have reached the
+seat, it records the unconfirmed wake on the parked row and ends. Deliberately held
+input keeps its existing retained-message custody. Condition watches and parked-owner policy
+behavior are unchanged. This does not replay failed occurrences recorded by older versions.
 
 ## "What are you watching for me?"
 
@@ -164,6 +190,27 @@ this one included, and never starts a read on any account. With no host registry
 says so. Use it rather than the single-machine `rig provider status --json`: one allowance used from several
 machines appears once, with each machine's own observation beside it, so you can't count it twice. If it answers that
 usage windows are off, tell the person that before setting the watch, as you would an unreachable channel.
+
+For a Claude login supplied by `CLAUDE_CODE_OAUTH_TOKEN`, an explicit one-credential read is available:
+
+```sh
+rig provider status --refresh --provider claude --claude-token-file /absolute/private/personal.token --credential-label Personal
+```
+
+The file must be readable by the daemon, regular, at most 8 KiB, and contain only the token. Ownership by the daemon user and mode 0600 or
+0400 are recommended; different ownership, broader permissions and symlinks produce warnings, not refusals. Provision it through your existing credential
+custody; never put token values in arguments, seat environment settings, evidence or a queue item. The path is on the selected daemon's
+machine. Repeat the command for another labelled file when you want to compare subscriptions. This option does not fan out with
+`--all-hosts` or `--hosts`.
+
+**Each token refresh spends one model turn.** Status and TUI reads show the cached result and never probe. A timeout or refusal does not
+prove no allowance was spent. The probe uses a temporary home/config/work directory and a single Haiku turn, with CLI flags requesting no tools, hooks or MCP. Unsupported CLI flags or missing events are reported as failures/unknown, not as free capacity. The event format is evidenced on
+Claude Code 2.1.310; other versions may report different fields. These are credential labels you supplied, not provider-verified account
+names, and do not prove a running seat uses that credential. The ordinary status-line sample/account join remains unproven.
+
+Only actually reported window percentages and resets are measurements. A rejected window can have an unknown percentage; overage rejection
+is separate from subscription rejection. Readings and their times survive daemon restart, marked historical until refreshed. Files with
+different references/labels stay separate; equal resets or matching labels on another host never establish one allowance or extra room.
 
 **Never put `--refresh` in the timer's check.** `rig provider status --all-hosts --refresh` starts a native read of the
 accounts on every machine. Run it only when the person asks for a fresh reading now.
@@ -244,10 +291,41 @@ Unknown: not said yet.
   stopped (the first fire comes one interval after you register it), and it stops when the agent that registered it
   is replaced. It's fine for agent-to-agent reminders. Your own watch timers also show as `periodic-reminder` in
   `rig watchdog list`: that's the one-shot timer `--wake-after` arms, not a registered repeating reminder. It's retired
-  when it fires or when the task stops being set aside. A wake held back because you were typing (a retained
-  delivery) wasn't delivered, so it doesn't use the timer up: it's tried again at each interval until an attempt goes
-  through (delivered or failed), which retires it. A timer another task shares through `--wake-watchdog` stays live
-  for that task when this task is handed off or stopped, and the same rule applies to its wake. None of this is a
-  delivery guarantee.
+  after delivery, when the occurrence ends, or when the task stops being set aside. A wake held back because you were typing (a retained
+  delivery) wasn't delivered, so it doesn't use the timer up. A failure known to have happened before input reached
+  the seat also keeps the same wake owed and retries on the existing cadence until delivery or the park ends. If input
+  may have reached the seat, the occurrence ends without automatic replay; inspect the receipt before retrying.
+  A timer another task shares through `--wake-watchdog` stays live for that task when this task is
+  handed off or stopped, and a held-back wake doesn't use it up. Once this task's park has ended, though,
+  a failure before input to that task is retried only up to `queue.wake_retry_cap` times (a permanent
+  transport failure ends it at once), and then the timer ends. None of this is a delivery guarantee.
 - **Transcript bytes as "usage".** `context-usage-threshold` measures an agent's transcript, not an account's
   allowance. For an allowance, see "A usage warning" above.
+
+## Recurring reminders for agents
+
+An agent-to-agent reminder can repeat until stopped. This is separate from
+[a person's one-shot watch](#setting-a-watch), which uses `rig queue block --wake-after`.
+
+Save this as `periodic-reminder.yaml`, replacing the example session names with your own:
+
+```yaml
+policy: periodic-reminder
+target:
+  session: worker@my-team
+message: "Finish the current action, then check the pending work."
+```
+
+Register it with all five required flags:
+
+```bash
+rig watchdog register --spec periodic-reminder.yaml --policy periodic-reminder \
+  --target-session worker@my-team --interval-seconds 600 \
+  --registered-by coordinator@my-team
+```
+
+At registration, `--policy` selects the policy; the YAML `policy` field is not the
+selector. YAML `target.session` takes precedence over `--target-session`, so keep them
+aligned. If YAML omits the target, the CLI target is the fallback. Put a non-empty
+`message` in YAML: `--message` is a shortcut only for `context-usage-threshold`.
+The first reminder is due after the interval; this example repeats every 600 seconds.

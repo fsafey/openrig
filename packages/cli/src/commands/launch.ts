@@ -22,10 +22,12 @@ type LaunchResponse = {
   held?: Array<{ nodeId: string; logicalId: string; reason: string }>;
   alreadyRunning?: Array<{ nodeId: string; logicalId: string }>;
   failedTargets?: Array<{ nodeId: string; logicalId: string; reason: string }>;
-  targetNodes?: Array<{ nodeId: string; logicalId: string }>;
+  targetNodes?: Array<{ nodeId: string; logicalId: string; permission?: { summary?: string } }>;
   snapshotSelection?: { snapshotId: string; kind: string; createdAt: string; ageMs: number; mode: "explicit" | "automatic"; rationale: string; newerUsableAlternative: unknown };
   nonTargetEffects?: { mode: "unchanged" | "detach_and_hold"; reason: string | null; affected: unknown[] };
   planOnly?: boolean;
+  // A `--seats` name more than one seat answers to: not launched, with the seats it could mean.
+  ambiguousSeats?: Array<{ seat: string; candidates: Array<{ logicalId: string; sessionName: string | null }>; message: string }>;
   // OPR.0.4.3.28 correction — non-blocking launch warnings (e.g. liveness_probe_unknown: launched
   // despite a failed tmux liveness probe). Surfaced as human output WITHOUT a non-zero exit.
   warnings?: string[];
@@ -34,8 +36,8 @@ type LaunchResponse = {
 // OPR.0.4.3.20 FR-7 — a launched-entry status that means NO session is running (the
 // operator must act). These are NOT successful launches — never print "Launched" for
 // them; exit non-zero. Mirrors the daemon's NON_RUNNING_LAUNCH_STATUSES.
-const NON_RUNNING_LAUNCH_STATUSES = new Set(["awaiting-decision", "attention_required", "failed"]);
-function launchStatusRunning(status: string): boolean {
+const NON_RUNNING_LAUNCH_STATUSES = new Set(["awaiting-decision", "attention_required", "failed", "left_attached"]);
+export function launchStatusRunning(status: string): boolean {
   return !NON_RUNNING_LAUNCH_STATUSES.has(status);
 }
 
@@ -66,7 +68,9 @@ function refuseAmbiguousRig(handle: string, ids: string[], json: boolean | undef
 
 /** Build the launch command, allowing local launches that start seats a longer wait than previews. */
 export function launchCommand(depsOverride?: StatusDeps): Command {
-  const cmd = new Command("launch").description("Launch or relaunch a node in a running rig");
+  const cmd = new Command("launch")
+    .description("Launch a node in a running rig, unless it's already running")
+    .addHelpText("after", "\nA running node is left as it is. For a fresh occupant in a running seat, use\n`rig seat launch <seat> --fresh --stop --reason <why>` (`--plan` previews it).");
   const getDeps = () => depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
 
   async function getClient(deps: StatusDeps): Promise<DaemonClient | null> {
@@ -83,7 +87,7 @@ export function launchCommand(depsOverride?: StatusDeps): Command {
     .option("--snapshot-id <id>", "Use this exact restore-usable snapshot")
     .option("--retry-startup-from <member-file>", "Retry a stopped first start that failed during projection, using its original member fragment")
     .option("--rig-root <path>", "Original absolute source root for --retry-startup-from")
-    .option("--plan", "Show subset selection and non-target effects without mutation")
+    .option("--plan", "Show restore selection and non-target effects without mutation; does not preview first start of a never-started materialized seat")
     .option("--json", "JSON output")
     .option("--host <id>", "Run on a remote host declared in ~/.openrig/hosts.yaml")
     .action(async (rigHandle: string, nodeRef: string | undefined, opts: { json?: boolean; holdReason?: string; seats?: string; host?: string; snapshotId?: string; plan?: boolean; retryStartupFrom?: string; rigRoot?: string }) => {
@@ -139,6 +143,8 @@ export function launchCommand(depsOverride?: StatusDeps): Command {
       // lookup that can't be read keeps today's path: the handle goes to the daemon as an id.
       let rigId = rigHandle;
       let rigLabel = rigHandle;
+      // Set when the handle matched a rig's name: `rig seat launch` resolves `<logicalId>@<rig name>` within that rig.
+      let rigName: string | undefined;
 
       if (opts.host) {
         const { runRemoteHttpOp, lookupRemoteRigId } = await import("../remote-host-ops.js");
@@ -249,7 +255,10 @@ export function launchCommand(depsOverride?: StatusDeps): Command {
         }
         if (resolution.kind === "resolved") {
           rigId = resolution.id;
-          if (resolution.byName) rigLabel = `${rigHandle} (${resolution.id})`;
+          if (resolution.byName) {
+            rigLabel = `${rigHandle} (${resolution.id})`;
+            rigName = rigHandle;
+          }
         }
         return true;
       };
@@ -307,19 +316,27 @@ export function launchCommand(depsOverride?: StatusDeps): Command {
           console.error(JSON.stringify(res.data, null, 2));
           return;
         }
+        const printAmbiguous = () => { for (const seat of res.data.ambiguousSeats ?? []) console.error(seat.message); };
         if (opts.plan && res.data.planOnly) {
           console.log("Plan only; no changes made.");
           printSnapshotSelection(res.data.snapshotSelection);
+          // Each target and the permission this launch will start it with (--json has the whole account).
+          if (res.data.targetNodes?.length) console.log("Targets:");
+          for (const target of res.data.targetNodes ?? []) {
+            console.log(`  ${target.logicalId}${target.permission?.summary ? `: ${target.permission.summary}` : ""}`);
+          }
           console.log(`Non-target effect: ${res.data.nonTargetEffects?.mode ?? "unavailable"}`);
           for (const node of res.data.nonTargetEffects?.affected ?? []) {
             const affected = node as { logicalId?: string; reason?: string };
             console.log(`  ${affected.logicalId ?? "unknown"}: ${affected.reason ?? "unspecified"}`);
           }
+          printAmbiguous();
           return;
         }
         // Hard failure (no per-seat result to render — e.g. rig_not_found): error + exit.
         if (!res.data.launched && !res.data.held && !res.data.alreadyRunning) {
           console.error(res.data.error ?? res.data.message ?? `Launch failed (HTTP ${res.status})`);
+          printAmbiguous();
           process.exitCode = 1;
           return;
         }
@@ -333,7 +350,10 @@ export function launchCommand(depsOverride?: StatusDeps): Command {
         const heldIds = (res.data.held ?? []).map((n) => `${n.logicalId} (${n.reason})`).join(", ");
         if (running.length) console.log(`Launched: ${running.map((n) => n.logicalId).join(", ")}`);
         if (heldIds) console.log(`Held: ${heldIds}`);
-        if (res.data.alreadyRunning?.length) console.log(`Already running: ${res.data.alreadyRunning.map((n) => n.logicalId).join(", ")}`);
+        // Launch saw only a live session not proved to be a bare shell: the pane is kept, and no agent is proven running there.
+        if (res.data.alreadyRunning?.length) {
+          console.log(`Not relaunched, live session (its agent isn't proven running): ${res.data.alreadyRunning.map((n) => n.logicalId).join(", ")}`);
+        }
         // OPR.0.4.3.28 correction — proceed-with-warning: print non-blocking launch warnings (e.g.
         // liveness_probe_unknown) WITHOUT setting a non-zero exit.
         for (const w of res.data.warnings ?? []) console.warn(`Warning: ${w}`);
@@ -347,6 +367,10 @@ export function launchCommand(depsOverride?: StatusDeps): Command {
         }
         if ((res.data as Record<string, unknown>).unmatchedIds && ((res.data as Record<string, unknown>).unmatchedIds as string[]).length > 0) {
           console.error(`Unmatched seats (not found): ${((res.data as Record<string, unknown>).unmatchedIds as string[]).join(", ")}`);
+          process.exitCode = 1;
+        }
+        if (res.data.ambiguousSeats?.length) {
+          printAmbiguous();
           process.exitCode = 1;
         }
         return;
@@ -393,7 +417,8 @@ export function launchCommand(depsOverride?: StatusDeps): Command {
         for (const w of res.data.warnings ?? []) console.warn(`Warning: ${w}`);
       };
       if (res.data.code === "already_running" || (res.data.alreadyRunning && res.data.alreadyRunning.length > 0)) {
-        console.log(`Node ${logicalId} is already running in rig ${rigLabel} (not relaunched)`);
+        console.log(`Node ${logicalId} has a live session in rig ${rigLabel}, so it wasn't relaunched. Its agent isn't proven running.`);
+        console.log(`For a fresh occupant: rig seat launch ${rigName ? `${logicalId}@${rigName}` : logicalId} --fresh --stop --reason "<why>"`);
         printLaunchWarnings();
         return;
       }

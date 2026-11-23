@@ -23,27 +23,12 @@ import { SessionTransport } from "../src/domain/session-transport.js";
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { ContextUsageStore } from "../src/domain/context-usage-store.js";
+import { ProcessCensus } from "../src/domain/process-census.js";
 import { CodexThreadIdResolver } from "../src/domain/codex-thread-id.js";
 import { SeatIdentityStore } from "../src/domain/seat-identity-store.js";
-import { SeatIdentityReconciler } from "../src/domain/seat-identity-reconciler.js";
-import { listNativeProcesses, type NativeProcessRow } from "../src/domain/native-process-lineage.js";
 import type { TmuxAdapter, TmuxResult } from "../src/adapters/tmux.js";
 import { sessionAdminRoutes } from "../src/routes/sessions.js";
 import { createFullTestDb } from "./helpers/test-app.js";
-
-// The generation-record route reads the native process table; each Codex case supplies its own.
-vi.mock("../src/domain/native-process-lineage.js", async (original) => {
-  const actual = await original<typeof import("../src/domain/native-process-lineage.js")>();
-  return { ...actual, listNativeProcesses: vi.fn(actual.listNativeProcesses) };
-});
-
-// `ps -o lstart` text (C locale, local time) for a Date, as the process observer reports it.
-function lstart(d: Date): string {
-  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  const two = (n: number) => String(n).padStart(2, "0");
-  return `${days[d.getDay()]} ${months[d.getMonth()]} ${String(d.getDate()).padStart(2, " ")} ${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())} ${d.getFullYear()}`;
-}
 
 function mockTmux(overrides?: Partial<{
   hasSession: (name: string) => Promise<boolean>;
@@ -110,7 +95,7 @@ describe("SessionTransport submitOnly — the guarded bare-Enter retry", () => {
     expect(res.submitOnly).toBe(true);
     expect(sendText).not.toHaveBeenCalled();                       // nothing typed — ever
     expect(sendKeys).toHaveBeenCalledTimes(1);
-    expect(sendKeys).toHaveBeenCalledWith("dev-impl@my-rig", ["Enter"]);
+    expect(sendKeys.mock.calls[0]?.slice(0, 2)).toEqual(["dev-impl@my-rig", ["Enter"]]);
   });
 
   it("REFUSES (staged_mismatch) when the pane shows something else — a bare Enter at a permission prompt would approve it", async () => {
@@ -399,49 +384,27 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
   let app: Hono;
   let db: Database.Database;
   let registry: SessionRegistry;
-  let panePid: number;
-  let paneReadHook: (() => void) | undefined;
+  let livePanePid: number | null;
   const threadId = "11111111-1111-4111-8111-111111111111";
 
   beforeEach(() => {
     stateDir = mkdtempSync(join(tmpdir(), "walk-genrec-"));
     db = createFullTestDb();
     registry = new SessionRegistry(db);
-    panePid = 3001;
-    paneReadHook = undefined;
+    livePanePid = 10;
     const store = new ContextUsageStore(db, { stateDir, codexHomeDir: stateDir });
     app = new Hono();
     app.use("*", async (c, next) => {
       c.set("contextUsageStore" as never, store as never);
       c.set("sessionRegistry" as never, registry as never);
-      c.set("tmuxAdapter" as never, { getPanePid: async () => { paneReadHook?.(); return panePid; } } as never);
+      c.set("tmuxAdapter" as never, { getPanePid: async () => livePanePid } as never);
       await next();
     });
     app.route("/api/sessions", sessionAdminRoutes);
   });
   afterEach(() => { vi.restoreAllMocks(); db.close(); rmSync(stateDir, { recursive: true, force: true }); });
 
-  // Synthetic PIDs, commands and times shaped like `ps`: the pane's shell has handed the terminal's
-  // foreground to a launch script's group, where a Node launcher runs native Codex.
-  const before = lstart(new Date(Date.now() - 60_000));
-  const later = () => lstart(new Date(Date.now() + 5_000));
-  function wrappedCodex(o: { root?: number; native?: number; rootStarted?: string; nativeStarted?: string } = {}): NativeProcessRow[] {
-    const root = o.root ?? 3001, group = root + 1;
-    return [
-      { pid: root, ppid: 3000, pgid: root, tpgid: group, executableName: "zsh", command: "-zsh", startedAt: o.rootStarted ?? before },
-      { pid: group, ppid: root, pgid: group, tpgid: group, executableName: "sh", command: "/bin/sh /tmp/launch-codex.sh", startedAt: before },
-      { pid: root + 2, ppid: group, pgid: group, tpgid: group, executableName: "node", command: "node /opt/bin/codex", startedAt: before },
-      { pid: o.native ?? 3004, ppid: root + 2, pgid: group, tpgid: group, executableName: "codex", command: "/opt/native/codex", startedAt: o.nativeStarted ?? before },
-    ];
-  }
-  // A Codex job outside the terminal's foreground group: under the pane, but not its occupant.
-  const backgroundCodex = (pid: number): NativeProcessRow =>
-    ({ pid, ppid: 3001, pgid: pid, tpgid: 3002, executableName: "codex", command: "/opt/native/codex exec", startedAt: before });
-
-  /** A running Codex seat whose identity verdict is written by the periodic reconciler itself, from the
-   *  same process table the route then reads. */
-  async function seedCodex(o: { metaId?: string; processes?: NativeProcessRow[]; now?: () => Date } = {}) {
-    const processes = o.processes ?? wrappedCodex();
+  function seedCodex(metaId = threadId, observedPid = 10, observedPanePid?: number) {
     const repo = new RigRepository(db);
     const rig = repo.createRig("codex-rig");
     const node = repo.addNode(rig.id, "dev.codex", { runtime: "codex" });
@@ -449,120 +412,104 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
     const session = registry.registerSession(node.id, seat);
     registry.updateStatus(session.id, "running");
     registry.updateBinding(node.id, { tmuxSession: seat, tmuxPane: "%42" });
-    const reconcile = (now = o.now) => new SeatIdentityReconciler({ db, now, listProcesses: () => processes,
-      tmux: { listSessions: async () => [{ name: seat }], getPanePid: async () => panePid, getPaneCommand: async () => "node" } as never,
-    }).reconcileAll();
-    await reconcile();
-    const verified = new SeatIdentityStore(db).getForNode(node.id)!;
-    expect(verified).toMatchObject({ verdict: "verified", evidence: { registeredPane: "%42" } });
-    vi.mocked(listNativeProcesses).mockImplementation(async () => processes);
-    // Codex logs name the native process's PID, so only it resolves a thread.
-    vi.spyOn(CodexThreadIdResolver.prototype, "resolve").mockImplementation(async pid => pid === verified.evidence.observedPid ? threadId : undefined);
+    new SeatIdentityStore(db).upsert({ nodeId: node.id, verdict: "verified", evidenceSource: "env", reason: null,
+      evidence: { registeredPane: "%42", observedPid, observedPanePid, observedCommand: "codex", matchedLayer: 1 },
+      sessionName: seat, observedAt: new Date().toISOString() } as never);
+    vi.spyOn(ProcessCensus.prototype, "list").mockResolvedValue([
+      { pid: 10, ppid: 1, command: "zsh" }, { pid: 20, ppid: 10, command: "codex", startedAt: "start" },
+    ]);
+    vi.spyOn(CodexThreadIdResolver.prototype, "resolveWithHome").mockResolvedValue({ thread: threadId, codexHome: join(stateDir, ".codex") });
     mkdirSync(join(stateDir, ".codex"));
     const nativeDb = new Database(join(stateDir, ".codex", "state_5.sqlite"));
     const record = join(stateDir, "rollout.jsonl");
     nativeDb.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)");
     nativeDb.prepare("INSERT INTO threads VALUES (?, ?)").run(threadId, record);
     nativeDb.close();
-    writeFileSync(record, JSON.stringify({ type: "session_meta", payload: { id: o.metaId ?? threadId } }) + "\n");
-    return { node, seat, record, verified, reconcile, url: `/api/sessions/${seat}/generation-record` };
+    writeFileSync(record, JSON.stringify({ type: "session_meta", payload: { id: metaId } }) + "\n");
+    return { node, record, url: `/api/sessions/${seat}/generation-record` };
   }
 
-  const unverified = (message: string) => ({ error: "record_identity_unverified", message: expect.stringContaining(message) });
-
-  it("Codex behind a shell and launcher reaches its native record from the verdict the reconciler writes, before its first token_count event", async () => {
-    const { url, verified } = await seedCodex();
-    // The verdict names native Codex, not the pane's shell (3001).
-    expect(verified.evidence.observedPid).toBe(3004);
+  it("Codex current bound thread resolves before its first token_count event", async () => {
+    const { url } = seedCodex();
     const response = await app.request(url);
-    expect(await response.json()).toMatchObject({ runtime: "codex", sessionId: threadId });
     expect(response.status).toBe(200);
-  });
-
-  it("Codex running as the pane's own process reaches its record as before", async () => {
-    const { url, verified } = await seedCodex({ processes: [
-      { pid: 3001, ppid: 3000, pgid: 3001, tpgid: 3001, executableName: "codex", command: "/opt/native/codex", startedAt: before },
-    ] });
-    expect(verified.evidence.observedPid).toBe(3001);
-    const response = await app.request(url);
     expect(await response.json()).toMatchObject({ runtime: "codex", sessionId: threadId });
+  });
+
+  it.each(["shell", "launcher"])("Codex %s wrapper serves the verified thread's metadata and suffix", async (launch) => {
+    const { url, record } = seedCodex(threadId, 20, 10);
+    vi.mocked(ProcessCensus.prototype.list).mockResolvedValue([
+      { pid: 10, ppid: 1, command: "zsh" },
+      ...(launch === "launcher" ? [{ pid: 15, ppid: 10, command: "node /opt/codex/bin/codex.js" }] : []),
+      { pid: 20, ppid: launch === "launcher" ? 15 : 10, command: "codex", startedAt: "start" },
+    ]);
+    const response = await app.request(url);
     expect(response.status).toBe(200);
+    const metadata = await response.json();
+    expect(metadata).toMatchObject({ runtime: "codex", sessionId: threadId, totalBytes: Buffer.byteLength(readFileSync(record)) });
+    expect(metadata.suffix).toBeUndefined();
+    expect(CodexThreadIdResolver.prototype.resolveWithHome).toHaveBeenCalledWith(20, "start");
+
+    const suffix = JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "fixture-turn" } }) + "\n";
+    appendFileSync(record, suffix);
+    const appended = await app.request(`${url}?sinceBytes=${metadata.totalBytes}`);
+    expect(appended.status).toBe(200);
+    expect(await appended.json()).toMatchObject({ generationId: metadata.generationId, sessionId: threadId, suffix, truncated: false });
   });
 
-  it.each<[string, () => NativeProcessRow[][], string]>([
-    ["replaced by another Codex", () => [wrappedCodex({ native: 3014 })], "its native Codex process is 3014, not the verified 3004"],
-    ["whose PID a Codex started after verification reuses", () => [wrappedCodex({ nativeStarted: later() })], "its native Codex process did not start before"],
-    ["replaced between the route's two process snapshots", () => [wrappedCodex(), wrappedCodex({ native: 3014 })], "no stable native Codex process"],
-  ])("Codex refuses a verified native process %s beneath the unchanged shell", async (_case, listings, reason) => {
-    const { url } = await seedCodex();
-    const sequence = listings();
-    vi.mocked(listNativeProcesses).mockImplementation(async () => (sequence.length > 1 ? sequence.shift()! : sequence[0]!));
+  it.each([null, 20, 99])("Codex refuses a changed or missing pane root (%s), even if it equals the native PID", async (pid) => {
+    const { url } = seedCodex(threadId, 20, 10);
+    livePanePid = pid;
     const response = await app.request(url);
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject(unverified(`no longer matches its verified occupant: ${reason}`));
+    expect(await response.json()).toMatchObject({ error: "record_identity_unverified", message: expect.stringContaining("no longer matches") });
+    expect(ProcessCensus.prototype.list).not.toHaveBeenCalled();
   });
 
-  it("Codex refuses a native process started in its verification's own second, and serves it after the next verdict", async () => {
-    // Ahead of the occupant's boot, whatever second the seed lands in.
-    const verifiedAt = new Date(Date.now() + 2_000);
-    const { url, reconcile } = await seedCodex({ processes: wrappedCodex({ nativeStarted: lstart(verifiedAt) }), now: () => verifiedAt });
-    const first = await app.request(url);
-    expect(first.status).toBe(409);
-    expect(await first.json()).toMatchObject(unverified("its native Codex process did not start before it was verified"));
-    await reconcile(() => new Date(verifiedAt.getTime() + 1_000));
-    expect((await app.request(url)).status).toBe(200);
-  });
-
-  it.each<[string, () => NativeProcessRow[], string]>([
-    ["respawned with a new shell and Codex", () => wrappedCodex({ root: 3101, native: 3104, rootStarted: later(), nativeStarted: later() }), "its native Codex process is 3104, not the verified 3004"],
-    ["replaced above the verified Codex's PID", () => wrappedCodex({ root: 3101, rootStarted: later() }), "its pane root did not start before it was verified"],
-  ])("Codex refuses a pane root %s", async (_case, processes, reason) => {
-    const { url } = await seedCodex();
-    panePid = 3101;
-    vi.mocked(listNativeProcesses).mockImplementation(async () => processes());
+  it("Codex keeps the legacy PID check when a verdict has no recorded pane PID", async () => {
+    const { url } = seedCodex(threadId, 20);
     const response = await app.request(url);
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject(unverified(`no longer matches its verified occupant: ${reason}`));
+    expect(await response.json()).toMatchObject({ error: "record_identity_unverified" });
   });
 
-  it("Codex refuses ambiguous native threads under one pane", async () => {
-    const { url } = await seedCodex({ processes: [...wrappedCodex(), backgroundCodex(3020)] });
-    vi.mocked(CodexThreadIdResolver.prototype.resolve).mockImplementation(async pid => pid === 3004 ? threadId : pid === 3020 ? "other-thread" : undefined);
+  it.each(["replaced", "unresolved"])("Codex refuses another process's thread when the verified native PID is %s", async (native) => {
+    const { url } = seedCodex(threadId, 20, 10);
+    vi.mocked(ProcessCensus.prototype.list).mockResolvedValue([
+      { pid: 10, ppid: 1, command: "zsh" },
+      ...(native === "unresolved" ? [{ pid: 20, ppid: 10, command: "codex", startedAt: "verified" }] : []),
+      { pid: 30, ppid: 10, command: "codex", startedAt: "replacement" },
+    ]);
+    vi.mocked(CodexThreadIdResolver.prototype.resolveWithHome).mockImplementation(async pid => pid === 30 ? { thread: threadId, codexHome: join(stateDir, ".codex") } : {});
     const response = await app.request(url);
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject(unverified("multiple"));
+    // Not a binding change: `rig walk` prints this message as it is.
+    expect(await response.json()).toMatchObject({ error: "record_identity_unverified",
+      message: "The Codex conversation in the pane for 'dev-codex@codex-rig' isn't the one its verified process owned, so no generation record is served." });
   });
 
-  it("Codex refuses a thread that is not its verified process's own", async () => {
-    const { url } = await seedCodex({ processes: [...wrappedCodex(), backgroundCodex(3020)] });
-    vi.mocked(CodexThreadIdResolver.prototype.resolve).mockImplementation(async pid => pid === 3020 ? "other-thread" : undefined);
+  it.each(["pane", "binding", "occupant"])("Codex still refuses a %s change during wrapped-thread resolution", async (changed) => {
+    const { url, node } = seedCodex(threadId, 20, 10);
+    vi.mocked(CodexThreadIdResolver.prototype.resolveWithHome).mockImplementation(async () => {
+      if (changed === "pane") livePanePid = 99;
+      else if (changed === "binding") registry.updateBinding(node.id, { tmuxPane: "%43" });
+      else registry.mintOccupantTenure(node.id, "handover", "successor-native-id");
+      return { thread: threadId, codexHome: join(stateDir, ".codex") };
+    });
     const response = await app.request(url);
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject(unverified("is not its verified process's own"));
+    expect(await response.json()).toMatchObject({ error: "record_identity_unverified", message: expect.stringContaining("changed while resolving") });
   });
 
   it("Codex refuses a wrong rollout identity instead of accepting the thread table pointer", async () => {
-    const { url } = await seedCodex({ metaId: "old-thread" });
+    const { url } = seedCodex("old-thread", 20, 10);
     const response = await app.request(url);
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({ error: "record_identity_mismatch" });
   });
 
-  it.each<[string, string, (record: string) => void]>([
-    ["absent from the native thread table", "unsupported_runtime", () => {
-      vi.mocked(CodexThreadIdResolver.prototype.resolve).mockImplementation(async pid => pid === 3004 ? "22222222-2222-4222-8222-222222222222" : undefined);
-    }],
-    ["missing on disk", "record_unreadable", record => rmSync(record)],
-  ])("Codex refuses when its record is %s", async (_case, error, remove) => {
-    const { url, record } = await seedCodex();
-    remove(record);
-    const response = await app.request(url);
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ error });
-  });
-
   it("Codex replacement at the same path changes generation identity", async () => {
-    const { url, record } = await seedCodex();
+    const { url, record } = seedCodex();
     const first = await (await app.request(url)).json();
     const replacement = record + ".next";
     writeFileSync(replacement, readFileSync(record));
@@ -574,64 +521,24 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
   });
 
   it("Codex refuses an identity observation from a retired occupant", async () => {
-    const { node, url } = await seedCodex();
+    const { node, url } = seedCodex();
     db.prepare("UPDATE seat_identity_verdicts SET observed_at = '2000-01-01T00:00:00Z' WHERE node_id = ?").run(node.id);
     const response = await app.request(url);
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({ error: "record_identity_unverified" });
   });
 
-  it.each<[string, (nodeId: string, seat: string) => void]>([
-    ["the occupant tenure", nodeId => registry.mintOccupantTenure(nodeId, "handover", "new-native-id")],
-    ["the bound pane", (nodeId, seat) => registry.updateBinding(nodeId, { tmuxSession: seat, tmuxPane: "%43" })],
-    ["the pane root", () => { panePid = 3999; }],
-    ["the native Codex process", () => { vi.mocked(listNativeProcesses).mockImplementation(async () => wrappedCodex({ native: 3014 })); }],
-    ["the native Codex process behind its reused PID", () => { vi.mocked(listNativeProcesses).mockImplementation(async () => wrappedCodex({ nativeStarted: later() })); }],
-    ["the pane root behind its reused PID", () => { vi.mocked(listNativeProcesses).mockImplementation(async () => wrappedCodex({ rootStarted: later() })); }],
-  ])("Codex refuses when %s changes while its thread resolves", async (_case, change) => {
-    const { url, node, seat } = await seedCodex();
-    vi.mocked(CodexThreadIdResolver.prototype.resolve).mockImplementation(async pid => {
-      if (pid !== 3004) return undefined;
-      change(node.id, seat);
-      return threadId;
-    });
+  it("Codex refuses ambiguous native threads under one pane", async () => {
+    const { url } = seedCodex(threadId, 20, 10);
+    vi.mocked(ProcessCensus.prototype.list).mockResolvedValue([
+      { pid: 10, ppid: 1, command: "zsh" },
+      { pid: 20, ppid: 10, command: "codex", startedAt: "a" },
+      { pid: 21, ppid: 10, command: "codex", startedAt: "b" },
+    ]);
+    vi.mocked(CodexThreadIdResolver.prototype.resolveWithHome).mockImplementation(async pid => ({ thread: pid === 20 ? threadId : "other-thread", codexHome: join(stateDir, ".codex") }));
     const response = await app.request(url);
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject(unverified("changed while resolving"));
-  });
-
-  it.each<[string, (nodeId: string, seat: string) => void]>([
-    ["the bound pane moves", (nodeId, seat) => registry.updateBinding(nodeId, { tmuxSession: seat, tmuxPane: "%43" })],
-    ["a successor tenure starts", nodeId => registry.mintOccupantTenure(nodeId, "handover", "new-native-id")],
-  ])("Codex refuses when %s during the closing pane read", async (_case, change) => {
-    const { url, node, seat } = await seedCodex();
-    let resolved = false;
-    vi.mocked(CodexThreadIdResolver.prototype.resolve).mockImplementation(async pid => {
-      if (pid !== 3004) return undefined;
-      resolved = true;
-      return threadId;
-    });
-    // The first pane read after the thread lookup is the closing one; the registry must be read after it.
-    paneReadHook = () => {
-      if (!resolved) return;
-      paneReadHook = undefined;
-      change(node.id, seat);
-    };
-    const response = await app.request(url);
-    expect(paneReadHook).toBeUndefined();
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject(unverified("changed while resolving"));
-  });
-
-  it("Codex never guesses a child for a verdict that recorded the pane's shell; the reconciler's next verdict serves", async () => {
-    // No current writer records the shell for a wrapped Codex; an older verdict may until the next poll.
-    const { url, node, reconcile } = await seedCodex();
-    db.prepare("UPDATE seat_identity_verdicts SET observed_pid = 3001 WHERE node_id = ?").run(node.id);
-    const guessed = await app.request(url);
-    expect(guessed.status).toBe(409);
-    expect(await guessed.json()).toMatchObject(unverified("its native Codex process is 3004, not the verified 3001"));
-    await reconcile();
-    expect((await app.request(url)).status).toBe(200);
+    expect(await response.json()).toMatchObject({ error: "record_identity_unverified", message: expect.stringContaining("multiple") });
   });
 
   it.each(["0.5", "-1", "NaN", "", "9007199254740992"])("refuses invalid byte offset %s", async offset => {
@@ -641,7 +548,7 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
 
   it.each(["complete", "prefix", "old-file", "replaced-file", "changed-occupant", "wrong-turn", "missing-turn", "missing-file", "claude"])(
     "integrated CLI → route → native record: %s", async (scenario) => {
-      const { record, node } = await seedCodex();
+      const { record, node } = seedCodex();
       const piece = "Shared heading. ".repeat(8) + "The complete middle matters.\n".repeat(9) + "unique tail Ω";
       const seat = scenario === "claude" ? "dev-claude@r" : "dev-codex@codex-rig";
       const claudePath = scenario === "claude" ? seedSidecar(seat, "claude-gen", "") : null;

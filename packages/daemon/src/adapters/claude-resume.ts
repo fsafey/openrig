@@ -1,5 +1,13 @@
-import { operationalLaunchArgs, operationalLaunchArg } from "./kernel-authority.js";
+import { continuationChoiceNotes, resumedClaudeArguments, sentClaudeAutoMode, type ClaudeContinuationLaunch } from "../domain/claude-continuation-launch.js";
+import type { ClaudePermissionRules } from "../domain/claude-permission-rules.js";
+import { claudeAutoModeForLaunch, type ClaudeAutoModeChoice } from "../domain/claude-auto-mode.js";
+import { withManagedRestoreReads, type RestoreReadPolicy } from "../domain/managed-restore-read-access.js";
+import { operationalLaunchArgs } from "./kernel-authority.js";
+import { claudeMcpArgs, type ClaudeMcp } from "../domain/claude-mcp.js";
+import { claudeSeatTokenFallbackNotice } from "../domain/claude-seat-token.js";
 import { setTimeout as sleep } from "node:timers/promises";
+import fs from "node:fs";
+import { throttledStatusLineForLaunch } from "../domain/claude-statusline-throttle.js";
 import type { TmuxAdapter } from "./tmux.js";
 import type { SeatLaunchEnvironment } from "../domain/seat-launch-environment.js";
 import { shellQuote } from "./shell-quote.js";
@@ -10,10 +18,13 @@ import { verifyClaudePaneProcess, verifyPaneIdleShell, type ClaudeLaunchedProces
 import { observeClaudePermission, type AppliedLaunchObservation } from "../domain/permission-drift.js";
 import { unresolvedClaudePermissionModes } from "../domain/native-permission-selection.js";
 import type { ClaudeManagedLaunch } from "../domain/claude-managed-launch.js";
+import { seatLaunchAdditionArgs, seatLaunchAdditionShellArgs, type SeatLaunchAdditions } from "../domain/seat-launch-additions.js";
 
 export type ResumeResult =
   // `launchedProcess` (Claude): the process this resume's own identity check observed (#1077).
-  | { ok: true; appliedLaunch?: AppliedLaunchObservation; launchedProcess?: ClaudeLaunchedProcess }
+  | { ok: true; appliedLaunch?: AppliedLaunchObservation; launchedProcess?: ClaudeLaunchedProcess;
+    /** Launch notes for the person, such as a seat token that wasn't applied. */
+    warnings?: string[] }
   // Non-terminal: a chooser or an inconclusive observation must preserve the
   // launch. Attention is not proof of native identity or successful continuity.
   | { ok: false; code: "attention_required"; message: string; evidence?: string }
@@ -27,6 +38,13 @@ export function isClaudeResumeType(resumeType: string | null | undefined): boole
 }
 
 interface ClaudeResumeOptions {
+  openrigHome?: string;
+  /** The compaction settings the restore reads from, so the launch grants those files too. */
+  restoreReadPolicy?: () => RestoreReadPolicy | null;
+  /** Slice 13: whether this restore adds a seat's hook bridge (opted in, on a Claude with asyncRewake). */
+  hookBridgeLaunch?: (nodeId: string, executable?: string) => boolean | Promise<boolean>;
+  /** #3416 (3): the seat's status line throttle in seconds, or null when it has none; read at each restore. */
+  statuslineThrottleLaunch?: (nodeId: string) => number | null | Promise<number | null>;
   seatLaunchEnvironment?: SeatLaunchEnvironment;
   claudeManagedLaunch?: ClaudeManagedLaunch;
   listProcesses?: NativeProcessLister;
@@ -47,6 +65,17 @@ export class ClaudeResumeAdapter {
     return true;
   }
 
+  /** #3416 (3): the throttled status line for this restore's --settings, as on a fresh launch (claude-code-adapter.ts). */
+  private async throttledStatusLine(nodeId: string | null | undefined, cwd: string, sessionName: string,
+    notes: string[]): Promise<{ statusLine?: Record<string, unknown> }> {
+    const seconds = nodeId ? await this.options.statuslineThrottleLaunch?.(nodeId) ?? null : null;
+    if (seconds === null || !this.options.openrigHome || !cwd) return {};
+    const result = throttledStatusLineForLaunch({ readFile: (p: string) => fs.readFileSync(p, "utf-8"), exists: (p: string) => fs.existsSync(p), cwd,
+      stateDir: this.options.openrigHome, nodeExecutable: process.execPath, sessionName, seconds });
+    if ("note" in result) { notes.push(result.note); return {}; }
+    return { statusLine: result.statusLine };
+  }
+
   async resume(
     tmuxSessionName: string,
     resumeType: string | null,
@@ -65,6 +94,16 @@ export class ClaudeResumeAdapter {
     nonInterruptive?: boolean,
     kernelAuthority?: boolean,
     teamPermissionDefault?: boolean,
+    advisor?: string | null,
+    // OPR.0.7.0.9: the seat's own launch additions (copies in its seat storage); absent → byte-identical.
+    launchAdditions?: SeatLaunchAdditions,
+    claudePermissions?: ClaudePermissionRules,
+    beforeNativeDispatch?: () => boolean,
+    executable?: string,
+    claudeMcp?: ClaudeMcp,
+    launchWrapper?: readonly string[],
+    continuation?: ClaudeContinuationLaunch,
+    claudeAutoMode?: ClaudeAutoModeChoice,
   ): Promise<ResumeResult> {
     if (!this.canResume(resumeType, resumeToken)) {
       return { ok: false, code: "no_resume", message: "Claude resume not available" };
@@ -75,34 +114,98 @@ export class ClaudeResumeAdapter {
     // 0.5.2-07: --model matches the fresh-launch adapter (claude-code-adapter), emitted after posture.
     const modelArg = model ? ` --model ${shellQuote(model)}` : "";
     const effortArg = effort ? ` --effort ${shellQuote(effort)}` : "";
+    advisor = advisor?.trim();
+    const advisorArg = advisor ? ` --advisor ${shellQuote(advisor)}` : "";
+    const mcpArgs = claudeMcpArgs(claudeMcp);
+    const mcpArg = mcpArgs.map(arg => ` ${shellQuote(arg)}`).join("");
+    const additionArgs = seatLaunchAdditionArgs(launchAdditions);
+    const additionArg = seatLaunchAdditionShellArgs(launchAdditions, shellQuote); // each flag bare, each value quoted
     let managed: Awaited<ReturnType<ClaudeManagedLaunch["prepare"]>> | undefined;
     if (selectedPermissionMode !== undefined) {
       try {
         if (!nodeId || !this.options.claudeManagedLaunch) await unresolvedClaudePermissionModes();
-        managed = await this.options.claudeManagedLaunch!.prepare({ nodeId: nodeId!, cwd, session: tmuxSessionName }, selectedPermissionMode);
+        managed = await this.options.claudeManagedLaunch!.prepare({ nodeId: nodeId!, cwd, session: tmuxSessionName,
+          ...(executable ? { executable } : {}), ...(launchWrapper?.length ? { launchWrapper } : {}), ...(continuation?.configDir !== undefined ? { continuationConfigDir: continuation.configDir } : {}) }, selectedPermissionMode);
       } catch (error) { return { ok: false, code: "permission_selection_refused", message: (error as Error).message }; }
     }
-    const choice = { kernelAuthority, teamPermissionDefault, nonInterruptive, launchPosture: resolvedPosture, permissionMode: selectedPermissionMode };
+    // A seat's own subscription token, as on a fresh launch (claude-code-adapter.ts).
+    let seatToken: ReturnType<ClaudeManagedLaunch["seatTokenLaunch"]> = null;
+    if (!managed && nodeId) {
+      try { seatToken = this.options.claudeManagedLaunch?.seatTokenLaunch?.(nodeId) ?? null; }
+      catch (error) { return { ok: false, code: "api_key_unavailable", message: (error as Error).message }; }
+    }
+    const requiresApiKey = seatToken?.ref.kind === "api-key";
+    const tokenWarnings: string[] = [...(managed?.warnings ?? seatToken?.warnings ?? [])];
+    if (seatToken) tokenWarnings.push(...(await this.options.claudeManagedLaunch?.tokenPrecedenceWarnings?.(nodeId!, seatToken.ref) ?? []));
+    const choice = { claudePermissions, claudeAutoMode, kernelAuthority, teamPermissionDefault, nonInterruptive, launchPosture: resolvedPosture, permissionMode: selectedPermissionMode,
+      // The version gate reads the Claude this resume runs, not PATH's.
+      hookBridge: nodeId ? (await this.options.hookBridgeLaunch?.(nodeId, executable ?? undefined)) === true : false,
+      ...await this.throttledStatusLine(nodeId, cwd, tmuxSessionName, tokenWarnings) };
     const posture = claudePostureFlag(process.env, resolvedPosture, selectedPermissionMode);
-    const appliedLaunch = observeClaudePermission(posture);
-    const permissionMode = posture + operationalLaunchArg("claude-code", choice);
-    const cmd = managed ? managed.command(["--permission-mode", selectedPermissionMode!, ...operationalLaunchArgs("claude-code", choice), ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []), "--resume", resumeToken!], claudeResumeLaunchEnv(resumeToken!))
-      : `${claudeResumeLaunchPrefix(resumeToken!)}${claudeClassicRendererEnvPrefix(process.env)}claude ${permissionMode}${modelArg}${effortArg} --resume ${shellQuote(resumeToken!)}`;
+    const autoMode = claudeAutoModeForLaunch(claudeAutoMode);
+    if (autoMode.warning) tokenWarnings.push(autoMode.warning);
+    const launchArgs = withManagedRestoreReads(operationalLaunchArgs("claude-code", choice), {
+      openrigHome: this.options.openrigHome, session: tmuxSessionName, cwd, nativeSessionId: resumeToken!,
+      ...(this.options.restoreReadPolicy?.() ?? {}),
+    });
+    const permissionMode = posture + launchArgs.map(arg => ` ${shellQuote(arg)}`).join("");
+    let wrapperPrefix = "";
+    if (!managed && executable && launchWrapper?.length) {
+      if (!this.options.seatLaunchEnvironment) return { ok: false, code: "resume_failed", message: "launch_wrapper support unavailable; no agent started." };
+      try { wrapperPrefix = this.options.seatLaunchEnvironment.resolveLaunchWrapper(launchWrapper).map(shellQuote).join(" ") + " "; }
+      catch { return { ok: false, code: "resume_failed", message: "launch_wrapper unavailable; no agent started." }; }
+    }
+    const nativeArgs = resumedClaudeArguments(continuation, ["--permission-mode", selectedPermissionMode!, ...launchArgs, ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []), ...(advisor ? ["--advisor", advisor] : []), ...mcpArgs, ...additionArgs, "--resume", resumeToken!], resumeToken!, effort, posture, autoMode.block ?? null);
+    const cmd = managed ? managed.command(nativeArgs, claudeResumeLaunchEnv(resumeToken!))
+      : `${claudeResumeLaunchPrefix(resumeToken!)}${claudeClassicRendererEnvPrefix(process.env)}${executable ? `exec ${wrapperPrefix}${shellQuote(executable)}` : "claude"} ${permissionMode}${modelArg}${effortArg}${advisorArg}${mcpArg}${additionArg} --resume ${shellQuote(resumeToken!)}`;
 
-    const textResult = managed ? await this.tmux.sendShellCommand(tmuxSessionName, cmd, managed.assertCurrent)
-      : this.options.seatLaunchEnvironment
-        ? await this.tmux.sendShellCommand(tmuxSessionName, await this.options.seatLaunchEnvironment.command(tmuxSessionName, cmd, { runtime: "claude-code", nodeId }), undefined, { sourceInPane: true })
-        : await this.tmux.sendText(tmuxSessionName, cmd);
+    const configPrefix = continuation?.configDir != null && this.options.seatLaunchEnvironment ? `CLAUDE_CONFIG_DIR=${shellQuote(continuation.configDir)} ` : "";
+    const classicCommand = configPrefix + (continuation?.args && executable
+      ? `${claudeResumeLaunchPrefix(resumeToken!)}exec ${wrapperPrefix}${shellQuote(executable)} ${nativeArgs.map(shellQuote).join(" ")}` : cmd);
+    if (!managed && continuation?.configDir !== undefined && !configPrefix) tokenWarnings.push("This classic launch cannot privately apply the captured config selector; ordinary pane selection is used.");
+    tokenWarnings.push(...continuationChoiceNotes(continuation, posture, model));
+    // Recorded from the arguments actually sent: captured continuation arguments carry the running process's settings.
+    const sentAutoMode = managed || (continuation?.args && executable) ? sentClaudeAutoMode(nativeArgs) : autoMode.block ?? null;
+    if (sentAutoMode === undefined) tokenWarnings.push("The running Claude's --settings is a file, so this relaunch can't set or check its auto mode block; status shows the block as unknown.");
+    const appliedLaunch = { ...observeClaudePermission(posture), claudeAutoMode: sentAutoMode === undefined ? { unknown: "settings_file" as const } : sentAutoMode };
+
+    const assertSelected = beforeNativeDispatch ? () => { if (!beforeNativeDispatch()) throw new Error("Selected history changed before Claude resume input"); } : undefined;
+    const beforeManagedInput = beforeNativeDispatch ? () => { assertSelected?.(); managed?.assertCurrent?.(); } : managed?.assertCurrent;
+
+    const sendClassic = async () => {
+      if (!this.options.seatLaunchEnvironment) {
+        if (launchWrapper?.length) return { ok: false as const, code: "resume_failed", message: "launch_wrapper support unavailable; no agent started." };
+        if (requiresApiKey) return { ok: false as const, code: "api_key_unavailable", message: "This launch cannot apply the selected API key; no Claude process started." };
+        if (seatToken) tokenWarnings.push(this.options.claudeManagedLaunch?.tokenNotApplied?.(nodeId!, seatToken.ref, "this launch path can't run the token step") ?? claudeSeatTokenFallbackNotice(seatToken.ref, "this launch path can't run the token step"));
+        if (beforeNativeDispatch && !beforeNativeDispatch()) return { ok: false as const, code: "selection_changed", message: "Selected history changed before Claude resume input" };
+        return assertSelected ? this.tmux.sendText(tmuxSessionName, classicCommand, assertSelected) : this.tmux.sendText(tmuxSessionName, classicCommand);
+      }
+      const staged = await this.options.seatLaunchEnvironment.command(tmuxSessionName, classicCommand, { runtime: "claude-code", nodeId,
+        ...(launchWrapper?.length ? { launchWrapper } : {}), ...(executable && launchWrapper?.length ? { claudeShellLookup: false as const } : {}),
+        ...(seatToken ? { claudeTokenStep: seatToken.step } : {}) });
+      if (seatToken && !staged.includes(seatToken.step)) {
+        if (requiresApiKey) return { ok: false as const, code: "api_key_unavailable", message: "This pane cannot apply the selected API key; no Claude process started." };
+        tokenWarnings.push(this.options.claudeManagedLaunch?.tokenNotApplied?.(nodeId!, seatToken.ref, "the seat's pane shell can't run the token step") ?? claudeSeatTokenFallbackNotice(seatToken.ref, "the seat's pane shell can't run the token step"));
+      }
+      if (beforeNativeDispatch && !beforeNativeDispatch()) return { ok: false as const, code: "selection_changed", message: "Selected history changed before Claude resume input" };
+      // The token step is POSIX shell: a fish pane runs the launch with /bin/sh rather than sourcing it.
+      const shellOptions = { sourceInPane: true, ...(seatToken && staged.includes(seatToken.step) ? { posix: true } : {}) };
+      return assertSelected ? this.tmux.sendShellCommand(tmuxSessionName, staged, assertSelected, shellOptions)
+        : this.tmux.sendShellCommand(tmuxSessionName, staged, undefined, shellOptions);
+    };
+    if (beforeNativeDispatch && !beforeNativeDispatch()) return { ok: false, code: "attention_required", message: "Selected history changed during Claude resume preparation; no native command was sent." };
+    const textResult = managed ? await this.tmux.sendShellCommand(tmuxSessionName, cmd, beforeManagedInput) : await sendClassic();
     if (!textResult.ok) {
       // sendText failed — nothing in the buffer, no cleanup needed
       return { ok: false, code: "resume_failed", message: textResult.message };
     }
 
-    const keyResult = managed || this.options.seatLaunchEnvironment ? { ok: true as const } : await this.tmux.sendKeys(tmuxSessionName, ["Enter"]);
+    const keyResult = managed || this.options.seatLaunchEnvironment ? { ok: true as const }
+      : await (assertSelected ? this.tmux.sendKeys(tmuxSessionName, ["Enter"], assertSelected) : this.tmux.sendKeys(tmuxSessionName, ["Enter"]));
     if (!keyResult.ok) {
       // Partial failure: command text is in the buffer but Enter failed.
       // Best-effort cleanup: send C-c to clear the typed command.
-      await this.tmux.sendKeys(tmuxSessionName, ["C-c"]);
+      if (!beforeNativeDispatch || beforeNativeDispatch()) await this.tmux.sendKeys(tmuxSessionName, ["C-c"], assertSelected);
       return { ok: false, code: "resume_failed", message: keyResult.message };
     }
 
@@ -111,7 +214,7 @@ export class ClaudeResumeAdapter {
       code: "attention_required",
       message: `Claude resume observation unavailable; launch retained: ${error instanceof Error ? error.message : String(error)}`,
     }));
-    return result.ok ? { ...result, appliedLaunch } : result;
+    return result.ok ? { ...result, appliedLaunch, ...(tokenWarnings.length ? { warnings: tokenWarnings } : {}) } : result;
   }
 
   private async verifyResume(tmuxSessionName: string, resumeToken: string): Promise<ResumeResult> {
@@ -179,8 +282,8 @@ export class ClaudeResumeAdapter {
     }
 
     // The exact --resume identity is stronger evidence than a pane command or
-    // a version/footer heuristic. Use it only with Claude's interactive prompt
-    // visible, and after the untrusted screen classifiers have had their say.
+    // a version/footer heuristic. Use it with Claude's interactive prompt visible
+    // (or behind a shell label, below), after the untrusted screen classifiers have had their say.
     const mayBeWrappedComposer = finalProbe.status === "inconclusive"
       || (finalProbe.status === "failed" && finalProbe.code === "returned_to_shell");
     if (/(^|\n)\s*❯/.test(finalContent) && mayBeWrappedComposer) {
@@ -216,6 +319,15 @@ export class ClaudeResumeAdapter {
           code: "retry_fresh",
           message: "Claude resume failed: pane returned to shell instead of entering Claude",
         };
+      }
+      // #2508: a launch subshell that didn't exec Claude (an rc alias or function, or a fallen-back environment
+      // correction) keeps the shell as the label. A proven Claude naming this resume beneath it is the foreground
+      // runtime, as a `claude` label is, before its prompt shows.
+      const identity = await verifyClaudePaneProcess({ target: tmuxSessionName, tmux: this.tmux,
+        ...(this.options.listProcesses ? { listProcesses: this.options.listProcesses } : {}), expectedToken: resumeToken });
+      if (identity) {
+        return { ok: true, ...(identity.process.startedAt
+          ? { launchedProcess: { pid: identity.process.pid, startedAt: identity.process.startedAt } } : {}) };
       }
       return {
         ok: false,

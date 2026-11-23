@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
+import { selectRigProject, rigFromSession } from "@openrig/daemon/project-catalog";
 import { ConfigStore } from "../../config-store.js";
 
 import type {
@@ -77,6 +78,65 @@ export function readFrontmatter(absPath: string): Record<string, unknown> {
   }
 }
 
+/** The line-based frontmatter reader the daemon's slice indexer applies to a
+ *  slice's files (`parseFrontmatter` in packages/daemon/src/domain/slices/slice-indexer.ts):
+ *  every line is trimmed at any indentation, `#` lines are skipped, wrapping quotes are
+ *  stripped, an inline `#` stays in the value, and the last `status:` line wins. */
+function parseIndexerFrontmatter(content: string): Record<string, string> {
+  if (!content.startsWith("---")) return {};
+  const rest = content.slice(3);
+  const endIdx = rest.indexOf("\n---");
+  if (endIdx === -1) return {};
+  const out: Record<string, string> = {};
+  for (const line of rest.slice(0, endIdx).split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const colonIdx = trimmed.indexOf(":");
+    if (colonIdx === -1) continue;
+    const key = trimmed.slice(0, colonIdx).trim();
+    let value = trimmed.slice(colonIdx + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+/** The files the slice indexer merges for a slice's frontmatter, in its merge order:
+ *  later files win, so `PROGRESS.md` overrides the node file (`SPEC.md` / `README.md`). */
+function indexerFrontmatterFiles(sliceAbsPath: string): string[] {
+  const node = resolveNodeFile(sliceAbsPath);
+  return [
+    path.join(sliceAbsPath, "IMPLEMENTATION-PRD.md"),
+    ...(node ? [path.join(sliceAbsPath, path.basename(node))] : []),
+    path.join(sliceAbsPath, "PROGRESS.md"),
+  ];
+}
+
+/** Whether the slice indexer would read a `status` out of this file on its own. */
+export function indexerReadsStatusIn(content: string): boolean {
+  return Object.prototype.hasOwnProperty.call(parseIndexerFrontmatter(content), "status");
+}
+
+/** Read a slice's status back the way the slice indexer does, and name the file that
+ *  supplies it. `status` is `null` when no file gives the indexer one. This follows the
+ *  indexer's merge (later files win) rather than listing frontmatter shapes up front, so it
+ *  reads what every shape actually becomes; a parity test holds it to the real indexer. */
+export function readIndexerSliceStatus(sliceAbsPath: string): { status: string | null; file: string | null } {
+  let status: string | null = null;
+  let file: string | null = null;
+  for (const candidate of indexerFrontmatterFiles(sliceAbsPath)) {
+    if (!fs.existsSync(candidate)) continue;
+    const frontmatter = parseIndexerFrontmatter(fs.readFileSync(candidate, "utf8"));
+    if (Object.prototype.hasOwnProperty.call(frontmatter, "status")) {
+      status = frontmatter["status"]!;
+      file = candidate;
+    }
+  }
+  return { status, file };
+}
+
 /** Update specific keys in a markdown file's frontmatter. The writer owns only
  *  those keys in valid mappings, preserving inline comments and unowned bytes.
  *  Invalid mappings retain the legacy line-based update with a warning. Valid
@@ -88,12 +148,17 @@ export function updateFrontmatter(
   updates: Record<string, unknown>,
 ): void {
   const original = fs.existsSync(absPath) ? fs.readFileSync(absPath, "utf8") : "";
+  fs.writeFileSync(absPath, editFrontmatter(original, updates, absPath), "utf8");
+}
+
+export function editFrontmatter(original: string, updates: Record<string, unknown>, absPath: string, strict = false): string {
   const match = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?=\r?\n|$)/.exec(original);
   if (!match) {
+    if (strict && /^---[ \t]*\r?\n/.test(original)) throw new ScopeCliError({ fact: "Frontmatter is not terminated.", consequence: "No progress update was made.", action: "Fix the frontmatter and retry." });
     const yaml = YAML.stringify(updates, { lineWidth: 0 }).trimEnd();
-    const separator = original.startsWith("\n") ? "" : "\n";
-    fs.writeFileSync(absPath, `---\n${yaml}\n---\n${separator}${original}`, "utf8");
-    return;
+    const newline = original.includes("\r\n") ? "\r\n" : "\n";
+    const separator = original.startsWith(newline) ? "" : newline;
+    return `---${newline}${yaml}${newline}---${newline}${separator}${original}`;
   }
 
   const originalBlock = match[1]!;
@@ -105,14 +170,14 @@ export function updateFrontmatter(
     block = updateMappedFrontmatter(original.slice(blockStart, blockEnd), updates, newline, absPath);
   } catch (error) {
     if (!(error instanceof ScopeCliError)) throw error;
+    if (strict) throw error;
     console.warn(`[warn] ${absPath}: frontmatter isn't valid YAML; using line-based updates. Listing cannot read its fields until the YAML is fixed.`);
     // Start again from the original block, including when a splice removed a used anchor.
     block = updateFrontmatterLines(originalBlock, updates);
     const updated = original.slice(0, match.index) + `---\n${block}\n---` + original.slice(match.index + match[0].length);
-    fs.writeFileSync(absPath, updated, "utf8");
-    return;
+    return updated;
   }
-  fs.writeFileSync(absPath, original.slice(0, blockStart) + block + original.slice(blockEnd), "utf8");
+  return original.slice(0, blockStart) + block + original.slice(blockEnd);
 }
 
 /** Keep main's line-based update for YAML that cannot use source-range splicing. */
@@ -205,6 +270,105 @@ export function configuredMissionsRoot(configPath?: string): string | null {
   return null;
 }
 
+/**
+ * The project's missions root: project.yaml's optional `missions.root` when it is a relative path inside the
+ * project, else the conventional `missions`. Null when it resolves outside the project. Work positions and
+ * mission creation both use it, so they agree on where a project's missions live.
+ */
+export function projectMissionsRoot(
+  projectRoot: string,
+  projectManifest: Record<string, unknown> | null,
+  warnings: string[],
+): string | null {
+  let missionsRel = "missions";
+  const missions = projectManifest?.["missions"];
+  const root = missions !== null && typeof missions === "object" && !Array.isArray(missions)
+    ? (missions as Record<string, unknown>)["root"]
+    : undefined;
+  if (root !== undefined) {
+    if (typeof root === "string" && !path.isAbsolute(root) && !root.split(/[\\/]/).includes("..")) {
+      missionsRel = root;
+    } else {
+      warnings.push("project.yaml: optional missions.root must be a relative path inside the project; kept the conventional missions root");
+    }
+  }
+  const missionsRoot = path.resolve(projectRoot, missionsRel);
+  const rel = path.relative(projectRoot, missionsRoot);
+  return rel === "" || (!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`)) ? missionsRoot : null;
+}
+
+/** {@link projectMissionsRoot} for the project.yaml at `projectRoot`, when there is one. */
+export function readProjectMissionsRoot(projectRoot: string, warnings: string[]): string | null {
+  const projectManifestPath = path.join(projectRoot, "project.yaml");
+  let projectManifest: Record<string, unknown> | null = null;
+  if (fs.existsSync(projectManifestPath)) {
+    try {
+      const value = YAML.parse(fs.readFileSync(projectManifestPath, "utf8")) as unknown;
+      if (value !== null && typeof value === "object" && !Array.isArray(value)) projectManifest = value as Record<string, unknown>;
+      else warnings.push(`${projectManifestPath} must contain a YAML object; kept the conventional missions root`);
+    } catch (err) {
+      warnings.push(`${projectManifestPath} is not valid YAML: ${(err as Error).message}; kept the conventional missions root`);
+    }
+  }
+  return projectMissionsRoot(projectRoot, projectManifest, warnings);
+}
+
+/** The project.yaml at `dir` as an object, or null when there's none or it doesn't parse. */
+function readProjectManifest(dir: string): Record<string, unknown> | null {
+  try {
+    const value = YAML.parse(fs.readFileSync(path.join(dir, "project.yaml"), "utf8")) as unknown;
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The nearest project.yaml at or above `from`, as its folder, or null. */
+function nearestProjectRoot(from: string): string | null {
+  for (let dir = from; ; dir = path.dirname(dir)) {
+    if (fs.existsSync(path.join(dir, "project.yaml"))) return dir;
+    if (path.dirname(dir) === dir) return null;
+  }
+}
+
+/** The project that declares `missionsRoot`: the nearest project.yaml at or above it, when its missions root is that
+ *  folder. */
+function owningProject(missionsRoot: string): { root: string; manifest: Record<string, unknown> | null } | null {
+  const target = path.resolve(missionsRoot);
+  const root = nearestProjectRoot(target);
+  if (!root) return null;
+  const manifest = readProjectManifest(root);
+  return projectMissionsRoot(root, manifest, []) === target ? { root, manifest } : null;
+}
+
+const PROJECT_ID_PREFIX_RE = /^[A-Z]{2,3}$/;
+
+/** The dot-ID prefix for missions minted in `missionsRoot`: its project.yaml's optional `scope.idPrefix` (2-3 uppercase
+ *  letters, such as OPS), so a project nested in another workspace doesn't repeat that workspace's ids. Absent, or
+ *  invalid (with a warning): OPR, as before. */
+export function projectIdPrefix(missionsRoot: string, warnings: string[] = []): string {
+  const owner = owningProject(missionsRoot);
+  const scope = owner?.manifest?.["scope"];
+  const value = scope !== null && typeof scope === "object" && !Array.isArray(scope)
+    ? (scope as Record<string, unknown>)["idPrefix"]
+    : undefined;
+  if (value === undefined) return DEFAULT_PROJECT_PREFIX;
+  if (typeof value === "string" && PROJECT_ID_PREFIX_RE.test(value)) return value;
+  warnings.push(`${path.join(owner!.root, "project.yaml")}: optional scope.idPrefix must be 2-3 uppercase letters (such as OPS); kept ${DEFAULT_PROJECT_PREFIX}`);
+  return DEFAULT_PROJECT_PREFIX;
+}
+
+/** The missions root of the project that encloses the one declaring `missionsRoot` (the next project.yaml above it), or
+ *  null when there's none. */
+export function enclosingMissionsRoot(missionsRoot: string): string | null {
+  const owner = owningProject(missionsRoot);
+  if (!owner || path.dirname(owner.root) === owner.root) return null;
+  const root = nearestProjectRoot(path.dirname(owner.root));
+  if (!root) return null;
+  const missions = projectMissionsRoot(root, readProjectManifest(root), []);
+  return missions && missions !== path.resolve(missionsRoot) ? missions : null;
+}
+
 /** Locate the missions root from an explicit workspace override or the typed
  * `workspace.slices_root` setting. No cwd walk: discovery may enumerate
  * candidates, but selection comes from configuration. */
@@ -212,6 +376,10 @@ export function resolveMissionsRoot(opts: {
   override?: string | null;
   cwd?: string;
   configPath?: string;
+  /** An absolute slice is an explicit target, so it keeps the previous workspace resolution. */
+  targetPath?: string;
+  /** Mission creation may create a new missions tree within an existing project. */
+  allowMissingProjectMissions?: boolean;
   /**
    * Fail instead of falling back to the configured root when an explicit
    * override (`--workspace` or OPENRIG_WORK_ROOT) names no missions tree.
@@ -228,7 +396,14 @@ export function resolveMissionsRoot(opts: {
   if (fromOverride) {
     const candidate = path.isAbsolute(fromOverride) ? fromOverride : path.resolve(cwd, fromOverride);
     const missions = path.join(candidate, "missions");
-    if (fs.existsSync(missions) && fs.statSync(missions).isDirectory()) return missions;
+    const hasMissionsChild = fs.existsSync(missions) && fs.statSync(missions).isDirectory();
+    // A named workspace reads the missions.root its project.yaml declares, where mission creation writes;
+    // a named missions folder is read as is.
+    if (hasMissionsChild || path.basename(candidate) !== "missions") {
+      const declared = readProjectMissionsRoot(candidate, []);
+      if (declared && fs.existsSync(declared) && fs.statSync(declared).isDirectory()) return declared;
+    }
+    if (hasMissionsChild) return missions;
     if (path.basename(candidate) === "missions" && fs.existsSync(candidate)) return candidate;
     if (opts.strictOverride) {
       const source = fromFlag === null ? "OPENRIG_WORK_ROOT" : "--workspace";
@@ -241,8 +416,49 @@ export function resolveMissionsRoot(opts: {
       });
     }
   }
+  if (!fromOverride && !(opts.targetPath && path.isAbsolute(opts.targetPath))) {
+    const rig = rigFromSession(process.env.OPENRIG_SESSION_NAME);
+    if (rig) {
+      try {
+        const config = new ConfigStore(opts.configPath);
+        const selected = selectRigProject(String(config.get("workspace.catalog_path")), rig);
+        if (selected) {
+          const manifestPath = path.join(selected.root, "project.yaml");
+          if (fs.existsSync(manifestPath)) {
+            let manifest: unknown;
+            try { manifest = YAML.parse(fs.readFileSync(manifestPath, "utf8")); }
+            catch (error) {
+              throw new ScopeCliError({ fact: `Cannot read ${manifestPath}: ${(error as Error).message}`, consequence: "No project was selected.", action: "Correct the project manifest or select a workspace explicitly." });
+            }
+            const fields = manifest && typeof manifest === "object" && !Array.isArray(manifest) ? manifest as Record<string, any> : null;
+            if (!fields) throw new ScopeCliError({ fact: `${manifestPath} must be a YAML object.`, consequence: "No project was selected.", action: "Correct the project manifest or select a workspace explicitly." });
+            const declared = fields.id ?? fields.metadata?.id;
+            if (declared && declared !== selected.id) throw new ScopeCliError({ fact: `Catalog project '${selected.id}' conflicts with project identity '${declared}'.`, consequence: "No project was selected.", action: "Correct the project identity or select a workspace explicitly." });
+          }
+          const warnings: string[] = [];
+          const root = readProjectMissionsRoot(selected.root, warnings);
+          for (const warning of warnings) console.error(`warning: ${warning}`);
+          if (!root || (fs.existsSync(root) ? !fs.statSync(root).isDirectory() : !opts.allowMissingProjectMissions)) throw new ScopeCliError({
+            fact: `Project '${selected.id}' selected by rig '${rig}' has no readable missions root.`,
+            consequence: "The command did not use the shared workspace.",
+            action: "Create its missions tree or select a workspace explicitly.",
+          });
+          console.error(`Project ${selected.id}: ${selected.root} (selected by rig ${rig})`);
+          return root;
+        }
+      } catch (error) {
+        const problem = error instanceof Error ? error.message : String(error);
+        console.error(`warning: rig project selection failed: ${problem}; using configured workspace. Fix the catalog or select a workspace explicitly with --workspace or OPENRIG_WORK_ROOT.`);
+      }
+    }
+  }
   const configured = configuredMissionsRoot(opts.configPath);
-  if (configured) return configured;
+  if (configured) {
+    if (!fromOverride && !(opts.targetPath && path.isAbsolute(opts.targetPath))) {
+      console.error(`Project unbound: ${configured} (configured missions root)`);
+    }
+    return configured;
+  }
   throw new ScopeCliError({
     fact: `Configured workspace.slices_root is not a readable directory: ${(new ConfigStore(opts.configPath).get("workspace.slices_root") as string) || "(unset)"}.`,
     consequence: "No mission tree to operate on.",
@@ -312,31 +528,23 @@ export function listMissions(missionsRoot: string): MissionInfo[] {
     const hasReadme = readmePath !== null;
     if (!hasReadme) continue;
     const frontmatter = readFrontmatter(readmePath);
-    const slicesDir = path.join(absPath, "slices");
-    const closedDir = path.join(absPath, "closed");
-    const activeSliceCount = countSliceDirs(slicesDir);
-    const closedSliceCount = countSliceDirs(closedDir);
     const id = pickIdFromFrontmatter(frontmatter);
-    out.push({
-      name: entry.name,
-      absPath,
-      readmePath: hasReadme ? readmePath : null,
-      frontmatter,
-      id,
-      activeSliceCount,
-      closedSliceCount,
-    });
+    out.push(withSliceCounts({ name: entry.name, absPath, readmePath, frontmatter, id }));
   }
   // Stable order: by mission name.
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
 }
 
-function countSliceDirs(dir: string): number {
-  if (!fs.existsSync(dir)) return 0;
-  return fs.readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && SLICE_DIRNAME_RE.test(e.name))
-    .length;
+/** The mission with each of its slices counted once, by its standing (the same one `slice ls` filters on). */
+function withSliceCounts(base: Omit<MissionInfo, "activeSliceCount" | "shippedSliceCount" | "closedSliceCount">): MissionInfo {
+  const mission: MissionInfo = { ...base, activeSliceCount: 0, shippedSliceCount: 0, closedSliceCount: 0 };
+  for (const { standing } of slicesWithStanding(mission)) {
+    if (standing === "active") mission.activeSliceCount++;
+    else if (standing === "shipped") mission.shippedSliceCount++;
+    else mission.closedSliceCount++;
+  }
+  return mission;
 }
 
 function pickIdFromFrontmatter(fm: Record<string, unknown>): string | null {
@@ -368,22 +576,15 @@ export function findMission(missionsRoot: string, identifier: string): MissionIn
   throw new ScopeCliError({
     fact: `Mission "${identifier}" not found under ${missionsRoot}.`,
     consequence: "Command did not run.",
-    action: "List available missions with: rig scope mission ls",
+    action: "List available missions with: rig scope mission ls. "
+      + "For a mission in another workspace, such as a catalog project, select its tree with the parent option: rig scope --workspace <project root> mission <verb> <mission>",
   });
 }
 
 function buildMissionInfo(missionsRoot: string, absPath: string): MissionInfo {
   const readmePath = resolveNodeFile(absPath);
   const frontmatter = readmePath ? readFrontmatter(readmePath) : {};
-  return {
-    name: path.basename(absPath),
-    absPath,
-    readmePath,
-    frontmatter,
-    id: pickIdFromFrontmatter(frontmatter),
-    activeSliceCount: countSliceDirs(path.join(absPath, "slices")),
-    closedSliceCount: countSliceDirs(path.join(absPath, "closed")),
-  };
+  return withSliceCounts({ name: path.basename(absPath), absPath, readmePath, frontmatter, id: pickIdFromFrontmatter(frontmatter) });
 }
 
 // ---------------------------------------------------------------------
@@ -394,35 +595,35 @@ export function listSlices(
   mission: MissionInfo,
   state: SliceState,
 ): SliceInfo[] {
-  const dirs: Array<{ root: string; bucket: "active" | "closed" }> = [];
-  if (state === "active" || state === "shipped" || state === "all") {
-    dirs.push({ root: path.join(mission.absPath, "slices"), bucket: "active" });
-  }
-  if (state === "closed" || state === "all") {
-    dirs.push({ root: path.join(mission.absPath, "closed"), bucket: "closed" });
-  }
-  const out: SliceInfo[] = [];
-  for (const { root } of dirs) {
+  return slicesWithStanding(mission)
+    .filter(({ standing }) => state === "all" || standing === state)
+    .map(({ slice }) => slice);
+}
+
+/** Where a slice stands. In closed/, it's closed. In place: shipped (or done) is delivered; a closed or superseded
+ *  status, or a superseded or retired stage, is an exit, so closed; anything else, blocked work included, is active. */
+export function sliceStanding(slice: SliceInfo, inClosedFolder: boolean): Exclude<SliceState, "all"> {
+  if (inClosedFolder) return "closed";
+  const status = (slice.status ?? "").toLowerCase();
+  const stage = typeof slice.frontmatter.stage === "string" ? slice.frontmatter.stage.toLowerCase() : "";
+  if (status === "done" || status.startsWith("shipped")) return "shipped";
+  if (status.startsWith("closed") || status === "superseded" || stage === "superseded" || stage === "retired") return "closed";
+  return "active";
+}
+
+/** Every slice in the mission (slices/ and closed/), in order, each with its standing. */
+function slicesWithStanding(mission: MissionInfo): Array<{ slice: SliceInfo; standing: Exclude<SliceState, "all"> }> {
+  const out: Array<{ slice: SliceInfo; standing: Exclude<SliceState, "all"> }> = [];
+  for (const [folder, inClosedFolder] of [["slices", false], ["closed", true]] as const) {
+    const root = path.join(mission.absPath, folder);
     if (!fs.existsSync(root)) continue;
     for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const m = SLICE_DIRNAME_RE.exec(entry.name);
-      if (!m) continue;
-      const sliceInfo = buildSliceInfo(mission, root, entry.name);
-      out.push(sliceInfo);
+      if (!entry.isDirectory() || !SLICE_DIRNAME_RE.test(entry.name)) continue;
+      const slice = buildSliceInfo(mission, root, entry.name);
+      out.push({ slice, standing: sliceStanding(slice, inClosedFolder) });
     }
   }
-  out.sort((a, b) => (a.nn ?? Number.MAX_SAFE_INTEGER) - (b.nn ?? Number.MAX_SAFE_INTEGER) || a.name.localeCompare(b.name));
-  if (state === "active") {
-    // active = not in closed/, and not already delivered in-place.
-    return out.filter((s) => {
-      const st = (s.status ?? "").toLowerCase();
-      return st !== "done" && !st.startsWith("closed") && !st.startsWith("shipped");
-    });
-  }
-  if (state === "shipped") {
-    return out.filter((s) => (s.status ?? "").toLowerCase().startsWith("shipped"));
-  }
+  out.sort((a, b) => (a.slice.nn ?? Number.MAX_SAFE_INTEGER) - (b.slice.nn ?? Number.MAX_SAFE_INTEGER) || a.slice.name.localeCompare(b.slice.name));
   return out;
 }
 
@@ -494,18 +695,24 @@ export function findSlice(
       // Walk up to find the owning mission.
       const owningMissionPath = findOwningMission(missionsRoot, candidate);
       if (!owningMissionPath) {
+        const workspace = workspaceHoldingSlice(missionsRoot, candidate);
         const error = new ScopeCliError({
           fact: `Slice path "${slicePath}" resolved to ${candidate} but no parent mission was found.`,
           consequence: "Cannot determine mission context for this slice.",
-          action: "Ensure the slice lives under <missionsRoot>/<mission>/{slices,closed}/.",
+          action: workspace
+            ? `The slice is in another workspace's missions tree (${workspace.missionsRoot}), not under ${missionsRoot}. `
+              + `Select that tree with the parent --workspace option, for example: rig scope --workspace ${quoteArg(workspace.option)} slice <verb> ${quoteArg(slicePath)}`
+            : "Ensure the slice lives under <missionsRoot>/<mission>/{slices,closed}/. "
+              + "For a slice in another workspace, such as a catalog project, select its tree with the parent option: rig scope --workspace <project root> slice <verb> <slice-path>",
         });
         if (!hintedName) throw error;
         firstContextError ??= error;
         continue;
       }
       const mission = buildMissionInfo(missionsRoot, owningMissionPath);
-      const sliceRoot = path.dirname(candidate);
-      return buildSliceInfo(mission, sliceRoot, path.basename(candidate));
+      // The directory and the name both come from the resolved path, so `<slice>/.` and `<slice>/sub/..` select the slice.
+      const resolved = path.resolve(candidate);
+      return buildSliceInfo(mission, path.dirname(resolved), path.basename(resolved));
     }
   }
   if (firstContextError) throw firstContextError;
@@ -516,10 +723,46 @@ export function findSlice(
   });
 }
 
+/** POSIX single-quoting for a path shown in a command. */
+function quoteArg(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+/**
+ * For a slice directory the selected missions root does not hold, the --workspace value that
+ * selects the nearest missions tree that does: the project root when that resolves to the tree,
+ * else the missions folder itself. Each value is checked with resolveMissionsRoot, so the named
+ * option is one that works. Null when no ancestor is a readable missions tree.
+ */
+function workspaceHoldingSlice(selectedRoot: string, sliceDir: string): { option: string; missionsRoot: string } | null {
+  const selected = path.resolve(selectedRoot);
+  const target = path.resolve(sliceDir);
+  for (let root = path.dirname(target); root !== path.dirname(root); root = path.dirname(root)) {
+    if (root === selected || !walkToMission(root, target)) continue;
+    for (const option of [path.dirname(root), root]) {
+      try {
+        if (path.resolve(resolveMissionsRoot({ override: option, strictOverride: true })) === root) return { option, missionsRoot: root };
+      } catch {
+        // Not a workspace for this tree; try the next form.
+      }
+    }
+  }
+  return null;
+}
+
 function findOwningMission(missionsRoot: string, slicePath: string): string | null {
+  // path.dirname never ends in a separator, so compare against the normalized root
+  // (a configured or --workspace root may be written as `/w/missions/`); resolve the
+  // slice the same way so a relative root and a relative candidate stay comparable.
+  // A path that leaves the root, such as `<root>/../other/m1/slices/x`, then falls back
+  // to the walk as written, where it reads as before.
+  return walkToMission(path.resolve(missionsRoot), path.resolve(slicePath)) ?? walkToMission(missionsRoot, slicePath);
+}
+
+function walkToMission(root: string, slicePath: string): string | null {
   let dir = path.dirname(slicePath);
-  while (dir.startsWith(missionsRoot) && dir !== missionsRoot) {
-    if (path.dirname(dir) === missionsRoot) return dir;
+  while (dir.startsWith(root) && dir !== root) {
+    if (path.dirname(dir) === root) return dir;
     dir = path.dirname(dir);
   }
   return null;
@@ -551,22 +794,24 @@ export function nextSliceNN(missionAbsPath: string): number {
 
 /** Mint or read the dot-ID for a mission. If the mission's README has
  *  an `id:` field, return it. Otherwise infer from the folder name
- *  (release-X.Y.Z → OPR.X.Y.Z; otherwise escape band). */
+ *  (release-X.Y.Z → <PFX>.X.Y.Z; otherwise escape band), with the
+ *  project's prefix (projectIdPrefix; OPR unless declared). */
 export function ensureMissionId(
   mission: MissionInfo,
   missionsRoot: string,
 ): string {
   if (mission.id) return mission.id;
+  const prefix = projectIdPrefix(missionsRoot);
   // Try release-pattern first; if it matches, no peer scan needed.
   try {
-    const id = inferMissionDotId(mission.name, null);
+    const id = inferMissionDotId(mission.name, null, prefix);
     return id;
   } catch {
     // Fall through to escape-band path.
   }
   const peers = listMissions(missionsRoot).filter((m) => m.name !== mission.name);
-  const ordinal = nextEscapeBandOrdinal(peers.map((p) => p.id));
-  return inferMissionDotId(mission.name, ordinal);
+  const ordinal = nextEscapeBandOrdinal(peers.map((p) => p.id), prefix);
+  return inferMissionDotId(mission.name, ordinal, prefix);
 }
 
 /** Same as ensureMissionId, but ALSO writes the inferred id back into

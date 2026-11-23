@@ -11,11 +11,13 @@
 // TODAY — those are it.todo ledger entries at the bottom (routed to the desk as
 // findings; a passing pin would freeze the defect). When a finding's fix lands,
 // its todo graduates to a real pin.
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { createDaemon } from "../src/startup.js";
+import { seatRuntimeDir } from "../src/domain/seat-runtime-dir.js";
 import type { AppDeps } from "../src/server.js";
 import type { CmuxTransportFactory } from "../src/terminal/cmux-transport.js";
 import type { ExecFn } from "../src/domain/tmux-adapter.js";
@@ -23,6 +25,23 @@ import type Database from "better-sqlite3";
 import type { ContextMonitor } from "../src/domain/context-monitor.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { getActiveRotationCount, startTranscriptRotation, stopTranscriptRotation } from "../src/domain/transcript-rotation.js";
+import type { makeWatchdogDeliver } from "../src/domain/watchdog-delivery.js";
+
+// What production startup hands the watchdog's delivery and two of its policies, recorded on the way through to the
+// real factories (nothing else changes): their queue-only seams are closures with no other handle.
+const composed = vi.hoisted(() => ({ deliver: [] as unknown[], idleGate: [] as unknown[], parkedOwner: [] as unknown[] }));
+vi.mock("../src/domain/watchdog-delivery.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../src/domain/watchdog-delivery.js")>();
+  return { ...real, makeWatchdogDeliver: (deps: Parameters<typeof real.makeWatchdogDeliver>[0]) => { composed.deliver.push(deps); return real.makeWatchdogDeliver(deps); } };
+});
+vi.mock("../src/domain/policies/idle-gate-qitem.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../src/domain/policies/idle-gate-qitem.js")>();
+  return { ...real, makeIdleGateQitemPolicy: (deps: Parameters<typeof real.makeIdleGateQitemPolicy>[0]) => { composed.idleGate.push(deps); return real.makeIdleGateQitemPolicy(deps); } };
+});
+vi.mock("../src/domain/policies/parked-owner-consumer.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../src/domain/policies/parked-owner-consumer.js")>();
+  return { ...real, makeParkedOwnerConsumerPolicy: (deps: Parameters<typeof real.makeParkedOwnerConsumerPolicy>[0]) => { composed.parkedOwner.push(deps); return real.makeParkedOwnerConsumerPolicy(deps); } };
+});
 
 let db: Database.Database;
 let deps: AppDeps;
@@ -33,11 +52,12 @@ const savedEnv: Record<string, string | undefined> = {};
 beforeAll(async () => {
   // D15 isolation: the composition writes real state — anchor it in scratch.
   scratch = fs.mkdtempSync(path.join(os.tmpdir(), "p16-wiring-"));
-  for (const k of ["OPENRIG_HOME", "OPENRIG_DB", "OPENRIG_URL", "OPENRIG_PORT", "OPENRIG_NO_KERNEL"]) {
+  for (const k of ["OPENRIG_HOME", "OPENRIG_DB", "OPENRIG_URL", "OPENRIG_PORT", "OPENRIG_NO_KERNEL", "TMUX_TMPDIR"]) {
     savedEnv[k] = process.env[k];
   }
   process.env.OPENRIG_HOME = path.join(scratch, "home");
-  process.env.OPENRIG_DB = path.join(scratch, "wiring.sqlite");
+  process.env.OPENRIG_DB = path.join(scratch, "stale.sqlite");
+  process.env.TMUX_TMPDIR = path.join(scratch, "tmux");
   delete process.env.OPENRIG_URL;
   delete process.env.OPENRIG_PORT;
   process.env.OPENRIG_NO_KERNEL = "1";
@@ -45,10 +65,9 @@ beforeAll(async () => {
     throw Object.assign(new Error("no socket"), { code: "ENOENT" });
   };
   const tmuxExec: ExecFn = async () => "";
-  // production passes the RESOLVED file dbPath (index.ts) — :memory: is the
-  // test-friendly default that deliberately skips the slow-op recorder; the
-  // wiring pin must compose like production.
-  const result = await createDaemon({ cmuxFactory, tmuxExec, dbPath: process.env.OPENRIG_DB! });
+  // A file DB composes the slow-op recorder that :memory: deliberately skips.
+  // A relative selection must still reach seats whose cwd differs from the daemon.
+  const result = await createDaemon({ cmuxFactory, tmuxExec, dbPath: path.relative(process.cwd(), path.join(scratch, "selected.sqlite")) });
   db = result.db;
   deps = result.deps;
   contextMonitor = result.contextMonitor;
@@ -88,15 +107,34 @@ describe("P16 — AppDeps members with safety semantics are composed (definednes
 });
 
 describe("P16 — domain-internal safety injections (the recurred class, pinned at the wire)", () => {
-  it("QueueRepository.validateRig is the topology gate, not the permissive default (recurrence #1)", async () => {
-    // behavioral probe through the composed object: an unknown-rig destination must refuse.
-    await expect(
-      deps.queueRepo!.create({
-        sourceSession: "a@known-nowhere",
-        destinationSession: "b@definitely-unregistered-rig",
-        body: "wiring probe",
-      } as never),
-    ).rejects.toThrow(/unknown rig/);
+  it("new seats receive the daemon's runtime directory default (#2030)", () => {
+    expect(deps.tmuxAdapter.launchEnvironment!()).toHaveProperty("runtimeDir", seatRuntimeDir(process.env));
+  });
+  it("new seats receive the selected database and configured tmux directory, not a stale DB override", () => {
+    const env = deps.tmuxAdapter.launchEnvironment!().env;
+    expect(env.OPENRIG_DB).toBe(path.resolve(db.name));
+    expect(env.OPENRIG_DB).not.toBe(process.env.OPENRIG_DB);
+    expect(env.TMUX_TMPDIR).toBe(process.env.TMUX_TMPDIR);
+    const selected = priv<Record<string, string>>(deps.nodeLauncher, "sessionEnv");
+    expect(selected.OPENRIG_DB).toBe(path.resolve(db.name));
+    expect(selected.TMUX_TMPDIR).toBe(process.env.TMUX_TMPDIR);
+    const seatCwd = path.join(scratch, "seat"); fs.mkdirSync(seatCwd);
+    const fromSeat = execFileSync(process.execPath, ["-e", "process.stdout.write(require('node:fs').realpathSync(process.env.OPENRIG_DB))"], {
+      cwd: seatCwd, env: { ...process.env, ...selected }, encoding: "utf8",
+    });
+    expect(fromSeat).toBe(fs.realpathSync(db.name));
+  });
+
+  it("QueueRepository keeps recording separate from topology-backed receiver selection", async () => {
+    const destination = "b@definitely-unregistered-rig";
+    expect(deps.queueRepo!.acceptsDestination(destination)).toBe(false);
+    const item = await deps.queueRepo!.create({
+      sourceSession: "a@known-nowhere", destinationSession: destination,
+      body: "wiring probe", nudge: false,
+    });
+    expect(deps.queueRepo!.getById(item.qitemId)?.destinationSession).toBe(destination);
+    expect(deps.queueRepo!.acceptsDestination(destination)).toBe(false);
+    expect(deps.queueRepo!.destinationAdvisory(destination)?.status).toBe("missing");
   });
 
   it("QueueRepository.workflowFrontierPredicate is injected (the close-path guard)", () => {
@@ -139,6 +177,55 @@ describe("P16 — domain-internal safety injections (the recurred class, pinned 
     } finally {
       for (const name of names) stopTranscriptRotation(name);
     }
+  });
+});
+
+describe("a queue-only seat's watchdog reminders go through its queue, as startup composes them (#3076)", () => {
+  type DeliverDeps = Parameters<typeof makeWatchdogDeliver>[0];
+  type SeatCheck = { isQueueOnlySeat?: (sessionName: string) => boolean };
+  const deliverDeps = () => composed.deliver.at(-1) as DeliverDeps;
+  const typist = "typist@pin-rig";
+  beforeAll(async () => {
+    db.exec(`INSERT INTO rigs(id,name) VALUES ('pin-rig','pin-rig');
+      INSERT INTO nodes(id,rig_id,logical_id,runtime) VALUES ('pin-node','pin-rig','typist','claude-code');
+      INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES ('pin-binding','pin-node','${typist}','%9');
+      INSERT INTO sessions(id,node_id,session_name,status) VALUES ('pin-session','pin-node','${typist}','running');`);
+    await deps.tmuxAdapter.deliveryGuard!.set("pin-node", { mode: "queue-only" }, "person@pin-rig", "a person types here");
+  });
+
+  it("the delivery, the idle-gate policy and the parked-owner policy each read the seat's typing guard", () => {
+    expect(composed.deliver).toHaveLength(1);
+    for (const check of [deliverDeps(), composed.idleGate.at(-1) as SeatCheck, composed.parkedOwner.at(-1) as SeatCheck]) {
+      expect(check.isQueueOnlySeat?.(typist)).toBe(true);
+      expect(check.isQueueOnlySeat?.("nobody@pin-nowhere")).toBe(false);
+    }
+  });
+
+  it("a reminder's cold row is OpenRig's, with no nudge: nothing wakes the seat", async () => {
+    const create = vi.spyOn(deps.queueRepo!, "create");
+    try {
+      const row = await deliverDeps().createQueueRow!({ qitemId: "qitem-watchdog-pin", destinationSession: typist, body: "Check the deploy.",
+        summary: "Watchdog (periodic-reminder): Check the deploy.", tags: ["watchdog", "queue-only"] });
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({ sourceSession: "watchdog@system", nudge: false, wakeTrigger: "openrig" }));
+      expect(row).toEqual({ qitemId: "qitem-watchdog-pin", state: "pending" });
+      expect(deps.queueRepo!.getById(row.qitemId)).toMatchObject({ sourceSession: "watchdog@system", destinationSession: typist });
+      expect(deps.queueRepo!.getById(row.qitemId)!.lastNudgeAttempt ?? null).toBeNull();
+    } finally { create.mockRestore(); }
+  });
+
+  it("the parked rows a reminder is noted on, and the notes, are the queue repository's", () => {
+    const parked = vi.spyOn(deps.queueRepo!, "parkedRowsOwnedBy").mockReturnValue(["qitem-parked-pin"]);
+    const noted = vi.spyOn(deps.queueRepo!, "noteParkedRows").mockReturnValue(["qitem-parked-pin"]);
+    const again = vi.spyOn(deps.queueRepo!, "noteOpenWatchdogRow").mockReturnValue("qitem-watchdog-pin");
+    try {
+      expect(deliverDeps().resolveParkedRows!({ jobId: "pin-job", targetSession: typist })).toEqual(["qitem-parked-pin"]);
+      expect(parked).toHaveBeenCalledWith("pin-job", typist);
+      const notes = [{ qitemId: "qitem-parked-pin", jobId: "pin-job", note: "n" }];
+      expect(deliverDeps().noteParkedRows!({ owner: typist, notes })).toEqual(["qitem-parked-pin"]);
+      expect(noted).toHaveBeenCalledWith(typist, notes);
+      expect(deliverDeps().noteQueuedRow!({ jobId: "pin-job", destinationSession: typist, note: "again" })).toBe("qitem-watchdog-pin");
+      expect(again).toHaveBeenCalledWith("pin-job", typist, "again");
+    } finally { parked.mockRestore(); noted.mockRestore(); again.mockRestore(); }
   });
 });
 

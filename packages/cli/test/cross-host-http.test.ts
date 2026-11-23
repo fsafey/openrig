@@ -191,14 +191,33 @@ describe("resolveCrossHostTarget (§4 sugar + precedence)", () => {
 // ---------------------------------------------------------------------------
 
 describe("send --host (http branch)", () => {
+  it.each([false, true])("HTTP native receipts retain request IDs, uncertainty and verification limits (json=%s)", async json => {
+    for (const state of ["pending", "submitted", "rejected", "unknown", "reconciled", "erased"]) {
+      process.exitCode = undefined; captured.stdoutLines = []; captured.stderrLines = [];
+      const unknown = ["unknown", "reconciled", "erased"].includes(state);
+      const receipt = { requestId: "native-remote", stage: unknown ? "completed" : state,
+        ...(state === "unknown" ? { result: { submissionUnknown: true } } : {}),
+        ...(state === "reconciled" ? { reconciliation: "receiver_state_lost" } : {}), ...(state === "erased" ? { erasedAt: "2026-11-16" } : {}) };
+      const h = mockClient(() => ({ status: state === "rejected" ? 409 : 200, data: { ok: state !== "rejected", runnerReceipt: receipt } }));
+      await sendCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "native@r", "make test", "--verify", ...(json ? ["--json"] : [])], { from: "user" });
+      expect(h.calls).toHaveLength(1);
+      if (json) expect(JSON.parse(captured.stdoutLines[0]!).result.data).toMatchObject({ runnerReceipt: receipt, verified: false });
+      else {
+        expect(captured.stdoutLines.join("\n")).not.toContain("Sent to");
+        expect(captured.stdoutLines.join("\n")).toContain("request native-remote");
+        expect(captured.stdoutLines.join("\n")).toContain("Verified: no (native receipt)");
+      }
+      expect(process.exitCode).toBe(unknown || state === "rejected" ? 1 : undefined);
+    }
+  });
   it.each(["\r", "\x1b", "\t", " "])("preserves explicit byte payload and interaction options over HTTP (%#)", async text => {
     const h = mockClient(() => ({ status: 200, data: { ok: true, promptInteraction: "unverified" } }));
     await sendCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "dev-impl@my-rig", text,
-      "--dangerously-interact", "--reason", "explicit key", "--verify"], { from: "user" });
+      "--dangerously-interact", "--type-without-checking", "--reason", "explicit key", "--verify"], { from: "user" });
     expect(process.exitCode).toBeUndefined();
     expect(h.calls).toHaveLength(1);
     expect(h.calls[0]).toMatchObject({ method: "POST", path: "/api/transport/send", body: {
-      session: "dev-impl@my-rig", text, dangerouslyInteract: true, reason: "explicit key", verify: true,
+      session: "dev-impl@my-rig", text, dangerouslyInteract: true, typeWithoutChecking: true, reason: "explicit key", verify: true,
     } });
     expect(sshRunnerNeverCalled).not.toHaveBeenCalled();
   });
@@ -218,6 +237,7 @@ describe("send --host (http branch)", () => {
     expect(body.session).toBe("dev-impl@my-rig"); // BR-1: never member@rig@host
     expect(String(body.text)).toContain("To: dev-impl@my-rig");
     expect(String(body.text)).toContain("hello");
+    expect(body.exactText).toBe("hello"); // the remote daemon types this if the seat is a terminal
     expect(call.options?.headers?.Authorization).toBe("Bearer test-token");
     expect(captured.stdoutLines).toContain("[via host=vps-b (http://vps-b:7433)]");
     expect(captured.stdoutLines).toContain("Sent to dev-impl@my-rig");
@@ -350,15 +370,22 @@ describe("send --host (http branch)", () => {
     const h = mockClient(() => ({ status: 200, data: {} }));
     const cmd = sendCommand(httpDeps(h));
     await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--wait-for-idle", "30"], { from: "user" });
-    expect(h.calls[0]!.options?.timeoutMs).toBe(30_000 + 30_000);
+    expect(h.calls[0]!.options?.timeoutMs).toBe(30_000 + 60_000);
     expect((h.calls[0]!.body as Record<string, unknown>).waitForIdleMs).toBe(30_000);
   });
 
-  it("a cross-host send waits 30 s for the remote to deliver, not the 5 s read default", async () => {
+  it("--wait-for-idle longer than 300 s is one request to the remote carrying the whole wait", async () => {
+    const h = mockClient(() => ({ status: 200, data: { ok: true } }));
+    const cmd = sendCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--wait-for-idle", "400"], { from: "user" });
+    expect(h.calls.map((c) => [(c.body as Record<string, unknown>).waitForIdleMs, c.options?.timeoutMs])).toEqual([[400_000, 400_000 + 60_000]]);
+  });
+
+  it("a cross-host send waits 60 s for the remote to deliver, not the 5 s read default", async () => {
     const h = mockClient(() => ({ status: 200, data: {} }));
     const cmd = sendCommand(httpDeps(h));
     await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello"], { from: "user" });
-    expect(h.calls[0]!.options?.timeoutMs).toBe(30_000);
+    expect(h.calls[0]!.options?.timeoutMs).toBe(60_000);
   });
 
   it("a remote that delivers after more than 5 s reports the send, not a failure", { timeout: 20_000 }, async () => {
@@ -406,7 +433,10 @@ describe("send --host (http branch)", () => {
     const err = captured.stderrLines.join("\n");
     expect(err).toContain("cross-host (host=vps-b, http://vps-b:7433): http remote-outcome-unknown:");
     expect(err).toContain("Delivery UNCONFIRMED — the remote daemon may have received and delivered the message.");
-    expect(err).toContain("Check the target before any resend: rig capture dev-impl@my-rig --host vps-b. A resend without checking risks a duplicate.");
+    expect(err).toContain("rig capture dev-impl@my-rig --host vps-b");
+    expect(err).toContain("off-screen");
+    expect(err).toContain("does not prove non-delivery");
+    expect(err).toContain("duplicate");
     expect(err).not.toContain("remote-daemon-unreachable");
     expect(captured.stdoutLines).not.toContain("Sent to dev-impl@my-rig");
     expect(process.exitCode).toBe(1);
@@ -430,7 +460,7 @@ describe("send --host (http branch)", () => {
     await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--json"], { from: "user" });
     const parsed = JSON.parse(captured.stdoutLines[0]!) as Record<string, any>;
     expect(parsed.result).toMatchObject({ ok: false, failedStep: "remote-outcome-unknown", outcomeUnknown: true });
-    expect(parsed.error.action).toContain("Check the target before any resend");
+    expect(parsed.error.action).toContain("does not prove non-delivery");
     expect(process.exitCode).toBe(1);
   });
 
@@ -488,9 +518,16 @@ describe("capture --host (http branch)", () => {
     expect(sshRunnerNeverCalled).not.toHaveBeenCalled();
     const call = h.calls[0]!;
     expect(call.path).toBe("/api/transport/capture");
-    expect(call.body).toEqual({ lines: 50, session: "dev-impl@my-rig" });
+    expect(call.body).toEqual({ lines: 50, session: "dev-impl@my-rig", inputBox: true });
     expect(captured.stdoutLines).toContain("[via host=vps-b (http://vps-b:7433)]");
     expect(captured.stdoutLines).toContain("pane content here");
+  });
+
+  it("http host: a non-positive --lines posts the documented default of 20, not 0", async () => {
+    const h = mockClient(() => ({ status: 200, data: { content: "pane content here" } }));
+    const cmd = captureCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "--lines=0"], { from: "user" });
+    expect(h.calls[0]!.body).toEqual({ lines: 20, session: "dev-impl@my-rig", inputBox: true });
   });
 
   it("anonymous (URL-only) http host: capture POSTs with NO Authorization header; still succeeds", async () => {
@@ -544,7 +581,7 @@ describe("capture --host (http branch)", () => {
     const pane = Array.from({ length: 26 }, (_, i) => `row${i + 1}`).join("\n") + "\n";
     const h = mockClient(() => ({ status: 200, data: { ok: true, sessionName: "dev-impl@my-rig", content: pane, lines: 5 } }));
     await captureCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "dev-impl@my-rig", "--lines", "5"], { from: "user" });
-    expect(h.calls[0]!.body).toEqual({ lines: 5, session: "dev-impl@my-rig" });
+    expect(h.calls[0]!.body).toEqual({ lines: 5, session: "dev-impl@my-rig", inputBox: true });
     expect(captured.stdoutLines).toContain("row22\nrow23\nrow24\nrow25\nrow26\n");
     expect(captured.stderrLines).toContain("[rig capture: dev-impl@my-rig: 21 earlier lines not shown; last 5 shown; activity unknown: rig ps --nodes]");
 
@@ -663,6 +700,14 @@ describe("transcript --host (net-new, CLI-direct GET)", () => {
 // ---------------------------------------------------------------------------
 
 describe("broadcast --host (net-new, CLI-direct POST)", () => {
+  it.each([false, true])("HTTP broadcast unknown native custody has the same failing exit in either encoding (json=%s)", async json => {
+    const h = mockClient(() => ({ status: 200, data: { total: 1, sent: 0, failed: 0, indeterminateNative: 1,
+      results: [{ ok: true, sessionName: "native@r", runnerReceipt: { requestId: "unknown", stage: "completed", reconciliation: "receiver_state_lost" } }] } }));
+    await broadcastCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "message", ...(json ? ["--json"] : [])], { from: "user" });
+    expect(process.exitCode).toBe(1);
+    if (json) expect(JSON.parse(captured.stdoutLines[0]!).result.data.indeterminateNative).toBe(1);
+    else expect(captured.stdoutLines.join("\n")).toContain("native effect unknown");
+  });
   it("http host: POSTs the LOCAL body verbatim; per-target results print verbatim; clean fan-out exits 0", async () => {
     const h = mockClient(() => ({
       status: 200,

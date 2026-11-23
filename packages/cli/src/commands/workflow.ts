@@ -102,6 +102,11 @@ export function printOutcomeSummary(json: boolean, status: number, summary: Outc
   console.log(`  next:  ${summary.next}`);
 }
 
+/** After a route or resume, the packet's close may need --evidence-ref or acceptance flags; workflow show prints its exact command. */
+function ownerAdvancesLine(who: string, instanceId: string, packetId: string | undefined): string {
+  return `${who} advances with the action rig workflow show ${instanceId} prints for packet ${packetId ?? "<packet>"} (it carries any --evidence-ref or acceptance flags the step needs)`;
+}
+
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -172,7 +177,7 @@ export function workflowCommand(depsOverride?: WorkflowDeps): Command {
 
   cmd
     .command("validate <specPath>")
-    .description("Validate a workflow spec file (returns structured ok/error report)")
+    .description("Validate a workflow spec file in memory, without registering it (returns structured ok/error report)")
     .option("--json", "JSON output for agents")
     .addHelpText("after", `
 Examples:
@@ -214,7 +219,29 @@ Examples:
     .option("--actor-session <session>", "Agent recording this decision")
     .option("--reason <text>", "Why the plan changed")
     .option("--json", "Complete comparison or receipt")
-    .addHelpText("after", "\nStart with: rig workflow revise <instance>\nInspection returns the exact apply command and recovery key. Compatible revisions preserve completed/live steps, required obligations and child custody. Restore a changed completed/live step and revise its unstarted successors; no blind abort/replay is required. Exception-routing changes apply to future occurrences only; existing exception obligations keep their owners. Ordinary roles and routing remain protected. After a timeout use rig workflow operation <key> or repeat the identical apply command.\n")
+    .addHelpText("after", `
+Start with: rig workflow revise <instance>
+Inspection returns the exact apply command and recovery key. Compatible revisions preserve completed/live steps, required obligations and child custody. Restore a changed completed/live step and revise its unstarted successors; no blind abort/replay is required. Exception-routing changes apply to future occurrences only; existing exception obligations keep their owners. Ordinary roles and routing remain protected. After a timeout use rig workflow operation <key> or repeat the identical apply command: the recovered receipt lists any packets the revision projected, and a repeat projects nothing more.
+
+An obsolete dependency can be removed from work that hasn't started: the preview lists each removed edge (dependency-removed), each required step whose required order it loosens (required-order-removed), and each unstarted step it makes ready (step-projected). The required steps themselves stay required. Applying projects each ready step once, through the same path as a closing prerequisite, and wakes its owner. A step with completed, live or failed work keeps its required order.
+
+Examples:
+  $ rig workflow revise WF01ABC
+  $ rig workflow revise WF01ABC --json | jq '{status, changes, reasons, applyCommand}'
+
+A mixed change is refused whole: one reason makes the proposal incompatible, and
+nothing is adopted, not even its compatible parts. Say the mission source edits
+completed step review and adds an unstarted step docs that waits on the
+outstanding step ship:
+  graph:    incompatible · authored input has not been adopted
+  ...
+    step-changed: review (objective)
+    step-added: docs
+    Step review already has completed, live or failed work. ...
+Put review back as it was bound (likewise any removed required step, or a required
+order removed from started work), keep docs, and inspect again. When it reads compatible, run the apply
+line it prints, then rig workflow show WF01ABC to confirm the adoption.
+`)
     .action(async (instanceId: string, opts: { apply?: boolean; expectedVersion?: string; expectedDigest?: string; operationKey?: string; actorSession?: string; reason?: string; json?: boolean }) => {
       if (opts.apply && (!opts.operationKey || !opts.expectedDigest || opts.expectedVersion === undefined || !opts.actorSession || !opts.reason)) {
         emit3PartError(opts.json ?? false, "The inspected revision identity and decision are required.", "No revision was sent.", "Run rig workflow revise " + instanceId + " and use its apply command.");
@@ -297,6 +324,7 @@ Examples:
     .requiredOption("--created-by <session>", "Session creating the instance (canonical <member>@<rig>)")
     .option("--entry-owner <session>", "Override default entry-step owner")
     .option("--rig <name>", "Bind the instance to this rig (overrides the spec's target.rig default; roles resolve to seats on this rig)")
+    .option("--pod <name>", "Bind role selection and {pod} targets to a pod on the bound rig")
     .option("--project <id>", "Catalogued project this run works for; stamped as project:<id> on every packet it creates. A project the daemon does not know creates the instance UNSCOPED, with an advisory naming it")
     .option("--mission <id>", "Mission this run works for; stamped as mission:<id> on every packet")
     .option("--slice <id>", "Slice this run works for; stamped as slice:<id> on every packet. They show on the slice's Queue tab when the Projects view is scoped to the same project, so pass --project too")
@@ -324,6 +352,7 @@ Examples:
       createdBy: string;
       entryOwner?: string;
       rig?: string;
+      pod?: string;
       project?: string;
       mission?: string;
       slice?: string;
@@ -344,6 +373,7 @@ Examples:
           createdBySession: opts.createdBy,
           entryOwnerSession: opts.entryOwner,
           targetRig: opts.rig,
+          targetPod: opts.pod,
           ...scopeBody,
         });
         printResult(opts.json ?? false, res.data, res.status);
@@ -369,7 +399,7 @@ Examples:
     .requiredOption("--instance <id>", "Workflow instance id")
     .requiredOption("--current-packet <qitem-id>", "qitem being closed (must be on instance frontier)")
     .requiredOption("--exit <kind>", "Closure exit kind: handoff | waiting | done | failed")
-    .requiredOption("--actor-session <session>", "Session closing the packet (owner-as-author)")
+    .option("--actor-session <session>", "Your session, only when it can't be derived from the caller (a managed seat's is): recorded as claimed")
     .option("--result-note <text>", "Closure result note (audit context)")
     .option("--evidence-ref <ref>", "Record attributed progress evidence; a changed reference resets an intentional-wait reminder")
     .option("--wait-for-proof <scope>", "For waiting: watch a slice proof scope through its current attention revision")
@@ -386,28 +416,27 @@ Examples:
       --instance WF01ABC \\
       --current-packet QITEM-123 \\
       --exit handoff \\
-      --actor-session driver@my-rig \\
       --result-note "implementation green; ready for review"
 
   # close the run cleanly
   $ rig workflow project --instance WF01ABC --current-packet QITEM-9 \\
-      --exit done --actor-session orch-lead@my-rig
+      --exit done
 
   # block on an external gate
   $ rig workflow project --instance WF01ABC --current-packet QITEM-4 \\
-      --exit waiting --actor-session qa@my-rig \\
+      --exit waiting \\
       --blocked-on "founder-gate-2"
 
   # also wait for the current outcome of a slice (no copied readiness)
   $ rig workflow project --instance WF01ABC --current-packet QITEM-4 \\
-      --exit waiting --actor-session qa@my-rig \\
+      --exit waiting \\
       --blocked-on QITEM-3 --wait-for-proof release-example/slices/01-build
 `)
     .action(async (opts: {
       instance: string;
       currentPacket: string;
       exit: string;
-      actorSession: string;
+      actorSession?: string;
       resultNote?: string;
       evidenceRef?: string;
       waitForProof?: string;
@@ -453,6 +482,7 @@ Examples:
           nextQitemId?: string | null;
           nextOwnerSession?: string | null;
           instance?: { status?: string };
+          advisories?: string[];
         }>("/api/workflow/project", {
           instanceId: opts.instance,
           currentPacketId: opts.currentPacket,
@@ -474,6 +504,7 @@ Examples:
           nextOwnerSession: opts.nextOwner,
         });
         printResult(opts.json ?? false, res.data, res.status);
+        printWorkflowAdvisories(res.data?.advisories);
         const body = res.data ?? {};
         const closedId = asString(body.closurePriorPacketId) ?? opts.currentPacket;
         const nextId = asString(body.nextQitemId);
@@ -495,8 +526,15 @@ Examples:
 
   cmd
     .command("list")
-    .description("List workflow instances; optionally filter by status")
+    .description("List workflow instances with optional exact filters")
     .option("--status <s>", "Filter by status (active | waiting | completed | failed | aborted)")
+    .option("--project <id>", "Match the instance project")
+    .option("--mission <id>", "Match the instance mission")
+    .option("--slice <id>", "Match the instance slice")
+    .option("--rig <name>", "Match the bound rig")
+    .option("--name <workflow>", "Match the workflow name")
+    .option("--tag <tag>", "Match a scope tag; repeat to require all tags", (tag: string, previous: string[]) => [...previous, tag], [])
+    .option("--limit <n>", "Maximum matching instances (1-10000)")
     .option("--json", "JSON output for agents")
     .addHelpText("after", `
 Examples:
@@ -504,10 +542,12 @@ Examples:
   $ rig workflow list --status active --json
   $ rig workflow list --status waiting | jq -r '.instances[].instanceId'
 `)
-    .action(async (opts: { status?: string; json?: boolean }) => {
+    .action(async (opts: { status?: string; project?: string; mission?: string; slice?: string; rig?: string; name?: string; tag: string[]; limit?: string; json?: boolean }) => {
       const deps = getDeps();
       const params = new URLSearchParams();
       if (opts.status) params.set("status", opts.status);
+      for (const field of ["project", "mission", "slice", "rig", "name", "limit"] as const) if (opts[field] !== undefined) params.set(field, opts[field]!);
+      for (const tag of opts.tag) params.append("tag", tag);
       const qs = params.toString();
       await withClient(deps, async (client) => {
         const res = await client.get<unknown>(`/api/workflow/list${qs ? `?${qs}` : ""}`);
@@ -616,19 +656,86 @@ exception routes only. Existing obligations keep their owners and evidence.
     });
 
   cmd
-    .command("trace <instanceId>")
-    .description("Show one workflow instance + its append-only step trail (audit-only verdict)")
+    .command("unregister [spec]")
+    .description("Take a workflow spec out of the registry: <name> or <name>@<version>, or --prune-missing for versions whose file is gone")
+    .option("--prune-missing", "Remove every registered version whose source file no longer exists (scoped to [spec] when given)")
     .option("--json", "JSON output for agents")
     .addHelpText("after", `
+A version that unfinished work (an active, waiting or resumable failed instance) is pinned to
+is never removed; with --prune-missing it is retained, readable by that work but hidden from
+the library, and a later prune removes it. A file still inside the workflows folder or the
+built-in starters is kept, because the next scan registers it again: move or delete the file.
+A file whose presence can't be checked (an access error, not "no such file") is kept and named.
+An empty version (name@) is a usage error.
+
+Examples:
+  $ rig workflow unregister qa-probe
+  $ rig workflow unregister pedido-do-board@1
+  $ rig workflow unregister --prune-missing
+  $ rig workflow unregister --prune-missing --json | jq '.removed[] | "\\(.name)@\\(.version) \\(.sourcePath)"'
+`)
+    .action(async (spec: string | undefined, opts: { pruneMissing?: boolean; json?: boolean }) => {
+      if (!spec && !opts.pruneMissing) {
+        console.error("Name a workflow spec (<name> or <name>@<version>) or pass --prune-missing.");
+        process.exitCode = 1;
+        return;
+      }
+      let name: string | undefined;
+      let version: string | undefined;
+      if (spec) {
+        const at = spec.lastIndexOf("@");
+        name = at > 0 ? spec.slice(0, at) : spec;
+        version = at > 0 ? spec.slice(at + 1) : undefined;
+      }
+      if (version !== undefined && version.trim() === "") {
+        console.error(`The version after @ is empty in "${spec}": use <name>@<version>, or <name> for every version.`);
+        process.exitCode = 1;
+        return;
+      }
+      const deps = getDeps();
+      await withClient(deps, async (client) => {
+        const res = await client.post<{
+          removed?: Array<{ name: string; version: string; sourcePath: string }>;
+          kept?: Array<{ name: string; version: string; sourcePath: string; reason: "pinned" | "scanned" | "unchecked" }>;
+        }>("/api/workflow/specs/unregister", { name, version, pruneMissing: opts.pruneMissing === true });
+        if (opts.json || res.status >= 400) {
+          printResult(opts.json ?? false, res.data, res.status);
+          return;
+        }
+        const removed = res.data.removed ?? [];
+        const kept = res.data.kept ?? [];
+        if (removed.length === 0 && kept.length === 0) console.log("Nothing to remove.");
+        for (const row of removed) console.log(`removed  ${row.name}@${row.version}  ${row.sourcePath}`);
+        for (const row of kept) {
+          const why = row.reason === "pinned"
+            ? "unfinished work is pinned to this version"
+            : row.reason === "unchecked"
+              ? "its file couldn't be checked (not ENOENT), so it isn't treated as missing"
+              : "the file is still in a scanned folder; move or delete it";
+          console.log(`kept     ${row.name}@${row.version}  ${row.sourcePath}  (${why})`);
+        }
+      });
+    });
+
+  cmd
+    .command("trace <instanceId>")
+    .description("Show one workflow instance + its append-only step trail (audit-only verdict)")
+    .option("--full", "Return the complete step trail instead of the 50 most recent closures (trailCompleteness: complete)")
+    .option("--json", "JSON output for agents")
+    .addHelpText("after", `
+The default trail holds the 50 most recent closures; trailCompleteness says
+"recent" when older ones were left out. --full asks the daemon for all of them.
+
 Examples:
   $ rig workflow trace WF01ABC
   $ rig workflow trace WF01ABC --json | jq '.trail[] | {step, actor, exit}'
+  $ rig workflow trace WF01ABC --full --json | jq '.trailCompleteness, (.trail | length)'
 `)
-    .action(async (instanceId: string, opts: { json?: boolean }) => {
+    .action(async (instanceId: string, opts: { json?: boolean; full?: boolean }) => {
       const deps = getDeps();
       await withClient(deps, async (client) => {
-        const res = await client.get<{ instance?: unknown; reconciliation?: unknown; trail?: unknown[]; frontier?: unknown[]; failures?: unknown[]; boundaryObligations?: unknown[]; unknowns?: string[] }>(
-          `/api/workflow/${encodeURIComponent(instanceId)}/trace`,
+        const res = await client.get<{ instance?: unknown; reconciliation?: unknown; trail?: unknown[]; trailCompleteness?: string; frontier?: unknown[]; failures?: unknown[]; boundaryObligations?: unknown[]; unknowns?: string[] }>(
+          `/api/workflow/${encodeURIComponent(instanceId)}/trace${opts.full ? "?full=true" : ""}`,
         );
         // WF3 FR-2: human mode renders the per-step tree (mini-req 2's
         // one-screen bar); --json byte-identical (BR-2).
@@ -646,6 +753,9 @@ Examples:
         } as Parameters<typeof renderTraceTree>[0];
         const trail = (res.data.trail ?? []) as Parameters<typeof renderTraceTree>[1];
         for (const line of renderTraceTree(instance, trail)) console.log(line);
+        if (res.data.trailCompleteness === "recent") {
+          console.log(`  (the ${trail.length} most recent closures; older ones left out - all of them: rig workflow trace ${instanceId} --full)`);
+        }
       });
     });
 
@@ -665,7 +775,7 @@ Examples:
 Read-only: reports where the instance is and how it got there so the
 frontier owner can continue truthfully. To actually advance, the packet
 OWNER closes it via:
-  $ rig workflow project --instance <id> --current-packet <qitem> --exit <exit> --actor-session <you>
+  $ rig workflow project --instance <id> --current-packet <qitem> --exit <exit>
 
 Examples:
   $ rig workflow continue WF01ABC
@@ -733,6 +843,7 @@ Examples:
     .requiredOption("--created-by <session>", "Session creating the instance (canonical <member>@<rig>)")
     .option("--entry-owner <session>", "Override default entry-step owner")
     .option("--rig <name>", "Bind the instance to this rig (overrides the spec's target.rig default; roles resolve to seats on this rig)")
+    .option("--pod <name>", "Bind role selection and {pod} targets to a pod on the bound rig")
     .option("--project <id>", "Catalogued project this run works for; stamped as project:<id> on every packet it creates. A project the daemon does not know creates the instance UNSCOPED, with an advisory naming it")
     .option("--mission <id>", "Mission this run works for; stamped as mission:<id> on every packet")
     .option("--slice <id>", "Slice this run works for; stamped as slice:<id> on every packet. They show on the slice's Queue tab when the Projects view is scoped to the same project, so pass --project too")
@@ -755,6 +866,7 @@ Examples:
       createdBy: string;
       entryOwner?: string;
       rig?: string;
+      pod?: string;
       project?: string;
       mission?: string;
       slice?: string;
@@ -774,6 +886,7 @@ Examples:
           createdBySession: opts.createdBy,
           entryOwnerSession: opts.entryOwner,
           targetRig: opts.rig,
+          targetPod: opts.pod,
           ...scopeBody,
         });
         printWorkflowAdvisories(res.data?.advisories);
@@ -825,7 +938,7 @@ Examples:
     .command("route <instanceId>")
     .description("Re-route the current frontier step to a new owner (same step, honest handoff closure; never advances)")
     .requiredOption("--to <session>", "New owner session (canonical <member>@<rig>)")
-    .requiredOption("--actor-session <session>", "Session performing the re-route (recorded as provenance)")
+    .option("--actor-session <session>", "Your session, only when it can't be derived from the caller (a managed seat's is): recorded as claimed")
     .option("--packet <qitem-id>", "Frontier packet to route (required when more than one is live)")
     .option("--reason <text>", "Why the step is being re-routed (recorded in the audit trail)")
     .option("--json", "JSON output for agents")
@@ -835,13 +948,16 @@ work should continue from the SAME step under a new owner. The old
 owner's stale close attempts are structurally rejected afterwards
 (packet_not_on_frontier).
 
+If the step's packet was already passed on with rig queue handoff to that
+same seat, route adopts the one successor there onto the frontier, with or
+without --packet, and writes no queue row; running it again writes nothing.
+
 Examples:
-  $ rig workflow route WF01ABC --to dev2-driver@my-rig \\
-      --actor-session orch-lead@my-rig --reason "owner seat dead"
+  $ rig workflow route WF01ABC --to dev2-driver@my-rig --reason "owner seat dead"
 `)
     .action(async (instanceId: string, opts: {
       to: string;
-      actorSession: string;
+      actorSession?: string;
       packet?: string;
       reason?: string;
       json?: boolean;
@@ -855,6 +971,7 @@ Examples:
           fromSession?: string;
           toSession?: string;
           instanceStatus?: string;
+          adoptedHandoff?: { successorState?: string };
         }>(`/api/workflow/${encodeURIComponent(instanceId)}/route`, {
           toSession: opts.to,
           packetId: opts.packet,
@@ -863,10 +980,22 @@ Examples:
         });
         printResult(opts.json ?? false, res.data, res.status);
         const body = res.data ?? {};
+        if (body.adoptedHandoff) {
+          // The packet was already handed off by the queue; its successor took its place and nothing was closed or created.
+          const state = body.adoptedHandoff.successorState ?? "?";
+          printOutcomeSummary(opts.json ?? false, res.status, {
+            what: `Adopted the queue handoff of step ${body.stepId ?? "?"} to ${body.toSession ?? opts.to}: packet ${body.closedPacketId ?? "?"} was already handed off, and its successor ${body.newPacketId ?? "?"} (${state}) now holds the step`,
+            state: `instance ${instanceId} = ${body.instanceStatus ?? "active"}; same step; no queue row closed or created; no step advanced`,
+            next: !["pending", "in-progress", "blocked"].includes(state)
+              ? `The successor is already ${state}; its outcome is on rig queue show ${body.newPacketId ?? "<packet>"}, and the step's exit is the workflow owner's to project`
+              : ownerAdvancesLine("The owner", instanceId, body.newPacketId),
+          });
+          return;
+        }
         printOutcomeSummary(opts.json ?? false, res.status, {
           what: `Re-routed step ${body.stepId ?? "?"} from ${body.fromSession ?? "?"} to ${body.toSession ?? opts.to} (packet ${body.closedPacketId ?? "?"} → ${body.newPacketId ?? "?"})`,
           state: `instance ${instanceId} = ${body.instanceStatus ?? "active"}; same step, new owner; no step advanced`,
-          next: `The new owner advances via: rig workflow project --instance ${instanceId} --current-packet ${body.newPacketId ?? "<packet>"} --exit <exit> --actor-session ${opts.to}`,
+          next: ownerAdvancesLine("The new owner", instanceId, body.newPacketId),
         });
       });
     });
@@ -878,25 +1007,28 @@ Examples:
   cmd
     .command("resume <instanceId>")
     .description("Redrive a FAILED instance from its failed step (completed steps never re-run; one fresh max_hops window)")
-    .requiredOption("--actor-session <session>", "Session performing the resume (recorded as provenance)")
+    .option("--actor-session <session>", "Your session, only when it can't be derived from the caller (a managed seat's is): recorded as claimed")
     .option("--occurrence <failed-qitem-id>", "Failure occurrence to redrive (required when more than one is unresolved)")
     .option("--decision <text>", "Durable instruction for the step owner (lands in the redrive packet)")
+    .option("--owner <session>", "Send the redrive to this seat instead of re-resolving the step's owner from its role")
     .option("--json", "JSON output for agents")
     .addHelpText("after", `
 Use after diagnosing an exception item: the instance returns to active,
 REBOUND to the step that failed, with a fresh packet routed to that
-step's re-resolved owner. The trail is preserved and extended; the
+step's re-resolved owner, or to --owner when you name one (recorded as
+named). The trail is preserved and extended; the
 resolved exception occurrence closes; a NEW failure of the same step
 raises a NEW occurrence honestly.
 
 Examples:
-  $ rig workflow resume WF01ABC --actor-session orch-lead@my-rig \\
+  $ rig workflow resume WF01ABC \\
       --decision "flaky fixture fixed in commit abc123 — retry"
 `)
     .action(async (instanceId: string, opts: {
-      actorSession: string;
+      actorSession?: string;
       occurrence?: string;
       decision?: string;
+      owner?: string;
       json?: boolean;
     }) => {
       const deps = getDeps();
@@ -905,19 +1037,31 @@ Examples:
           stepId?: string;
           newPacketId?: string;
           ownerSession?: string;
+          ownerSource?: "named" | "resolved";
+          ownerNote?: string;
+          currentOwnerSession?: string;
           resumeCount?: number;
           exceptionItemsClosed?: number;
+          absorbedReplay?: boolean;
         }>(`/api/workflow/${encodeURIComponent(instanceId)}/resume`, {
           actorSession: opts.actorSession,
           occurrenceId: opts.occurrence,
           decision: opts.decision,
+          ownerSession: opts.owner,
         });
         printResult(opts.json ?? false, res.data, res.status);
         const body = res.data ?? {};
+        const owner = `${body.ownerSession ?? "?"}${body.ownerSource ? ` (${body.ownerSource})` : ""}`
+          + (body.currentOwnerSession && body.currentOwnerSession !== body.ownerSession ? `, now owned by ${body.currentOwnerSession}` : "");
         printOutcomeSummary(opts.json ?? false, res.status, {
-          what: `Redrove instance ${instanceId} from step ${body.stepId ?? "?"} (redrive #${body.resumeCount ?? "?"}; packet ${body.newPacketId ?? "?"} → ${body.ownerSession ?? "?"}; ${body.exceptionItemsClosed ?? 0} exception item(s) resolved)`,
-          state: `instance ${instanceId} = active, rebound to ${body.stepId ?? "?"}; completed steps untouched; fresh max_hops window`,
-          next: `The owner advances via: rig workflow project --instance ${instanceId} --current-packet ${body.newPacketId ?? "<packet>"} --exit <exit> --actor-session ${body.ownerSession ?? "<owner>"}`,
+          what: `${body.absorbedReplay ? "Replay absorbed, nothing redriven: instance" : "Redrove instance"} ${instanceId} from step ${body.stepId ?? "?"} (redrive #${body.resumeCount ?? "?"}; packet ${body.newPacketId ?? "?"} → ${owner}; ${body.exceptionItemsClosed ?? 0} exception item(s) resolved)${body.ownerNote ? `; ${body.ownerNote}` : ""}`,
+          // An absorbed replay changed nothing, and the redrive it points at may already be closed.
+          state: body.absorbedReplay
+            ? `unchanged by this replay; this failure occurrence was already resumed (packet ${body.newPacketId ?? "?"})`
+            : `instance ${instanceId} = active, rebound to ${body.stepId ?? "?"}; completed steps untouched; fresh max_hops window`,
+          next: body.absorbedReplay
+            ? `Check where the instance stands: rig workflow show ${instanceId}`
+            : ownerAdvancesLine("The owner", instanceId, body.newPacketId),
         });
       });
     });
@@ -926,9 +1070,9 @@ Examples:
     .command("abort <instanceId>")
     .description("Transactionally cancel every live packet and abort the whole workflow instance")
     .requiredOption("--reason <text>", "Why the whole instance is being aborted")
-    .requiredOption("--actor-session <session>", "Session performing the abort")
+    .option("--actor-session <session>", "Your session, only when it can't be derived from the caller (a managed seat's is): recorded as claimed")
     .option("--json", "JSON output for agents")
-    .action(async (instanceId: string, opts: { reason: string; actorSession: string; json?: boolean }) => {
+    .action(async (instanceId: string, opts: { reason: string; actorSession?: string; json?: boolean }) => {
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<{ closedPacketIds?: string[]; status?: string }>(

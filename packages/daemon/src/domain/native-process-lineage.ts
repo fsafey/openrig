@@ -1,21 +1,25 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { isShellForeground } from "./shell-classifier.js";
+import { EMPTY_CLAUDE_MCP_CONFIG } from "./claude-mcp.js";
+import { isClaudePluginChannel } from "./claude-plugin-channels.js";
 import { runAsyncSite } from "./sync-site-wrap.js";
 import { readNativeExecutablePaths } from "./native-process-executable.js";
-
-const execFileAsync = promisify(execFile);
+import { readNativeProcessArguments } from "./native-process-arguments.js";
+import { readProcessChildrenNow, readProcessTable, readProcessTableCensusNow } from "./process-table.js";
 
 export interface NativeProcessRow {
   pid: number;
   ppid: number;
   command: string;
+  /** Exact OS argv for native Codex. Missing, malformed, or unreadable argv never proves Codex identity. */
+  argv?: string[] | null;
   pgid?: number;
   tpgid?: number;
   executableName?: string;
   /** OS executable path, not argv[0], for otherwise unresolved Claude rows. */
   executablePath?: string;
   startedAt?: string;
+  /** The run state's letter, where it was read (Linux /proc); `Z` is a zombie. */
+  state?: string;
 }
 
 export type NativeRuntime = "claude-code" | "codex";
@@ -23,25 +27,37 @@ export type NativeRuntime = "claude-code" | "codex";
 function tokens(command: string): string[] {
   // ps flattens argv: inline settings JSON retains its string delimiters.
   // A quote inside a name or filename is literal, not a shell span delimiter.
+  // A `--settings` or `--mcp-config` JSON value keeps the spaces between its members too, as in
+  // `{"env": {"A": "b"}}`: it stays one token until its braces balance. Braces inside its strings don't count, and
+  // a brace that opens any other option's value is literal (#2508).
   const result: string[] = [];
   let start = 0;
   let quote: string | null = null;
+  let depth = 0;
   const append = (end: number) => {
     if (start === end) return;
     const token = command.slice(start, end);
     result.push(token[0] === '"' && token.at(-1) === '"'
       ? token.slice(1, -1) : token);
   };
+  const structured = () => command.startsWith('"{', start) || command[start] === "{"
+    || command.startsWith("'{", start) || command.startsWith("--settings={", start)
+    || command.startsWith('--settings="', start) || command.startsWith("--mcp-config={", start)
+    || command.startsWith('--mcp-config="', start);
+  const jsonValue = () => command.startsWith("--settings={", start) || command.startsWith("--mcp-config={", start)
+    || (command[start] === "{" && (result.at(-1) === "--settings" || result.at(-1) === "--mcp-config"));
   for (let index = 0; index < command.length; index += 1) {
     const char = command[index]!;
     if (quote !== null) {
       if (quote === '"' && char === "\\") { index += 1; continue; }
       if (char === quote) quote = null;
-    } else if (char === '"' && (command.startsWith('"{', start) || command[start] === "{"
-      || command.startsWith("'{", start) || command.startsWith("--settings={", start)
-      || command.startsWith('--settings="', start))) {
+    } else if (char === '"' && structured()) {
       quote = char;
-    } else if (/\s/.test(char)) {
+    } else if (char === "{" && jsonValue()) {
+      depth += 1;
+    } else if (char === "}" && depth > 0) {
+      depth -= 1;
+    } else if (/\s/.test(char) && depth === 0) {
       append(index);
       start = index + 1;
     }
@@ -67,6 +83,12 @@ function claudeExecutable(token: string, selectedExecutable?: string): boolean {
   if (selectedExecutable) return token === selectedExecutable;
   return token.startsWith("/") && !token.split("/").some(part => part === "." || part === "..")
     && /\/\.local\/share\/claude\/versions\/\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(token);
+}
+
+/** Whether a process command names a Claude executable anywhere in its argv: `claude` by name, or the native
+ *  installer's versioned path (whose process runs as its version, not as `claude`). */
+export function commandNamesClaude(command: string): boolean {
+  return tokens(command).some((token) => claudeExecutable(token));
 }
 
 // Nixpkgs packages Claude as a wrapper that execs its sibling `.claude-unwrapped`
@@ -110,48 +132,95 @@ function needsClaudeExecutablePath(row: NativeProcessRow): boolean {
       || NIX_WRAPPED_CLAUDE_NAMES.some(name => osNameIs(osName, name)));
 }
 
-function commandUsesExpectedToken(command: string, runtime: NativeRuntime, expectedToken: string): boolean {
-  const argv = tokens(command);
-  const executable = runtime === "claude-code" ? "claude" : "codex";
-  const executableIndex = argv.findIndex((token) => runtime === "claude-code" ? claudeExecutable(token) : executableName(token) === executable);
-  if (executableIndex < 0) return false;
-  const args = argv.slice(executableIndex + 1);
-  if (runtime === "claude-code") {
-    for (let index = 0; index < args.length; index += 1) {
-      const arg = args[index]!;
-      if ((arg === "--resume" || arg === "--session-id") && args[index + 1] === expectedToken) return true;
-      if (arg === `--resume=${expectedToken}` || arg === `--session-id=${expectedToken}`) return true;
-    }
-    return false;
-  }
-
-  return codexResumeToken(args) === expectedToken;
+// A launch whose frozen file is a `#!` script (a user's wrapper that execs the real Claude) can't be recognised
+// by that path: the live process runs the binary the script chose. Only when the exact-path match above finds
+// nothing, such a process is Claude when the OS itself names its executable `claude` (or the versioned install
+// layout) and agrees with the OS process name. A name alone is not enough: the path is read from the OS, never
+// from the script, and the caller pins the fingerprint that contains it.
+function claudeProcessAfterScript(row: NativeProcessRow): boolean {
+  const path = row.executablePath;
+  if (!path || !path.startsWith("/") || path.split("/").some(part => part === "." || part === "..")) return false;
+  // The OS name is the file's own name, or `claude`, which the native installer's versioned binary sets for itself when
+  // a launcher execs it through its `claude` symlink (#2341).
+  const osName = executableName(row.executableName ?? "");
+  return claudeExecutable(tokens(row.command)[0] ?? "") && claudeExecutable(path)
+    && (executableName(path) === osName || osName === "claude");
 }
 
-// undefined is a fresh command; null is a resume command without an exact token.
-function codexResumeToken(args: string[]): string | null | undefined {
-  const topLevelOptionsWithValues = new Set([
-    "-a", "--ask-for-approval", "-c", "--config", "-m", "--model",
-    "-p", "--profile", "-s", "--sandbox",
-  ]);
-  let resumeIndex = -1;
+// The rows whose OS path the script rule reads: a foreground process whose argv[0] is a path named `claude` and
+// whose OS name is `claude`. A bare `claude` title carries no path and keeps today's result without a read.
+function mayBeClaudeAfterScript(row: NativeProcessRow): boolean {
+  const argv0 = tokens(row.command)[0] ?? "";
+  return argv0.startsWith("/") && executableName(argv0) === "claude" && executableName(row.executableName ?? "") === "claude"
+    && row.pgid !== undefined && row.pgid > 0 && row.pgid === row.tpgid;
+}
+
+function commandUsesExpectedToken(command: string, runtime: NativeRuntime, expectedToken: string): boolean {
+  // Codex takes the exact-argv selector in findExactNativeResumeProcess before this Claude-only search.
+  if (runtime !== "claude-code") return false;
+  const argv = tokens(command);
+  const executableIndex = argv.findIndex((token) => claudeExecutable(token));
+  if (executableIndex < 0) return false;
+  const args = argv.slice(executableIndex + 1);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
-    if (topLevelOptionsWithValues.has(arg)) { index += 1; continue; }
-    if (arg.startsWith("-")) continue;
-    if (arg === "resume") resumeIndex = index;
+    if ((arg === "--resume" || arg === "--session-id") && args[index + 1] === expectedToken) return true;
+    if (arg === `--resume=${expectedToken}` || arg === `--session-id=${expectedToken}`) return true;
+  }
+  return false;
+}
+
+// Interactive options can appear before or after `resume`/`fork`. Their values
+// (including a model or directory named "resume") are never positionals.
+const CODEX_OPTIONS_WITH_VALUES = new Set([
+  "-a", "--ask-for-approval", "-c", "--config", "-m", "--model",
+  "-p", "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir",
+  "--enable", "--disable", "--local-provider",
+  "--remote", "--remote-auth-token-env",
+]);
+
+// Unlike the single-value options, --image/-i consumes consecutive values until
+// another option or `--` (Codex SharedCliOptions.images: num_args = 1..).
+function codexOptionEnd(args: string[], index: number): number {
+  const arg = args[index]!;
+  if (arg === "-i" || arg === "--image") {
+    let end = index + 1;
+    while (end < args.length && !args[end]!.startsWith("-")) end += 1;
+    return end;
+  }
+  return index + (CODEX_OPTIONS_WITH_VALUES.has(arg) ? 2 : 1);
+}
+
+// undefined is another command; null is the requested command without an exact token.
+function codexConversationToken(args: string[], subcommand: "resume" | "fork", exactArgv = false): string | null | undefined {
+  let resumeIndex = -1;
+  for (let index = 0; index < args.length;) {
+    const arg = args[index]!;
+    if (arg === "--") break; // Everything after this is the fresh launch's prompt.
+    if (arg.startsWith("-")) { index = codexOptionEnd(args, index); continue; }
+    if (arg === subcommand) resumeIndex = index;
     break;
   }
   if (resumeIndex < 0) return undefined;
   const resumeArgs = args.slice(resumeIndex + 1);
   let index = 0;
+  let conversation: string | null = null;
+  let last = false;
   while (index < resumeArgs.length) {
     const arg = resumeArgs[index]!;
-    if (arg === "--add-dir") { index += 2; continue; }
-    if (arg.startsWith("-")) { index += 1; continue; }
-    return arg;
+    if (arg === "--") { conversation ??= resumeArgs[index + 1] ?? null; break; }
+    if (arg === "--last") last = true;
+    if (arg.startsWith("-")) { index = codexOptionEnd(resumeArgs, index); continue; }
+    // A flattened ps command cannot tell a quoted prompt from several argv entries. Exact
+    // argv can: keep scanning for a real --last after a prompt, while a literal --last
+    // inside one prompt argument never equals the option.
+    if (conversation !== null) { if (!exactArgv) break; index += 1; continue; }
+    conversation = arg;
+    index += 1;
   }
-  return null;
+  // Both Codex finalizers treat --last's positional as the prompt. Scan past
+  // the first positional because a real --last may follow the session id.
+  return last ? null : conversation;
 }
 
 /** A `ps` command line split the way identity proof splits it. */
@@ -168,10 +237,86 @@ export function claudeCommandSessionToken(command: string): string | null {
 /** The conversation a Codex command line resumes: its token, null for a resume naming none, undefined
  *  when the command is not a resume at all (a fresh `codex -C …`). */
 export function codexCommandResumeToken(command: string): string | null | undefined {
-  return codexResumeToken(tokens(command).slice(1));
+  return codexConversationToken(tokens(command).slice(1), "resume");
+}
+
+/** The native process's own resume identity. Flattened ps text is never positive proof. */
+export function codexProcessResumeToken(row: Pick<NativeProcessRow, "argv">): string | null | undefined {
+  const argv = codexProcessArgv(row);
+  return argv ? codexConversationToken(argv.slice(1), "resume", true) : undefined;
+}
+
+function validCodexArgv(row: Pick<NativeProcessRow, "argv">): row is { argv: string[] } {
+  let bytes = 0;
+  return Array.isArray(row.argv) && row.argv.length > 0 && row.argv.length <= 4096
+    && typeof row.argv[0] === "string" && row.argv[0].length > 0
+    && row.argv.every(arg => typeof arg === "string" && !arg.includes("\0")
+      && (bytes += Buffer.byteLength(arg)) <= 1024 * 1024);
+}
+
+/** Exact, bounded argv from a process whose argv[0] also names Codex. No ps-text fallback. */
+export function codexProcessArgv(row: Pick<NativeProcessRow, "argv">): string[] | null {
+  return validCodexArgv(row) && executableName(row.argv[0]!) === "codex" ? row.argv : null;
 }
 
 type ClaudeArgvIds = { resume: string | null; "session-id": string | null };
+
+// OPR.0.7.0.9: a seat's launch additions, read the same way by both selectors. The options OpenRig already emitted
+// (`--model`, `--effort`, `--name`, `--permission-mode`, `--settings`) keep each selector's earlier handling exactly.
+// Returns the index of the option's last value token; null when its value is missing or malformed (no positive proof);
+// undefined when the argument isn't `--agent` or `--append-system-prompt-file`. `--agent` takes one registered-name
+// token. `ps` joins argv with spaces, so the prompt file's path runs to the next `--` option; OpenRig launches only a
+// path that reads back that way (`claudePathBounds`), so a value token opening with `--` or a settings-like `{` ends it.
+const CLAUDE_AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const opensSpan = (token: string): boolean => token.startsWith("--") || /^["']?\{/.test(token);
+// Only the empty configuration OpenRig emits is understood here. Unknown MCP paths/configs
+// still cannot supply positive session proof, and JSON contents never become identity options.
+function claudeMcpValueEnd(args: string[], index: number): number | null | undefined {
+  const arg = args[index]!;
+  if (arg === "--strict-mcp-config") return index;
+  if (arg === "--mcp-config") return args[index + 1] === EMPTY_CLAUDE_MCP_CONFIG ? index + 1 : null;
+  if (arg.startsWith("--mcp-config=")) return arg.slice("--mcp-config=".length) === EMPTY_CLAUDE_MCP_CONFIG ? index : null;
+  return undefined;
+}
+
+function claudeAdditionValueEnd(args: string[], index: number): number | null | undefined {
+  const arg = args[index]!;
+  const inline = arg.match(/^(--agent|--append-system-prompt-file)=([\s\S]*)$/);
+  const flag = inline ? inline[1]! : arg;
+  if (flag !== "--agent" && flag !== "--append-system-prompt-file") return undefined;
+  const value = inline ? inline[2]! : args[index + 1];
+  if (!value || value.startsWith("-")) return null;
+  if (flag === "--agent" && !CLAUDE_AGENT_NAME.test(value)) return null;
+  let end = inline ? index : index + 1;
+  if (flag === "--append-system-prompt-file") {
+    while (end + 1 < args.length && !opensSpan(args[end + 1]!)) end += 1;
+  }
+  return end;
+}
+
+/** Whether a path passed as `--append-system-prompt-file` reads back from `ps` as exactly that one value: its tokens
+ *  don't open with `-`/`--` or a settings-like `{`, so both identity selectors find where it ends. The launch-time check. */
+export function claudePathBounds(path: string): boolean {
+  const parts = tokens(path);
+  return parts.length > 0 && parts.join(" ") === path.trim() && !parts[0]!.startsWith("-") && !parts.some(opensSpan);
+}
+
+// #2044: a seat's plugin channels, read the same way by both selectors. Claude's `--channels` is variadic: it takes
+// every following value up to the next option, and OpenRig passes one or more `plugin:<name>@<marketplace>` entries
+// there. Every value must be such an entry, so a bare word or a `server:` entry after the option is no proof;
+// `--channels=<entry>` carries one entry. Returns the index of the last value; null when there is none or one isn't an
+// entry; undefined when the argument isn't the option.
+function claudeChannelsValueEnd(args: string[], index: number): number | null | undefined {
+  const arg = args[index]!;
+  if (arg.startsWith("--channels=")) return isClaudePluginChannel(arg.slice("--channels=".length)) ? index : null;
+  if (arg !== "--channels") return undefined;
+  let end = index;
+  while (end + 1 < args.length && !args[end + 1]!.startsWith("-")) {
+    if (!isClaudePluginChannel(args[end + 1])) return null;
+    end += 1;
+  }
+  return end > index ? end : null;
+}
 
 /** The conversation a parsed Claude argv names. A fork's --resume names its parent, so with
  *  --fork-session only the fork's own --session-id names it, and both must be present. Without
@@ -183,14 +328,36 @@ function claudeArgvIdentity(ids: ClaudeArgvIds, fork: boolean): string | null | 
 }
 
 // Managed fresh/resume/fork launches name the current Claude identity explicitly.
+// Claude flags that take no value, so a launcher can add them without hiding the session it names (#2341: a seat's
+// launcher that adds --no-chrome). Claude's own help lists both as switches (2.1.282).
+const CLAUDE_SWITCH_FLAGS: ReadonlySet<string> = new Set(["--chrome", "--no-chrome"]);
+
 function claudeSessionToken(args: string[]): string | null {
+  const parsed = claudeArgvIds(args);
+  return parsed ? claudeArgvIdentity(parsed.ids, parsed.fork) ?? null : null;
+}
+
+/** #3044: the conversation a Claude fork launch forked from: the `--resume` of a command line that also carries
+ *  `--fork-session` and the fork's own `--session-id`, read by the same parser as its identity; null when it is no
+ *  fork the identity proof accepts or can't be parsed. */
+export function claudeCommandForkParent(command: string): string | null {
+  const parsed = claudeArgvIds(tokens(command).slice(1));
+  return parsed?.fork && parsed.ids["session-id"] !== null ? parsed.ids.resume : null;
+}
+
+function claudeArgvIds(args: string[]): { ids: ClaudeArgvIds; fork: boolean } | null {
   const ids: ClaudeArgvIds = { resume: null, "session-id": null };
   let fork = false;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
     if (index === 0 && /^\(\d+\.\d+\.\d+[^)]*\)$/.test(arg)) continue;
-    if (arg === "--settings") {
+    if (arg === "--settings" || arg === "--advisor") {
       const value = args[++index];
+      if (!value || value.startsWith("-")) return null;
+      continue;
+    }
+    if (arg.startsWith("--advisor=")) {
+      const value = arg.slice("--advisor=".length);
       if (!value || value.startsWith("-")) return null;
       continue;
     }
@@ -200,7 +367,17 @@ function claudeSessionToken(args: string[]): string | null {
     }
     if (["--permission-mode", "--model", "--name", "--effort"].includes(arg)) { index += 1; continue; }
     if (/^--(?:permission-mode|model|name|settings|effort)=/.test(arg)
-      || arg.startsWith("--remote-control=") || arg === "--dangerously-skip-permissions") continue;
+      || arg.startsWith("--remote-control=") || arg === "--dangerously-skip-permissions"
+      || CLAUDE_SWITCH_FLAGS.has(arg)) continue;
+    const mcpEnd = claudeMcpValueEnd(args, index);
+    if (mcpEnd === null) return null;
+    if (mcpEnd !== undefined) { index = mcpEnd; continue; }
+    const additionEnd = claudeAdditionValueEnd(args, index);
+    if (additionEnd === null) return null;
+    if (additionEnd !== undefined) { index = additionEnd; continue; }
+    const channelsEnd = claudeChannelsValueEnd(args, index);
+    if (channelsEnd === null) return null;
+    if (channelsEnd !== undefined) { index = channelsEnd; continue; }
     if (arg === "--fork-session") { fork = true; continue; }
     const identity = arg.match(/^--(session-id|resume)(?:=(.*))?$/);
     if (!identity) return null; // Unknown argv is not positive identity proof.
@@ -209,7 +386,7 @@ function claudeSessionToken(args: string[]): string | null {
     if (ids[kind] !== null || !value || value.startsWith("-")) return null;
     ids[kind] = value;
   }
-  return claudeArgvIdentity(ids, fork) ?? null;
+  return { ids, fork };
 }
 
 // Delivery-only reading of a Claude argv. Like the strict selector, it accepts
@@ -222,8 +399,13 @@ function claudeSessionIdentity(args: string[]): string | null | { unparsed: true
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
     if (index === 0 && /^\(\d+\.\d+\.\d+[^)]*\)$/.test(arg)) continue;
-    if (["--permission-mode", "--model", "--name", "--settings", "--effort"].includes(arg)) {
+    if (["--permission-mode", "--model", "--name", "--settings", "--effort", "--advisor"].includes(arg)) {
       const value = args[++index];
+      if (!value || value.startsWith("-")) return unparsed;
+      continue;
+    }
+    if (arg.startsWith("--advisor=")) {
+      const value = arg.slice("--advisor=".length);
       if (!value || value.startsWith("-")) return unparsed;
       continue;
     }
@@ -232,7 +414,17 @@ function claudeSessionIdentity(args: string[]): string | null | { unparsed: true
       continue;
     }
     if (/^--(?:permission-mode|model|name|settings|effort)=/.test(arg)
-      || arg.startsWith("--remote-control=") || arg === "--dangerously-skip-permissions") continue;
+      || arg.startsWith("--remote-control=") || arg === "--dangerously-skip-permissions"
+      || CLAUDE_SWITCH_FLAGS.has(arg)) continue;
+    const mcpEnd = claudeMcpValueEnd(args, index);
+    if (mcpEnd === null) return unparsed;
+    if (mcpEnd !== undefined) { index = mcpEnd; continue; }
+    const additionEnd = claudeAdditionValueEnd(args, index);
+    if (additionEnd === null) return unparsed;
+    if (additionEnd !== undefined) { index = additionEnd; continue; }
+    const channelsEnd = claudeChannelsValueEnd(args, index);
+    if (channelsEnd === null) return unparsed;
+    if (channelsEnd !== undefined) { index = channelsEnd; continue; }
     if (arg === "--fork-session") { fork = true; continue; }
     const identity = arg.match(/^--(session-id|resume)(?:=(.*))?$/);
     if (!identity) return unparsed; // Unknown argv is not positive identity proof.
@@ -263,7 +455,13 @@ function witnessedClaudeRow(row: NativeProcessRow): boolean {
  * intermediate stop only, never to recognise a child that refuses its launcher or
  * takes the proof. */
 function claudeRuntimeRow(row: NativeProcessRow): boolean {
-  return witnessedClaudeRow(row) || (needsClaudeExecutablePath(row) && row.executablePath === undefined);
+  return witnessedClaudeRow(row) || unwitnessedClaudeRow(row);
+}
+
+/** A native or Nix Claude (argv0 claude, a version or Nix OS name) whose executable witness is missing from this
+ * sample (unreadable, timed out or over budget). The proof does not count it, but a later sample may. */
+export function unwitnessedClaudeRow(row: NativeProcessRow): boolean {
+  return needsClaudeExecutablePath(row) && row.executablePath === undefined;
 }
 
 /** Verified Claude runtimes that `parent` starts directly (same process group,
@@ -395,29 +593,40 @@ function mayBeClaudeRuntime(row: NativeProcessRow): boolean {
 
 /** The same OS observation serves menu input, restore proof and periodic identity.
  * Older callers may carry only pid/ppid/command; that is insufficient positive Codex proof. */
-export async function listNativeProcesses(): Promise<NativeProcessRow[]> {
-  try {
-    const output = await runAsyncSite("codex.runtime.list_processes", async () => {
-      // lstart is locale-formatted; the child-only C locale keeps the English date the parser expects.
-      const { stdout } = await execFileAsync("ps", ["-Ao", "pid,ppid,pgid,tpgid,ucomm,lstart,command"], { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" } });
-      return stdout;
-    });
-    const rows: NativeProcessRow[] = output.split("\n").slice(1).flatMap((line) => {
-      // ucomm may contain spaces on every platform: macOS app helpers (`Slack Helper`), and on
-      // Linux task names set by prctl(PR_SET_NAME) or process.title (`tmux: server`,
-      // `node (vitest 1)`). lstart always begins with a weekday word and runs to the year, and
-      // ucomm (16 bytes at most) is too short to contain such a date, so matching ucomm lazily
-      // up to the first date is exact.
-      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(-?\d+)\s+(-?\d+)\s+(.+?)\s+(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/);
-      return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), tpgid: Number(match[4]), executableName: match[5]!, startedAt: match[6]!, command: match[7]! }] : [];
-    });
-    const candidates = rows.filter(needsClaudeExecutablePath);
-    if (candidates.length > 0) {
-      const paths = await readNativeExecutablePaths(candidates.map(row => row.pid));
-      for (const row of candidates) row.executablePath = paths.get(row.pid);
-    }
-    return rows;
-  } catch { return []; }
+export async function listNativeProcesses(options: { claudeLaunchPaths?: boolean; frozenExecutable?: string } = {}): Promise<NativeProcessRow[]> {
+  try { return await listNativeProcessesOrThrow(options); } catch { return []; }
+}
+
+/** The same listing, but a failed enumeration rejects instead of reading as an empty table. A caller that shares or
+ *  reuses one listing needs this: an empty array is a legitimate success, so it cannot also mean "failed". */
+export async function listNativeProcessesOrThrow(options: { claudeLaunchPaths?: boolean; frozenExecutable?: string } = {}): Promise<NativeProcessRow[]> {
+  // Copies: the table is shared with concurrent readers, and executable paths are added below.
+  const rows: NativeProcessRow[] = (await runAsyncSite("codex.runtime.list_processes", readProcessTable)).map((row) => ({ ...row }));
+  // `claudeLaunchPaths`: the caller is proving a launch through a `#!` script, which needs the OS path of the
+  // foreground path-named Claude too. `frozenExecutable`: the caller is proving a launch that froze that file (the
+  // installer's symlink resolved to its versioned file), which needs the path only of a path-named Claude whose
+  // argv[0] isn't already the file; an exact launch is proved without it, and a helper timeout can't change its
+  // fingerprint. Every other listing skips that read (on macOS it starts a helper process).
+  const candidates = rows.filter(row => needsClaudeExecutablePath(row) || (mayBeClaudeAfterScript(row) && (options.claudeLaunchPaths === true
+    || (!!options.frozenExecutable && tokens(row.command)[0] !== options.frozenExecutable))));
+  if (candidates.length > 0) {
+    const paths = await readNativeExecutablePaths(candidates.map(row => row.pid));
+    for (const row of candidates) row.executablePath = paths.get(row.pid);
+  }
+  // Linux argv was captured with this same /proc table sample; never read real /proc
+  // again after a caller has selected a fixture or alternate process-table root.
+  // Only foreground rows can be selected below. Skip macOS helper reads for
+  // background Codex processes; every foreground seat still gets fresh argv.
+  const codexCandidates = process.platform === "darwin"
+    ? rows.filter(row => row.executableName === "codex" && row.pgid !== undefined && row.pgid > 0 && row.pgid === row.tpgid)
+    : [];
+  if (codexCandidates.length > 0) {
+    // A failed or timed-out helper read loses argv evidence, not the process table.
+    // The foreground Codex still participates in delivery's uniqueness check.
+    const argumentsByPid = await readNativeProcessArguments(codexCandidates.map(row => row.pid)).catch(() => new Map<number, string[]>());
+    for (const row of codexCandidates) row.argv = argumentsByPid.get(row.pid) ?? null;
+  }
+  return rows;
 }
 
 export type NativeProcessLister = () => NativeProcessRow[] | Promise<NativeProcessRow[]>;
@@ -434,10 +643,46 @@ function rotationProcess(row: NativeProcessRow, rotation: ClaudeResumeRotation |
   return !!rotation && row.pid === rotation.process.pid && !!row.startedAt && row.startedAt === rotation.process.startedAt;
 }
 
-export type NativeProcessObservation = { panePid: number; process: NativeProcessRow; fingerprint: string };
+/** `afterScript`: found by the script-launch or symlink rule, not the exact-path match; its first proof must be pinned. */
+export type NativeProcessObservation = { panePid: number; process: NativeProcessRow; fingerprint: string; afterScript?: true };
 export type CodexProcessObservation = NativeProcessObservation;
 
-function nativeProcessCandidates(rows: NativeProcessRow[], panePid: number, runtime: NativeRuntime, selectedExecutable?: string): NativeProcessObservation[] {
+/** The process still running the frozen `#!` script: the kernel starts it as `<interpreter> [one shebang option] <script>
+ *  args…`, so the script's path is its argv[1], or its argv[2] after a single option. */
+function runsFrozenScript(row: NativeProcessRow, selectedExecutable: string): boolean {
+  const [, first, second] = tokens(row.command);
+  return first === selectedExecutable || (first?.startsWith("-") === true && second === selectedExecutable);
+}
+
+/** A process whose argv[0] is an absolute path named `claude` and whose OS executable path is exactly the frozen file. */
+function runsFrozenFile(row: NativeProcessRow, selectedExecutable: string): boolean {
+  const argv0 = tokens(row.command)[0] ?? "";
+  const path = row.executablePath;
+  return !!path && path === selectedExecutable && path.startsWith("/") && !path.split("/").some(part => part === "." || part === "..")
+    && argv0.startsWith("/") && executableName(argv0) === "claude";
+}
+
+function nativeProcessCandidates(rows: NativeProcessRow[], panePid: number, runtime: NativeRuntime, selectedExecutable?: string, scriptLaunch?: boolean): NativeProcessObservation[] {
+  const exact = candidatesMatching(rows, panePid, runtime, row => claudeProcess(row, selectedExecutable));
+  if (exact.length > 0 || runtime !== "claude-code" || !selectedExecutable) return exact;
+  // #2341: the native installer's `claude` is a symlink to `versions/<ver>`, and the launch froze its realpath. A Claude
+  // spelling argv[0] through the link is that launch when the OS says it runs exactly the frozen file.
+  const linked = candidatesMatching(rows, panePid, runtime, row => runsFrozenFile(row, selectedExecutable));
+  if (linked.length > 0) return linked.map(candidate => ({ ...candidate, afterScript: true as const }));
+  if (scriptLaunch !== true) return exact;
+  const named = candidatesMatching(rows, panePid, runtime, claudeProcessAfterScript);
+  if (named.length > 0) return named.map(candidate => ({ ...candidate, afterScript: true as const }));
+  // #2341: a wrapper that starts Claude without `exec` keeps running the frozen script as the foreground parent, and
+  // Claude can run under any name. That script's direct child naming a Claude conversation is the launched runtime;
+  // the caller still requires the launch's own token, one candidate and a stable fingerprint.
+  const byPid = new Map(rows.map(row => [row.pid, row]));
+  return candidatesMatching(rows, panePid, runtime, row => {
+    const parent = byPid.get(row.ppid);
+    return !!parent && runsFrozenScript(parent, selectedExecutable) && claudeSessionToken(tokens(row.command).slice(1)) !== null;
+  }).map(candidate => ({ ...candidate, afterScript: true as const }));
+}
+
+function candidatesMatching(rows: NativeProcessRow[], panePid: number, runtime: NativeRuntime, claudeRow: (row: NativeProcessRow) => boolean): NativeProcessObservation[] {
   const byPid = new Map(rows.map((row) => [row.pid, row]));
   const root = byPid.get(panePid);
   if (byPid.size !== rows.length || !root?.startedAt || !root.tpgid || root.tpgid <= 0) return [];
@@ -445,25 +690,34 @@ function nativeProcessCandidates(rows: NativeProcessRow[], panePid: number, runt
   const executable = runtime === "claude-code" ? "claude" : "codex";
   for (const row of rows) {
     const osExecutable = runtime === "claude-code" ? executableName(row.executableName ?? "") : row.executableName;
-    if ((runtime === "claude-code" ? !claudeProcess(row, selectedExecutable)
-      : osExecutable !== executable || executableName(tokens(row.command)[0] ?? "") !== executable)
-      || row.pgid !== root.tpgid || row.tpgid !== root.tpgid) continue;
+    if (row.pgid !== root.tpgid || row.tpgid !== root.tpgid) continue;
+    // A zombie (an exited child nobody reaped) can't take input or run anything, and its argv is gone. Only a state read
+    // as `Z` excludes it: an unread state is no evidence.
+    if (row.state === "Z") continue;
+    if (runtime === "claude-code" ? !claudeRow(row) : osExecutable !== executable) continue;
+    // OS-named Codex with unreadable argv still competes for the foreground.
+    // A readable argv[0] naming a different executable is positive contrary evidence.
+    if (runtime === "codex" && validCodexArgv(row) && !codexProcessArgv(row)) return [];
     const chain: NativeProcessRow[] = [];
     const visited = new Set<number>();
     let current: NativeProcessRow | undefined = row;
+    let belongsToPane = false;
     while (current && !visited.has(current.pid) && current.startedAt) {
       visited.add(current.pid);
       chain.push(current);
-      if (current.pid === panePid) { matches.push({ process: row, chain }); break; }
+      if (current.pid === panePid) { matches.push({ process: row, chain }); belongsToPane = true; break; }
       current = byPid.get(current.ppid);
     }
+    if (runtime === "codex" && !belongsToPane) return [];
   }
   return matches.map(({ process, chain }) => ({ panePid, process,
-    fingerprint: JSON.stringify(chain.map(row => [row.pid, row.ppid, row.startedAt, row.pgid, row.tpgid, row.executableName, row.command, row.executablePath])) }));
+    fingerprint: JSON.stringify(chain.map(row => runtime === "codex"
+      ? [row.pid, row.ppid, row.startedAt, row.pgid, row.tpgid, row.executableName, row.command, row.executablePath, row.argv]
+      : [row.pid, row.ppid, row.startedAt, row.pgid, row.tpgid, row.executableName, row.command, row.executablePath])) }));
 }
 
-function selectNativeProcess(rows: NativeProcessRow[], panePid: number, expectedToken?: string | null, requireResume = false, runtime: NativeRuntime = "codex", selectedExecutable?: string, rotation?: ClaudeResumeRotation | null): NativeProcessObservation | null {
-  const matches = nativeProcessCandidates(rows, panePid, runtime, selectedExecutable);
+function selectNativeProcess(rows: NativeProcessRow[], panePid: number, expectedToken?: string | null, requireResume = false, runtime: NativeRuntime = "codex", selectedExecutable?: string, rotation?: ClaudeResumeRotation | null, scriptLaunch?: boolean, requireArgv = false): NativeProcessObservation | null {
+  const matches = nativeProcessCandidates(rows, panePid, runtime, selectedExecutable, scriptLaunch);
   // #1079: a Codex launcher that spawns Codex is one runtime on one chain.
   const chain = runtime === "codex" ? launcherChain(matches, rows) : matches;
   if (!chain || chain.length === 0 || (runtime !== "codex" && chain.length !== 1)) return null;
@@ -478,13 +732,87 @@ function selectNativeProcess(rows: NativeProcessRow[], panePid: number, expected
     // links naming different conversations stay refused. Exact resume proof
     // needs the deepest process's own argv: a launcher's token is never
     // inherited by a child that names nothing, which stays deliverable but unproved.
-    const identities = chain.map((link) => codexResumeToken(tokens(link.process.command).slice(1)));
+    const identities = chain.map((link) => codexProcessResumeToken(link.process));
     if (new Set(identities.filter((value) => typeof value === "string")).size > 1) return null;
+    // Exact resume proof needs readable argv across the whole foreground chain:
+    // an opaque launcher may name another conversation even when its child agrees.
+    if ((requireResume || requireArgv) && chain.some((link) => !codexProcessArgv(link.process))) return null;
     if (requireResume && (!expectedToken || identities[0] !== expectedToken)) return null;
     if (expectedToken !== undefined && identities.some((value) => value !== undefined
       && (!expectedToken || value !== expectedToken))) return null;
   }
   return observation;
+}
+
+/** Whether any process in the pane's subtree (the pane's own process included) has a Claude executable anywhere in its
+ *  argv: the recognizer `findExactNativeResumeProcess` (via `commandUsesExpectedToken`) starts from. A Claude run as
+ *  `node …/bin/claude`, or in the background, counts. */
+export function subtreeNamesClaudeExecutable(rows: NativeProcessRow[], panePid: number): boolean {
+  const byParent = new Map<number, NativeProcessRow[]>();
+  for (const row of rows) byParent.set(row.ppid, [...(byParent.get(row.ppid) ?? []), row]);
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const queue = [panePid];
+  const seen = new Set<number>();
+  while (queue.length > 0) {
+    const pid = queue.shift()!;
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    const row = byPid.get(pid);
+    if (row && tokens(row.command).some((token) => claudeExecutable(token))) return true;
+    for (const child of byParent.get(pid) ?? []) queue.push(child.pid);
+  }
+  return false;
+}
+
+/** Why `selectNativeProcess` rejects a snapshot, in the same order it checks. Used only to word a failed check;
+ *  a test pins `kind: "passes"` to `selectNativeProcess` returning a process, so the two cannot drift apart. */
+export type NativeRejection =
+  | { kind: "passes" }
+  | { kind: "no_single_process" }
+  | { kind: "no_recorded_conversation" }
+  | { kind: "names_no_conversation" }
+  | { kind: "not_a_resume" }
+  | { kind: "other_conversation"; conversation: string }
+  | { kind: "conflicting_conversations" }
+  | { kind: "rotation_process_mismatch"; conversation: string };
+
+/** #3044 delta review SR1: how many foreground processes of the pane the proof would take as the runtime (0, 1 or more),
+ *  with the same rules as explainNativeRejection. */
+export function nativeCandidateCount(rows: NativeProcessRow[], panePid: number, runtime: NativeRuntime, selectedExecutable?: string,
+  scriptLaunch?: boolean): number {
+  return nativeProcessCandidates(rows, panePid, runtime, selectedExecutable, scriptLaunch).length;
+}
+
+export function explainNativeRejection(rows: NativeProcessRow[], panePid: number, runtime: NativeRuntime,
+  expectedToken: string | null | undefined, requireResume: boolean, rotation?: ClaudeResumeRotation | null, selectedExecutable?: string,
+  scriptLaunch?: boolean): NativeRejection {
+  const matches = nativeProcessCandidates(rows, panePid, runtime, selectedExecutable, scriptLaunch);
+  const chain = runtime === "codex" ? launcherChain(matches, rows) : matches;
+  if (!chain || chain.length === 0 || (runtime !== "codex" && chain.length !== 1)) return { kind: "no_single_process" };
+  const { process } = chain[0]!;
+  if (runtime === "claude-code") {
+    if (!expectedToken) return { kind: "no_recorded_conversation" };
+    const launched = claudeSessionToken(tokens(process.command).slice(1));
+    if (launched === expectedToken) return { kind: "passes" };
+    if (launched === null) return { kind: "names_no_conversation" };
+    if (launched === rotation?.token) return rotationProcess(process, rotation) ? { kind: "passes" } : { kind: "rotation_process_mismatch", conversation: launched };
+    return { kind: "other_conversation", conversation: launched };
+  }
+  const identities = chain.map((link) => codexProcessResumeToken(link.process));
+  if (new Set(identities.filter((value) => typeof value === "string")).size > 1) return { kind: "conflicting_conversations" };
+  if (requireResume) {
+    if (!expectedToken) return { kind: "no_recorded_conversation" };
+    if (chain.some((link) => !validCodexArgv(link.process))) return { kind: "not_a_resume" };
+    if (identities[0] === undefined) return { kind: "not_a_resume" };
+    if (identities[0] === null) return { kind: "names_no_conversation" };
+    if (identities[0] !== expectedToken) return { kind: "other_conversation", conversation: identities[0] };
+  }
+  if (expectedToken !== undefined) {
+    const named = identities.find((value) => value !== undefined && (!expectedToken || value !== expectedToken));
+    if (named === null) return { kind: "names_no_conversation" };
+    if (typeof named === "string") return { kind: "other_conversation", conversation: named };
+  }
+  return { kind: "passes" };
 }
 
 async function observeNativePaneProcess(input: {
@@ -493,8 +821,13 @@ async function observeNativePaneProcess(input: {
   listProcesses?: NativeProcessLister;
   expectedToken?: string | null;
   requireResume?: boolean;
+  /** Codex only: require exact argv on every chain link without requiring a resume (fresh launches remain eligible). */
+  requireArgv?: boolean;
   /** Canonical executable frozen by the managed launch, never re-resolved at observation time. */
   selectedExecutable?: string;
+  /** Claude only: the frozen executable is a `#!` script, so a process whose OS executable path is named `claude` is
+   *  recognised when no exact-path match exists, and that path is read from the OS (see `claudeProcessAfterScript`). */
+  scriptLaunch?: boolean;
   /** Claude only: the recorded rotation into `expectedToken` (`claudeResumeRotation`). Its process
    *  may name the rotation's token instead of `expectedToken`. */
   rotation?: ClaudeResumeRotation | null;
@@ -502,14 +835,44 @@ async function observeNativePaneProcess(input: {
   try {
     const pid = await input.tmux.getPanePid(input.target);
     if (!pid) return null;
-    const rows = await (input.listProcesses ?? listNativeProcesses)();
+    const rows = await (input.listProcesses ?? (() => listNativeProcesses({ claudeLaunchPaths: input.scriptLaunch === true, frozenExecutable: input.selectedExecutable })))();
     return selectNativeProcess(rows, pid, input.expectedToken, input.requireResume, runtime, input.selectedExecutable,
-      runtime === "claude-code" ? input.rotation : undefined);
+      runtime === "claude-code" ? input.rotation : undefined, input.scriptLaunch, input.requireArgv);
   } catch { return null; }
 }
 
 export async function observeCodexPaneProcess(input: Parameters<typeof observeNativePaneProcess>[0]): Promise<CodexProcessObservation | null> {
   return observeNativePaneProcess(input, "codex");
+}
+
+/** A single foreground Codex chain that explicitly forks the requested parent.
+ * The child's PID-owned native record must still supply its own identity. */
+export async function observeCodexForkProcess(input: {
+  target: string;
+  tmux: { getPanePid(target: string): Promise<number | null> };
+  listProcesses?: NativeProcessLister;
+  parentToken: string;
+}): Promise<CodexProcessObservation | null> {
+  try {
+    const pid = await input.tmux.getPanePid(input.target);
+    if (!pid || !input.parentToken) return null;
+    const rows = await (input.listProcesses ?? listNativeProcesses)();
+    const chain = launcherChain(nativeProcessCandidates(rows, pid, "codex"), rows);
+    if (!chain?.length) return null;
+    // A fork is positive history proof. Every chain link must have exact argv,
+    // including the selected child and any launcher that could name a conflict.
+    const args: string[][] = [];
+    for (const link of chain) {
+      const argv = codexProcessArgv(link.process);
+      if (!argv) return null;
+      args.push(argv.slice(1));
+    }
+    const parents = args.map(argv => codexConversationToken(argv, "fork", true));
+    if (!parents.includes(input.parentToken)
+      || parents.some(parent => parent !== undefined && parent !== input.parentToken)
+      || args.some(argv => codexConversationToken(argv, "resume", true) !== undefined)) return null;
+    return chain[0]!;
+  } catch { return null; }
 }
 
 export async function verifyCodexPaneProcess(input: Parameters<typeof observeCodexPaneProcess>[0]): Promise<CodexProcessObservation | null> {
@@ -584,7 +947,8 @@ export async function observeClaudePaneRuntime(input: Omit<Parameters<typeof obs
   try {
     const pid = await input.tmux.getPanePid(input.target);
     if (!pid) return null;
-    const candidates = nativeProcessCandidates(await (input.listProcesses ?? listNativeProcesses)(), pid, "claude-code", input.selectedExecutable);
+    const rows = await (input.listProcesses ?? (() => listNativeProcesses({ claudeLaunchPaths: input.scriptLaunch === true, frozenExecutable: input.selectedExecutable })))();
+    const candidates = nativeProcessCandidates(rows, pid, "claude-code", input.selectedExecutable, input.scriptLaunch);
     return candidates.length === 1 ? candidates[0]! : null;
   } catch { return null; }
 }
@@ -644,6 +1008,13 @@ function idleShellRoot(rows: NativeProcessRow[], pid: number): NativeProcessRow 
     && !rows.some(row => row.pid !== pid && row.pgid === root.tpgid) ? root : null;
 }
 
+/** An idle shell's identity, for comparing two samples: the row without its run state, which changes as the shell
+ *  wakes and sleeps (S, R) while it stays the same process. */
+function shellFingerprint(root: NativeProcessRow): string {
+  const { state: _state, ...identity } = root;
+  return JSON.stringify(identity);
+}
+
 /** Whether the bound pane is a stable idle shell: in two samples the pane's own shell owns the foreground with
  * nothing else in its group, and it is the same shell both times. A missing, failed or changing listing is not idle:
  * a launch script still starting the runtime holds the foreground the same way a shell label would suggest. */
@@ -656,8 +1027,44 @@ export async function verifyPaneIdleShell(input: {
     try {
       const pid = await input.tmux.getPanePid(input.target);
       if (!pid) return null;
-      const root = idleShellRoot(await (input.listProcesses ?? listNativeProcesses)(), pid);
-      return root ? JSON.stringify(root) : null;
+      // Idle proof needs the complete table, but no executable-path or argv enrichment.
+      const rows = await (input.listProcesses ?? (() => runAsyncSite("codex.runtime.list_processes", readProcessTable)))();
+      const root = idleShellRoot(rows, pid);
+      return root ? shellFingerprint(root) : null;
+    } catch { return null; }
+  };
+  const first = await sample();
+  return first !== null && await sample() === first;
+}
+
+/** Whether the bound pane holds nothing but its idle shell: `verifyPaneIdleShell`'s two matching samples, and in each
+ *  the shell has no child process at all. A harness or any other job started from it, suspended or in the background in
+ *  another process group, is a child, so it isn't empty. For ending a pane without --stop; delivery keeps the
+ *  foreground rule above. A missing or failed listing isn't empty. Each sample reads the table anew, after its pane
+ *  read: another observer's shared read still in flight may predate a job started since. A process hidden from this user
+ *  (Linux hidepid) could be the shell's child, so a census with any hidden pid isn't empty either, nor is a shell whose
+ *  own children list (Linux, where the kernel keeps one) names any process. */
+export async function verifyPaneEmptyShell(input: {
+  target: string;
+  tmux: { getPanePid(target: string): Promise<number | null> };
+  listProcesses?: NativeProcessLister;
+}): Promise<boolean> {
+  const sample = async (): Promise<string | null> => {
+    try {
+      const pid = await input.tmux.getPanePid(input.target);
+      if (!pid) return null;
+      const rows = input.listProcesses ? await input.listProcesses()
+        : await runAsyncSite("codex.runtime.list_processes", async () => {
+          const census = await readProcessTableCensusNow();
+          // A hidden stat can't show its parent; even an unrelated one leaves the shell's children unknown.
+          if (census.permissionHiddenPids.length > 0) throw new Error("some processes are hidden from this user");
+          // hidepid=2 leaves another user's process out of the census altogether; the shell's own list still names it.
+          const children = await readProcessChildrenNow(pid);
+          if (children && children.length > 0) throw new Error("the shell has a child process");
+          return census.rows;
+        });
+      const root = idleShellRoot(rows, pid);
+      return root && !rows.some(row => row.ppid === pid) ? shellFingerprint(root) : null;
     } catch { return null; }
   };
   const first = await sample();
@@ -725,7 +1132,7 @@ export async function observeClaudeDelivery(
       if (other) return { state: "conflict", detail: "A different native runtime occupies the bound foreground", fingerprint: other.fingerprint };
       const root = idleShellRoot(rows, pid);
       if (root) {
-        return { state: "idle_shell", detail: "The bound foreground is an idle shell with no receiving child", fingerprint: JSON.stringify(root) };
+        return { state: "idle_shell", detail: "The bound foreground is an idle shell with no receiving child", fingerprint: shellFingerprint(root) };
       }
       return unknown;
     } catch { return unknown; }

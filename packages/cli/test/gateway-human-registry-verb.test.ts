@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -6,6 +6,8 @@ import { createProgram } from "../src/index.js";
 // The registry module is home-state owned by the daemon; the verb (and this test) reach
 // it via the narrow @openrig/daemon/gateway-human-registry subpath (the C3/crash-cart rail).
 import { humansDir, loadHumanRegistry } from "@openrig/daemon/gateway-human-registry";
+import { gatewayRoutes } from "../../daemon/src/routes/gateway.js";
+import { REGISTRATION_OFFER } from "../src/person-registration-offer.js";
 
 // M1 A3 pt2 / A4b relocate — `rig gateway human add` verb integration. The verb lazy-imports
 // the relocated daemon surface; these tests drive the real command end-to-end.
@@ -19,8 +21,39 @@ describe("rig gateway human add verb (post-relocate)", () => {
     process.exitCode = undefined;
   });
   afterEach(() => {
+    vi.restoreAllMocks();
     if (prevHome === undefined) delete process.env.OPENRIG_HOME; else process.env.OPENRIG_HOME = prevHome;
     rmSync(home, { recursive: true, force: true });
+  });
+
+  // The kernel operator runs `rig gateway participants` before its greeting: with nobody registered, the output ends with
+  // the same offer `rig daemon start` prints; once someone is, it doesn't.
+  it("participants ends with the registration offer while nobody is registered, and drops it once someone is", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const empty = createProgram(); empty.exitOverride();
+    await empty.parseAsync(["node", "rig", "gateway", "participants"]);
+    const before = log.mock.calls.map((call) => String(call[0]));
+    expect(before.slice(-REGISTRATION_OFFER.length)).toEqual([...REGISTRATION_OFFER]);
+    expect(existsSync(humansDir(home))).toBe(false);
+    const add = createProgram(); add.exitOverride();
+    await add.parseAsync(["node", "rig", "gateway", "human", "add", "mike", "--display-name", "Mike", "--delivery-class", "B"]);
+    log.mockClear();
+    const after = createProgram(); after.exitOverride();
+    await after.parseAsync(["node", "rig", "gateway", "participants"]);
+    expect(log.mock.calls.map((call) => String(call[0]))).not.toContain(REGISTRATION_OFFER[0]);
+  });
+
+  it("participants --json and the daemon route expose the same filtered view", async () => {
+    const add = createProgram(); add.exitOverride();
+    await add.parseAsync(["node", "rig", "gateway", "human", "add", "mike", "--display-name", "Mike", "--delivery-class", "B"]);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const command = createProgram(); command.exitOverride();
+    await command.parseAsync(["node", "rig", "gateway", "participants", "--organization", "missing", "--json"]);
+    const cli = JSON.parse(String(log.mock.calls.at(-1)?.[0]));
+    const response = await gatewayRoutes({ home }).request("/participants?organization=missing");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(cli);
+    expect(cli).toMatchObject({ ok: true, participants: [], default: { id: "mike", source: "only-person" } });
   });
 
   it("is wired via createProgram (gateway human add)", () => {
@@ -33,6 +66,23 @@ describe("rig gateway human add verb (post-relocate)", () => {
     expect(bindingOpt).toBeDefined();
     expect(bindingOpt!.description).toContain("connectorRef and secretsRef are config/vault labels");
     expect(bindingOpt!.description).toContain("tokens come from 'rig slack setup --secrets-env-file'");
+    expect(bindingOpt!.description).toContain("or file:<path> for relay");
+  });
+
+  it("gateway human add help text documents relay binding syntax and requirements", () => {
+    const gw = createProgram().commands.find((c) => c.name() === "gateway");
+    const human = gw!.commands.find((c) => c.name() === "human");
+    const addCmd = human!.commands.find((c) => c.name() === "add");
+    let help = "";
+    addCmd!.configureOutput({
+      writeOut: (text) => { help += text; },
+      writeErr: () => {},
+    });
+    addCmd!.outputHelp();
+    expect(help).toContain("relay:<connectorRef>:file:<absolute-env-file>:primary:handle=<safe-alias>");
+    expect(help).toContain("OPENRIG_RELAY_URL");
+    expect(help).toContain("OPENRIG_RELAY_OUTBOUND_TOKEN");
+    expect(help).toContain("OPENRIG_RELAY_INBOUND_TOKEN");
   });
 
   it("add writes a fragment + projection; address DERIVED; vault-pointer secretsRef (with ':') survives", async () => {
@@ -51,6 +101,35 @@ describe("rig gateway human add verb (post-relocate)", () => {
       expect(loaded.entities[0]!.address).toBe("mike@external");
       expect(loaded.entities[0]!.connectorBindings[0]!.secretsRef).toBe("vault://slack/mike");
     }
+  });
+
+  it("says a person added with no connector is asked in the Feed and Steering only, and says nothing of it with one", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const bare = createProgram(); bare.exitOverride();
+    await bare.parseAsync(["node", "rig", "gateway", "human", "add", "ana", "--display-name", "Ana", "--delivery-class", "A"]);
+    expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({ ok: true, entityId: "ana", delivery: "Feed and Steering only" });
+    expect(error.mock.calls.map((call) => String(call[0]))).toEqual([
+      "ana has no connector binding, so messages and questions reach them only in the TUI's Feed and Steering until one is added: rerun rig gateway human add ana --replace "
+        + "with the same options plus --binding <kind:connectorRef:secretsRef:primary[:handle=<id>]> (rig gateway human set's binding.<n> changes only a binding that exists).",
+    ]);
+    expect(process.exitCode).toBeUndefined();
+    // The hint's command adds the binding; binding.0 on a person with none is out of range, which is why the hint doesn't name it.
+    const outOfRange = createProgram(); outOfRange.exitOverride();
+    await outOfRange.parseAsync(["node", "rig", "gateway", "human", "set", "ana", "binding.0", "slack:main:vault://slack/ana:primary"]);
+    expect(process.exitCode).toBe(1);
+    expect(String(error.mock.calls.at(-1)?.[0])).toContain("is out of range");
+    process.exitCode = undefined;
+    const replaced = createProgram(); replaced.exitOverride();
+    await replaced.parseAsync(["node", "rig", "gateway", "human", "add", "ana", "--replace", "--display-name", "Ana", "--delivery-class", "A", "--binding", "slack:main:vault://slack/ana:primary"]);
+    expect(process.exitCode).toBeUndefined();
+    const loaded = loadHumanRegistry(home);
+    expect(loaded.ok && loaded.entities.find((e) => e.entityId === "ana")?.connectorBindings.length).toBe(1);
+    error.mockClear();
+    const bound = createProgram(); bound.exitOverride();
+    await bound.parseAsync(["node", "rig", "gateway", "human", "add", "mike", "--display-name", "Mike", "--binding", "slack:main:vault://slack/mike:primary", "--delivery-class", "B"]);
+    expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).not.toHaveProperty("delivery");
+    expect(error).not.toHaveBeenCalled();
   });
 
   it("A6 v3: an OPTIONAL handle= token parses alongside a ':'-bearing secretsRef (inbound-resolvable)", async () => {

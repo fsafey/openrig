@@ -49,6 +49,8 @@ function row(over: Row = {}, waiting: Row = {}): Row {
 }
 
 function makeDeps(routes: Record<string, { status: number; data: unknown } | Array<{ status: number; data: unknown }>>): QueueDeps {
+  const transitions: Array<{ transitionId: number; transitionNote: string | null; actorSession: string }> =
+    [{ transitionId: 1, transitionNote: null, actorSession: "stub@rig" }];
   const pick = (key: string, fallback: { status: number; data: unknown }) => {
     const r = routes[key];
     return (Array.isArray(r) ? r.shift() : r) ?? fallback;
@@ -56,8 +58,27 @@ function makeDeps(routes: Record<string, { status: number; data: unknown } | Arr
   return {
     lifecycleDeps: {} as QueueDeps["lifecycleDeps"],
     clientFactory: () => ({
-      get: vi.fn(async (p: string) => pick(`GET ${p}`, { status: 200, data: {} })),
-      post: vi.fn(async (p: string) => pick(`POST ${p}`, { status: 500, data: { error: "unrouted" } })),
+      // The sender this stub stamps; the transitions it records carry it as their actor, as the daemon does.
+      senderIdentity: async () => ({ session: "stub@rig", originUnknown: false }),
+      get: vi.fn(async (p: string) => {
+        const explicit = routes[`GET ${p}`];
+        if (explicit) return Array.isArray(explicit) ? explicit.shift()! : explicit;
+        if (p.endsWith("/transitions")) return { status: 200, data: transitions };
+        const update = routes[`POST ${p}/update`];
+        if (update) {
+          const response = Array.isArray(update) ? update[0] : update;
+          return { status: 200, data: response?.data ?? {} };
+        }
+        return { status: 200, data: {} };
+      }),
+      post: vi.fn(async (p: string, body: unknown) => {
+        const response = pick(`POST ${p}`, { status: 500, data: { error: "unrouted" } });
+        const transitionNote = body && typeof body === "object" ? (body as { transitionNote?: unknown }).transitionNote : undefined;
+        if (response.status < 400 && typeof transitionNote === "string") {
+          transitions.push({ transitionId: transitions.length + 1, transitionNote, actorSession: "stub@rig" });
+        }
+        return response;
+      }),
     }) as unknown as ReturnType<QueueDeps["clientFactory"]>,
   };
 }
@@ -422,7 +443,7 @@ describe("queue write receipt (output.compact)", () => {
     it("a --host create to another daemon names the host and the remote read", async () => {
       const out = await createVia(["--host", "far"], row(), { status: 200, data: { selfHostId: "here" } });
       expect(out).toContain("host: far (the row lives on that daemon)");
-      expect(out).toContain("OPENRIG_URL='<daemon-url of host far>' rig queue show 'qitem-20261010180000-aaaa' --full --json");
+      expect(out).toContain("rig queue show 'qitem-20261010180000-aaaa' --host 'far' --full --json");
     });
 
     it("a --host naming this daemon's own host id is local, as the daemon resolves it: no remote host, a local read", async () => {
@@ -446,7 +467,7 @@ describe("queue write receipt (output.compact)", () => {
 
     it("an unconfirmed --host offers both reads as alternatives, in the footer and in --json, for a create and a handoff's new row", async () => {
       const local = "rig queue show 'qitem-20261010180000-aaaa' --full --json";
-      const remote = "OPENRIG_URL='<daemon-url of host far>' rig queue show 'qitem-20261010180000-aaaa' --full --json";
+      const remote = "rig queue show 'qitem-20261010180000-aaaa' --host 'far' --full --json";
       const out = await createVia(["--host", "far"], row(), { status: 503, data: {} });
       expect(out).toContain(`full row: ${local} if this daemon is host far, otherwise ${remote}, or add --full to the create`);
       logs = [];
@@ -458,12 +479,12 @@ describe("queue write receipt (output.compact)", () => {
       const routes = { [v.route]: { status: v.status, data: v.data }, "GET /healthz": { status: 503, data: {} } };
       logs = [];
       const plain = await run([...v.argv, "--host", "far"], routes);
-      expect(plain).toContain(`rig queue show 'qitem-20261010180000-aaaa' --full --json · rig queue show '${newId}' --full --json if this daemon is host far, otherwise OPENRIG_URL='<daemon-url of host far>' rig queue show '${newId}' --full --json, or add --full to the handoff`);
+      expect(plain).toContain(`rig queue show 'qitem-20261010180000-aaaa' --full --json · rig queue show '${newId}' --full --json if this daemon is host far, otherwise rig queue show '${newId}' --host 'far' --full --json, or add --full to the handoff`);
       logs = [];
       const hj = JSON.parse(await run([...v.argv, "--host", "far", "--json"], routes)) as Row;
       expect(hj.receipt).toMatchObject({
         fullCommands: ["rig queue show 'qitem-20261010180000-aaaa' --full --json", `rig queue show '${newId}' --full --json`],
-        createdFullCommandOnHost: `OPENRIG_URL='<daemon-url of host far>' rig queue show '${newId}' --full --json`,
+        createdFullCommandOnHost: `rig queue show '${newId}' --host 'far' --full --json`,
       });
     });
 

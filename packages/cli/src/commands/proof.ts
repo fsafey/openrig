@@ -3,9 +3,39 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Command } from "commander";
 import YAML from "yaml";
+import { inferCatalogProject, ProjectReadError } from "@openrig/daemon/project-catalog";
 import { DaemonClient } from "../client.js";
-import { findSlice, resolveMissionsRoot } from "../lib/scope/scope-fs.js";
-import { ScopeCliError } from "../lib/scope/types.js";
+import { ConfigStore } from "../config-store.js";
+import { findSlice, readProjectMissionsRoot, resolveMissionsRoot } from "../lib/scope/scope-fs.js";
+import { ScopeCliError, type SliceInfo } from "../lib/scope/types.js";
+
+/** findSlice, then, for an absolute slice path the configured tree doesn't own, the catalogued project whose root holds it
+ *  (chosen as work-install chooses one for a working folder), read under that project's missions root. A tree named with
+ *  --workspace or OPENRIG_WORK_ROOT stands, and a retry that fails reports the original refusal. */
+function findSliceInCatalog(
+  missionsRoot: string, slicePath: string, hintMission: string | null, workspace: string | undefined, warnings: string[],
+): SliceInfo {
+  try {
+    return findSlice(missionsRoot, slicePath, hintMission);
+  } catch (error) {
+    if (!(error instanceof ScopeCliError) || !path.isAbsolute(slicePath) || workspace || process.env.OPENRIG_WORK_ROOT) throw error;
+    let projectMissionsRoot: string | null = null;
+    try {
+      const catalogPath = String(new ConfigStore().resolveWithSource("workspace.catalog_path").value);
+      const project = inferCatalogProject(catalogPath, new ProjectReadError("project_required", "no catalogued project holds the slice"),
+        { cwd: slicePath }, warnings);
+      projectMissionsRoot = readProjectMissionsRoot(project.root, warnings);
+    } catch {
+      throw error;
+    }
+    if (!projectMissionsRoot || path.resolve(projectMissionsRoot) === path.resolve(missionsRoot)) throw error;
+    try {
+      return findSlice(projectMissionsRoot, slicePath, hintMission);
+    } catch {
+      throw error;
+    }
+  }
+}
 import { selectProofContractBody, isScaffoldPlaceholderText } from "../lib/scope/scaffold-placeholder.js";
 import { parseLogicalCheckboxes } from "../lib/scope/logical-checkbox.js";
 
@@ -113,6 +143,11 @@ export function proofCommand(): Command {
 The selected daemon owns show/judge. Scope addresses are mission/slices/slice#item.
 The project owner selects proofPolicy: { judges: [exact-seat-address] } in the
 owning slice.yaml, mission.yaml or project.yaml (nearest wins; no default gate roles).
+By default an item's latest judgment from any listed judge decides it. Add
+everyJudge: true to require every listed judge's own current accept: one judge's
+accept then can't hide another's reject, withdraw, missing judgment or stale
+evidence. Turning it on is a policy change, so earlier judgments must be recorded
+again. rig proof show lists each judge's own latest judgment either way.
 The contract is the authored ## Proof contract. A sole item needs no # selector.
 
 Example (existing evidence, no copied hashes or operation key):
@@ -133,9 +168,18 @@ checkboxes do not accept an item under the selected proof policy.
     if (cmd.opts().workspace) throw new Error("--workspace applies to proof add. Select the judgment daemon using OPENRIG_URL; proof show reports its scope basis.");
     return new DaemonClient();
   };
-  const response = async (r: { status: number; data: unknown }): Promise<Record<string, any>> => {
+  // A path_escape response names the supported routes to another workspace's tree.
+  const projectSelected = (project: unknown, scope: unknown) => Boolean(project) || /^[^/:]+:/.test(typeof scope === "string" ? scope : "");
+  const escapeHint = (project: boolean) => project
+    ? "\nThe scope is outside that project's missions root; name a mission/slice path inside it."
+    : "\nThe scope is outside the selected daemon workspace. For a catalog project, pass --project <id> or prefix the scope with <project>:."
+      + " To use another daemon's workspace, select that daemon with OPENRIG_URL.";
+  const response = async (r: { status: number; data: unknown }, project = false): Promise<Record<string, any>> => {
     const data = r.data as Record<string, any>;
-    if (r.status >= 400) throw new Error(`${data.error ?? r.status}: ${data.message ?? "Read the named source and retry"}`);
+    if (r.status >= 400) {
+      throw new Error(`${data.error ?? r.status}: ${data.message ?? "Read the named source and retry"}${data.error === "path_escape" ? escapeHint(project) : ""}`);
+    }
+    if (Array.isArray(data.warnings)) for (const warning of data.warnings) console.error(`warning: ${warning}`);
     return data;
   };
   const projectHelp = "Workspace-catalog project id; resolves the scope under that project's missions root (same as a <project>:<scope> prefix)";
@@ -145,7 +189,7 @@ checkboxes do not accept an item under the selected proof policy.
     .action(async (scope, opts) => {
       try {
         const query = new URLSearchParams({ ...(opts.project ? { project: opts.project } : {}), ...(scope ? { scope } : {}) }).toString();
-        const data = await response(await client().get(`/api/proof${query ? `?${query}` : ""}`));
+        const data = await response(await client().get(`/api/proof${query ? `?${query}` : ""}`), projectSelected(opts.project, scope));
         console.log(opts.json ? JSON.stringify(data) : JSON.stringify(data, null, 2));
       } catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exitCode = 1; }
     });
@@ -166,7 +210,7 @@ checkboxes do not accept an item under the selected proof policy.
         const refs = [...new Set<string>([...opts.evidence, ...(opts.comparison ? [opts.comparison] : [])])];
         const query = new URLSearchParams({ ...(opts.project ? { project: opts.project } : {}), scope });
         for (const ref of refs) query.append("evidence", ref);
-        const c = client(), view = await response(await c.get(`/api/proof?${query}`));
+        const c = client(), view = await response(await c.get(`/api/proof?${query}`), projectSelected(opts.project, scope));
         const items = view.items as Array<{ id: string; text: string; index: number; revision: string; judgment: { id: string } | null }> | undefined;
         const item = selector ? items?.find(i => i.id === selector || i.text === selector || String(i.index) === selector) : items?.length === 1 ? items[0] : undefined;
         if (!item) throw new Error("Select one current item with scope#item; rig proof show lists IDs, text and indices");
@@ -177,9 +221,12 @@ checkboxes do not accept an item under the selected proof policy.
           ...(opts.subject ? { subject: { kind: opts.subject.slice(0, subjectAt), ref: opts.subject.slice(subjectAt + 1), ...(opts.comparison ? { comparison: opts.comparison } : {}) } } : {}),
           expectedRevision: opts.revision ?? item.revision, expectedPrevious: item.judgment?.id ?? null,
           operationId: opts.operationId, replace: opts.replace === true, ...(opts.project ? { project: opts.project } : {}),
-          // Pin the project root the prepared read resolved; the daemon refuses (409 project_changed) if it moved.
+          ...((view.project || view.selection) ? { expectedProject: (view.project as { id?: string } | undefined)?.id ?? null } : {}),
+          ...((view.project?.missionsRoot ?? view.selection?.missionsRoot) ? { expectedMissionsRoot: view.project?.missionsRoot ?? view.selection?.missionsRoot } : {}),
+          ...(view.preparationReceipt ? { preparationReceipt: view.preparationReceipt } : {}),
+          // Pin the project and missions roots the prepared read resolved.
           ...((view.project as { root?: string } | undefined)?.root ? { projectRoot: (view.project as { root: string }).root } : {}) };
-        const result = await response(await c.post("/api/proof/judge", body));
+        const result = await response(await c.post("/api/proof/judge", body), projectSelected(opts.project, scope));
         console.log(opts.json ? JSON.stringify(result) : JSON.stringify(result, null, 2));
       } catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exitCode = 1; }
     });
@@ -229,8 +276,8 @@ checkboxes do not accept an item under the selected proof policy.
           });
         }
         const parentOpts = (command.parent?.opts() ?? {}) as { workspace?: string };
-        const missionsRoot = resolveMissionsRoot({ override: parentOpts.workspace });
-        const slice = findSlice(missionsRoot, slicePath, opts.mission ?? null);
+        const missionsRoot = resolveMissionsRoot({ override: parentOpts.workspace, targetPath: slicePath });
+        const slice = findSliceInCatalog(missionsRoot, slicePath, opts.mission ?? null, parentOpts.workspace, warns);
 
         // Resolve the artifact body.
         let body = "";

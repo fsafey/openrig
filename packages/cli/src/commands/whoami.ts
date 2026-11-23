@@ -64,6 +64,8 @@ interface WhoamiResult {
   resolvedBy: string;
   identity: WhoamiIdentity & Record<string, unknown>;
   peers: WhoamiPeer[];
+  /** #2871: present only while `rig up` is still creating the team. */
+  rosterState?: "building";
   edges: { outgoing: WhoamiEdge[]; incoming: WhoamiEdge[] };
   transcript: { enabled: boolean; path: string | null; tailCommand: string | null };
   contextUsage?: {
@@ -94,6 +96,7 @@ function projectCompactWhoami(data: Record<string, unknown>, bounded?: BoundedPe
       podNamespace: id["podNamespace"],
       memberId: id["memberId"],
       sessionName: id["sessionName"],
+      senderAddress: id["senderAddress"],
       runtime: id["runtime"],
     },
     peers: peers.map((p) => {
@@ -102,6 +105,8 @@ function projectCompactWhoami(data: Record<string, unknown>, bounded?: BoundedPe
     }),
     // KEEP: openrig-user SKILL.md documents peersNote as a required recovery field.
     peersNote: bounded ? bounded.note : data["peersNote"],
+    // #2871: while `rig up` is still creating the team, say so, as the daemon does.
+    ...(data["rosterState"] !== undefined ? { rosterState: data["rosterState"] } : {}),
     ...(bounded ? { peersOmitted: bounded.omitted } : {}),
     // edges already carry only kind + to/from {logicalId, sessionName}.
     edges: data["edges"],
@@ -142,9 +147,14 @@ export function boundPeers(data: Record<string, unknown>, bound: number, allPeer
   const ordered = [0, 1, 2].flatMap((t) => peers.filter((peer) => tier(peer) === t));
   const shown = ordered.slice(0, bound);
   const omitted = peers.length - shown.length;
-  const note = `peers = ${shown.length} of this rig's ${peers.length} (roster excluding self; edge peers first, then your pod, then roster order; `
+  // #2871: while `rig up` is still building the team, the daemon's note opens with that; keep it first, and don't call
+  // the edges complete.
+  const daemonNote = typeof data["peersNote"] === "string" ? data["peersNote"] : "";
+  const building = data["rosterState"] === "building";
+  const opening = building && daemonNote.includes("peers = ") ? daemonNote.slice(0, daemonNote.indexOf("peers = ")) : "";
+  const note = `${opening}peers = ${shown.length} of this rig's ${peers.length} (roster excluding self; edge peers first, then your pod, then roster order; `
     + `bound output.whoami_peers=${bound}); ${omitted} not shown; all: ${allPeersCommand}; `
-    + "edges = directional relationships (always complete); use `rig ps --nodes` for node inventory including self + live state";
+    + `edges = directional relationships (${building ? "the ones written so far" : "always complete"}); use \`rig ps --nodes\` for node inventory including self + live state`;
   return { peers: shown, omitted, note };
 }
 
@@ -160,7 +170,8 @@ function whoamiPeersBound(): number {
 
 type TmuxExecFn = (cmd: string) => string;
 
-const defaultTmuxExec: TmuxExecFn = (cmd: string) => execSync(cmd, { encoding: "utf-8" }).trim();
+// tmux's stderr (an unset @rigged_* option, no server) rides the thrown error; callers fall through.
+const defaultTmuxExec: TmuxExecFn = (cmd: string) => execSync(cmd, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 function buildPartialWhoamiResult(source: { nodeId?: string; sessionName?: string }): Record<string, unknown> {
   return {
@@ -408,10 +419,15 @@ left out. --all-peers lists every one (today's compact output).`)
       console.log(`Logical ID: ${id.logicalId}`);
       console.log(`Pod:        ${(id.podNamespace ?? id.podId) ?? "—"} / ${id.memberId}`);
       console.log(`Session:    ${id.sessionName ?? "—"}`);
+      if (id.senderAddress && id.senderAddress !== id.sessionName) console.log(`Sender:     ${id.senderAddress}`);
       console.log(`Runtime:    ${id.runtime}`);
       console.log(`Transport:  ${id.attachmentType === "external_cli" ? "external_cli (outbound only)" : id.attachmentType}`);
       console.log(`Resolved:   via ${data.resolvedBy.replace(/_/g, " ")}`);
 
+      if (data.rosterState === "building") {
+        console.log("");
+        console.log("Team:       still being built by `rig up`: the peers and edges below are the ones created so far, and more may come. Run `rig whoami` again once it finishes.");
+      }
       if (data.peers.length > 0) {
         console.log("");
         // OPR.99.0.6.1: name the contract on the header so peers cannot be
