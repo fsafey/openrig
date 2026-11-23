@@ -381,6 +381,12 @@ exec tmux -S ${shellQuote(tmuxSocketPath)} "$@"
   // later invocation fall back to the operator's default server.
   env.TMUX_TMPDIR = tmuxTmpDir;
   env.PATH = [tmuxWrapperDir, runtimeStubDir, originalPath].filter(Boolean).join(delimiter);
+  // A seat pane runs the scratch HOME's login shell, and a login shell's system profile can put directories
+  // ahead of the inherited PATH: macOS path_helper (/etc/profile, /etc/zprofile) adds /etc/paths and
+  // /etc/paths.d, which on a Homebrew host include /opt/homebrew/bin. A host's own pi there then runs instead
+  // of a test's stub. The user profiles run after the system ones, so they put the scaffold's commands first again.
+  const scaffoldPath = `PATH=${shellQuote([tmuxWrapperDir, runtimeStubDir].join(delimiter))}:"$PATH"\nexport PATH\n`;
+  for (const profile of [".profile", ".zprofile"]) writeFileSync(join(home, profile), scaffoldPath);
   // Forced-local: never resolve/attach the shared fleet kernel.
   env.OPENRIG_NO_KERNEL = "1";
   // A3-R3 injected clock: the ONLY sanctioned way OPENRIG_TEST_CLOCK_NOW is set —
