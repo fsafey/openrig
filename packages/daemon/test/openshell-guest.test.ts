@@ -48,7 +48,7 @@ try:
  g.regular(sys.argv[2],sys.argv[3]); print("unexpected-success")
 except g.Refused as error: print(str(error))
 `;
-  const result=await run("python3",["-c",script,helper,root,file],{timeout:5000});
+  const result=await run("python3",["-B", "-c",script,helper,root,file],{timeout:5000});
   expect(result.stdout.trim()).toBe("environment_file_invalid");
 });
 
@@ -76,7 +76,7 @@ try:
  print(g.regular(sys.argv[2],sys.argv[3]).decode())
 except Exception as error: print(type(error).__name__+":"+str(error))
 `;
-  const result = await run("python3", ["-c", script, helper, root, file], { timeout: 5000 });
+  const result = await run("python3", ["-B", "-c", script, helper, root, file], { timeout: 5000 });
   expect(result.stdout.trim()).toBe("selected context");
 });
 
@@ -112,7 +112,7 @@ try: g.launch(root)
 except Captured: pass
 except g.Refused as error: print(json.dumps({"error":str(error)}))
 `;
-  const result = JSON.parse((await run("python3", ["-c", script, helper, root, input, String(changed)], { timeout: 5000 })).stdout);
+  const result = JSON.parse((await run("python3", ["-B", "-c", script, helper, root, input, String(changed)], { timeout: 5000 })).stdout);
   if (changed) expect(result).toEqual({ error: "environment_projection_changed" });
   else {
     expect(result.input).toBe(input);
@@ -153,7 +153,7 @@ g.subprocess.Popen=spawn; g.process_start=lambda pid:"start"
 try: g.launch(root)
 except Captured: pass
 `;
-  const result = JSON.parse((await run("python3", ["-c", script, helper, root], {
+  const result = JSON.parse((await run("python3", ["-B", "-c", script, helper, root], {
     timeout: 5000,
     env: {
       PATH: process.env.PATH ?? "/usr/bin:/bin",

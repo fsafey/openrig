@@ -45,6 +45,3 @@ packages/daemon/context-packs/
 
 # Internal build receipts; never commit
 /.evidence/
-
-# Python bytecode written by tests that import packaged helpers (openshell guest.py)
-__pycache__/
