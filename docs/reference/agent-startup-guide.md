@@ -376,6 +376,10 @@ transaction. The seat's node, canonical address, queue, session history and skil
 `rig seat status` shows **Working directory for future launches** (`launch_cwd` in JSON). That's saved configuration,
 not where the running process is.
 
+**A change planned from an earlier look:** pass the `nodeId` and `cwd` that `rig ps --nodes --json` showed as
+`--expected-node-id` and `--expected-cwd`. If the seat was recreated at that address, or its directory changed since,
+the change is refused (`cwd_baseline_changed`) before anything is created or saved.
+
 **What it writes:** it creates the folder if it's missing, and writes nothing else there. The seat's next fresh launch or
 rebuild handover writes its startup files there, as launch does today.
 

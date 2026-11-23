@@ -212,6 +212,25 @@ describe("changing an existing seat's launch directory", () => {
     expect(savedCwd(other.node.id)).toBe(oldCwd);
   });
 
+  it("saves the move when the caller's expected node and stored cwd still hold", async () => {
+    const seat = seed();
+    const result = await service.setCwd({ seatRef: seat.sessionName, cwd: newCwd, reason: "assigned checkout", operator: "lead@project",
+      expectedNodeId: seat.node.id, expectedCwd: oldCwd });
+    expect(result).toMatchObject({ ok: true, from: oldCwd, to: fs.realpathSync(newCwd), changed: true });
+    expect(savedCwd(seat.node.id)).toBe(fs.realpathSync(newCwd));
+    expect(cwdEvents()).toHaveLength(1);
+  });
+
+  it("matches an expected cwd of null only for a seat with no stored cwd", async () => {
+    const seat = seed();
+    const before = custody();
+    expect(await service.setCwd({ seatRef: seat.sessionName, cwd: newCwd, reason: "assigned checkout", expectedCwd: null }))
+      .toMatchObject({ ok: false, code: "cwd_baseline_changed" });
+    expect(fs.existsSync(newCwd)).toBe(false);
+    expect(savedCwd(seat.node.id)).toBe(oldCwd);
+    expect(custody()).toEqual(before);
+  });
+
   it("stores a symlink destination's real directory, and the same directory again records no second event", async () => {
     const seat = seed();
     fs.mkdirSync(newCwd);

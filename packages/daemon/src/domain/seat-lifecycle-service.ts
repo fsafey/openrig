@@ -161,6 +161,8 @@ export interface SeatRefusal {
     | "cwd_check_failed"
     | "cwd_persistence_failed"
     | "cwd_configuration_changed"
+    | "cwd_baseline_changed"
+    | "invalid_expectation"
     | "cwd_destination_conflict"
     | "missing_reason"
     | "permission_selection_refused"
@@ -238,6 +240,10 @@ interface SetCwdInput {
   cwd: string;
   reason: string;
   operator?: string | null;
+  /** What the caller's inspection saw, passed through as sent: the seat's node id, and its stored cwd (null for none).
+   *  Each one given must still hold, so a request built before the seat was recreated or moved changes nothing. */
+  expectedNodeId?: unknown;
+  expectedCwd?: unknown;
 }
 
 export type SetPolicyResult =
@@ -574,12 +580,23 @@ export class SeatLifecycleService {
     if (to === path.parse(to).root) {
       return { ok: false, code: "invalid_cwd", message: "Choose a project directory, not a filesystem root, for managed startup files." };
     }
+    const { expectedNodeId, expectedCwd } = input;
+    if ((expectedNodeId !== undefined && (typeof expectedNodeId !== "string" || !expectedNodeId.trim()))
+      || (expectedCwd !== undefined && expectedCwd !== null && (typeof expectedCwd !== "string" || !path.isAbsolute(expectedCwd)))) {
+      return { ok: false, code: "invalid_expectation", message: "An expected node id must be a nonempty string, and an expected cwd an absolute path or null." };
+    }
     const resolved = this.resolveSeat(input.seatRef);
     if ("code" in resolved) return resolved;
     const seat = this.describe(resolved);
     const node = this.rigRepo.getRig(seat.rigId)?.nodes.find(candidate => candidate.id === seat.nodeId);
     if (!node) return { ok: false, code: "seat_not_found", message: "The seat no longer exists.", guidance: SEAT_LOOKUP_GUIDANCE };
     const from = node.cwd;
+    // Before anything is created: the transaction below rechecks this same node and cwd.
+    if ((expectedNodeId !== undefined && node.id !== expectedNodeId) || (expectedCwd !== undefined && from !== expectedCwd)) {
+      return { ok: false, code: "cwd_baseline_changed",
+        message: "The seat's node or stored cwd is no longer the one expected; nothing was created or changed.",
+        guidance: "Inspect the seat again with: rig ps --nodes --json (nodeId, cwd)" };
+    }
     try {
       fs.mkdirSync(to, { recursive: true });
       to = fs.realpathSync(to);

@@ -1593,6 +1593,8 @@ A seat can switch itself (its CLI may end when it retires; the daemon finishes).
     .requiredOption("--cwd <directory>", "Absolute working directory on the daemon's host; created if missing")
     .requiredOption("--reason <text>", "Audit reason for the future launch directory")
     .option("--operator <address>", "Operator recorded on the audit event when no session identity is present")
+    .option("--expected-node-id <id>", "Node id your inspection saw; refuses if the seat was recreated at this address")
+    .option("--expected-cwd <directory>", "Stored cwd your inspection saw; refuses if it changed since")
     .option("--json", "JSON output for agents")
     .description("Save an existing seat's working directory for its next fresh launch or rebuild handover")
     .addHelpText("after", `
@@ -1622,11 +1624,17 @@ project directory, so a resume there may not find it (not run natively).
 rig seat restart --keep-conversation (Codex) isn't adoption: it respawns in the
 directory it observes from the running process.
 
+Pass --expected-node-id and --expected-cwd as rig ps --nodes --json showed them
+(nodeId, cwd), and the change is refused, with nothing created, if the seat was
+recreated at this address or its directory changed since.
+
 Files in the old directory are left as they are; other seats may still use them.
 Example:
   rig seat set-cwd planning-lead@project --cwd /work/project/seats/planning-lead --reason "isolate planning"`)
-    .action(async (seat: string, opts: { cwd: string; reason: string; operator?: string; json?: boolean }) => {
-      await runLifecycleVerb("set-cwd", seat, { cwd: opts.cwd, reason: opts.reason, operator: opts.operator }, opts, data => {
+    .action(async (seat: string, opts: { cwd: string; reason: string; operator?: string; expectedNodeId?: string; expectedCwd?: string; json?: boolean }) => {
+      await runLifecycleVerb("set-cwd", seat, { cwd: opts.cwd, reason: opts.reason, operator: opts.operator,
+        ...(opts.expectedNodeId !== undefined ? { expectedNodeId: opts.expectedNodeId } : {}),
+        ...(opts.expectedCwd !== undefined ? { expectedCwd: opts.expectedCwd } : {}) }, opts, data => {
         const s = data["seat"] as { logicalId?: string; rigName?: string } | undefined;
         console.log(`Launch directory for ${s?.logicalId}@${s?.rigName}: ${String(data["to"])}${data["changed"] === false ? " (already selected)" : " (audited)"}.`);
         console.log("set-cwd wrote nothing there but the folder: the next fresh launch or rebuild handover writes its startup files.");

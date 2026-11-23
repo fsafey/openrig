@@ -497,7 +497,8 @@ function seatLifecycleStatus(code: string): 400 | 404 | 409 | 422 | 500 | 502 {
     || code === "missing_effort" || code === "invalid_effort" || code === "invalid_policy" || code === "invalid_statusline_throttle"
     || code === "missing_cwd" || code === "invalid_cwd" || code === "invalid_stop_precondition"
     || code === "missing_permissions_to" || code === "permissions_to_not_a_person"
-    || code === "missing_home" || code === "invalid_home" || code === "missing_expectation" || code === "invalid_operation_id") return 400;
+    || code === "missing_home" || code === "invalid_home" || code === "missing_expectation" || code === "invalid_operation_id"
+    || code === "invalid_expectation") return 400;
   if (code === "seat_not_found") return 404;
   if (code === "tmux_probe_failed") return 502;
   // #3253: a seat whose process limit can't be applied; only an unverified check may pass on retry (409).
@@ -584,6 +585,9 @@ seatRoutes.post("/set-cwd/:seatRef", async (c) => {
     cwd: typeof body.cwd === "string" ? body.cwd : "",
     reason: typeof body.reason === "string" ? body.reason : "",
     operator: transportSenderSession(c) ?? (typeof body.operator === "string" ? body.operator : null),
+    // Optional, passed through as sent: the service refuses a wrong type and enforces each one given.
+    expectedNodeId: body.expectedNodeId,
+    expectedCwd: body.expectedCwd,
   });
   return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));
 });

@@ -276,6 +276,15 @@ describe("rig seat set-cwd", () => {
     expect(exitCode).toBeUndefined();
   });
 
+  it("forwards an inspected node id and stored cwd as the move's expectations", async () => {
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const deps = makeDeps({ status: 200, data: { ok: true, seat: { logicalId: "planner", rigName: "project" }, to: "/srv/remote/planner", changed: true } }, calls);
+    await captureLogs(() => makeCommand(deps).parseAsync([...args, "--expected-node-id", "node-1", "--expected-cwd", "/srv/shared"]).then(() => {}));
+    expect(calls).toEqual([{ path: "/api/seat/set-cwd/planner%40project", body: {
+      cwd: "/srv/remote/space dir/../planner", reason: "isolate planning", expectedNodeId: "node-1", expectedCwd: "/srv/shared",
+    } }]);
+  });
+
   it.each([200, 409, 500])("preserves the daemon response in JSON, including a refused change (HTTP %s)", async status => {
     const data = status === 200
       ? { ok: true, changed: false, to: "/srv/remote/planner", effect: "next_launch", warnings: [] }

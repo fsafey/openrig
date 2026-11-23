@@ -65,6 +65,76 @@ describe("POST /api/seat/{set-model,stop,clean}/:seatRef", () => {
       reason: "isolate planning", operator: "operator@project" });
   });
 
+  // An inspection names the seat's node and stored cwd; a seat recreated at the same address, or moved since, must not
+  // be changed by a request built from that older view.
+  // set-cwd's own checks need the runtime adapters startup wires.
+  function withRuntimeAdapters() {
+    db.close();
+    db = createFullTestDb();
+    setup = createTestApp(db, { wireRuntimeAdapters: true });
+  }
+
+  it.each(["recreated seat", "moved seat"] as const)("set-cwd refuses a stale expectation from before a %s, creating no directory and saving nothing", async scenario => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "seat-cwd-expect-"));
+    withRuntimeAdapters();
+    try {
+      // A seat set-cwd would otherwise move: a stored cwd and a saved (empty) startup selection.
+      const movable = (seat: ReturnType<typeof seedSeat>) => {
+        db.prepare("UPDATE nodes SET cwd = ? WHERE id = ?").run("/srv/shared", seat.node.id);
+        db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, '[]', '[]', '[]', 'claude-code')")
+          .run(seat.node.id);
+        return seat;
+      };
+      const inspected = movable(seedSeat("dev.mover"));
+      let current = inspected;
+      if (scenario === "recreated seat") {
+        setup.rigRepo.deleteNode(inspected.node.id);
+        current = movable(seedSeat("dev.mover"));
+      } else {
+        db.prepare("UPDATE nodes SET cwd = ? WHERE id = ?").run("/srv/moved-meanwhile", current.node.id);
+      }
+      expect(current.sessionName).toBe(inspected.sessionName);
+      const target = path.join(root, "target");
+      const res = await post("set-cwd", inspected.sessionName, { cwd: target, reason: "assigned checkout", operator: "op@seat-rig",
+        expectedNodeId: inspected.node.id, expectedCwd: "/srv/shared" });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, code: "cwd_baseline_changed" });
+      expect(fs.existsSync(target)).toBe(false);
+      expect((db.prepare("SELECT cwd FROM nodes WHERE id = ?").get(current.node.id) as { cwd: string }).cwd)
+        .toBe(scenario === "recreated seat" ? "/srv/shared" : "/srv/moved-meanwhile");
+      expect(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'node.cwd_changed'").get()).toEqual({ n: 0 });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("set-cwd saves the move through the route when the expected node and cwd still hold", async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "seat-cwd-expect-"));
+    withRuntimeAdapters();
+    try {
+      const seat = seedSeat("dev.mover");
+      db.prepare("UPDATE nodes SET cwd = ? WHERE id = ?").run("/srv/shared", seat.node.id);
+      db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, '[]', '[]', '[]', 'claude-code')")
+        .run(seat.node.id);
+      const target = path.join(root, "target");
+      const res = await post("set-cwd", seat.sessionName, { cwd: target, reason: "assigned checkout", operator: "op@seat-rig",
+        expectedNodeId: seat.node.id, expectedCwd: "/srv/shared" });
+      expect(res.status, JSON.stringify(await res.clone().json())).toBe(200);
+      expect((db.prepare("SELECT cwd FROM nodes WHERE id = ?").get(seat.node.id) as { cwd: string }).cwd).toBe(fs.realpathSync(target));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([{ expectedNodeId: 42 }, { expectedNodeId: "" }, { expectedCwd: 7 }, { expectedCwd: "relative/dir" }])("set-cwd rejects a malformed expectation %j", async expectation => {
+    const { sessionName } = seedSeat();
+    const res = await post("set-cwd", sessionName, { cwd: "/srv/target", reason: "assigned checkout", operator: "op@seat-rig", ...expectation });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ ok: false, code: "invalid_expectation" });
+  });
+
   it.each(["null", "[]", "{broken", '{"cwd": 42, "reason": "isolate"}'])("set-cwd rejects malformed input %s without an internal error", async body => {
     const res = await setup.app.request("/api/seat/set-cwd/planner%40project", {
       method: "POST", headers: { "Content-Type": "application/json" }, body,
