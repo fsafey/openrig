@@ -97,6 +97,10 @@ test "$ci_result" = success || exit 1
 gh pr merge <pr-number> --squash --match-head-commit "$ci_sha"
 ```
 
+For a PR that merges an upstream release into the fork, use `--merge` instead of
+`--squash`. A squash keeps the files but leaves the upstream commits outside
+`main`'s ancestry, so the next sync would re-merge history already integrated.
+
 The status is an attributed report by a trusted repository writer, not an
 independent CI attestation. Do not upload private logs or native provider state.
 Read suite counts/skips and installed-scenario records before publishing success.
