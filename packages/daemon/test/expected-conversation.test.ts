@@ -108,6 +108,8 @@ it.each([["claude-code", "pane root"], ["claude-code", "native process"], ["code
 });
 
 // The pane root stays; the native process under it changes after the lookup's census, still naming the original id.
+// For Codex, the resolver's own after-read census refuses a changed native process first; a reused pane root PID, and
+// every Claude change, reach the closing chain check.
 const changes = [
   ["the verified native process is replaced", false, (r: "claude-code" | "codex") => paneRows(r, { nativePid: 30 })],
   ["a later process reuses the native PID", false, (r: "claude-code" | "codex") => paneRows(r, { native: later() })],
@@ -119,7 +121,10 @@ it.each((["claude-code", "codex"] as const).flatMap(runtime => changes.map(([lab
   const f = fixture(runtime); if (legacy) legacyVerdict(f);
   let calls = 0;
   vi.spyOn(ProcessCensus.prototype, "list").mockImplementation(async () => calls++ === 0 ? paneRows(runtime) : next(runtime));
-  await expect(resolve(f)).rejects.toMatchObject({ code: "expected_identity_mismatch", message: "The pane process changed during native resolution." });
+  const readCheck = runtime === "codex" && _label !== "a later process reuses the pane root PID";
+  await expect(resolve(f)).rejects.toMatchObject(readCheck
+    ? { code: "expected_identity_unavailable", message: expect.stringContaining("changed while its thread was read") }
+    : { code: "expected_identity_mismatch", message: "The pane process changed during native resolution." });
 });
 
 // Tenure and binding are read after every await: the closing pane read, and the closing census after it.
