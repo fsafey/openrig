@@ -18,6 +18,7 @@ import { CodexThreadIdResolver } from "../src/domain/codex-thread-id.js";
 import { SeatIdentityStore } from "../src/domain/seat-identity-store.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
+import { resolveExpectedConversation } from "../src/domain/expected-conversation.js";
 import { sessionAdminRoutes } from "../src/routes/sessions.js";
 import { transportRoutes } from "../src/routes/transport.js";
 
@@ -50,7 +51,7 @@ function fixture(runtime: "claude-code" | "codex" = "claude-code", guarded = fal
   vi.spyOn(tmux, "captureComposerSnapshot").mockImplementation(async () => frame());
   const guard = guarded ? new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name)) : undefined;
   if (guard) tmux.deliveryGuard = guard;
-  const rows = () => [{ pid: 10, ppid: 1, command: "zsh" }, { pid: 20, ppid: 10,
+  const rows = () => [{ pid: 10, ppid: 1, command: "zsh", startedAt: "Thu Oct 29 00:00:00 2026" }, { pid: 20, ppid: 10,
     command: runtime === "codex" ? `codex resume ${current}` : `claude --session-id ${current}`, startedAt: "Thu Oct 29 00:00:00 2026" }];
   vi.spyOn(ProcessCensus.prototype, "list").mockImplementation(async () => rows());
   vi.spyOn(CodexThreadIdResolver.prototype, "resolve").mockImplementation(async () => current);
@@ -73,6 +74,81 @@ function fixture(runtime: "claude-code" | "codex" = "claude-code", guarded = fal
   return { root, db, registry, node, tmux, guard, transport, app, expected, commands, store, records, readUrl, processes: rows,
     replace: () => { current = B; }, onLoad: (fn: () => void) => { afterLoad = fn; }, beforeKeys: (fn: () => void) => { beforeKeys = fn; } };
 }
+
+// `ps -o lstart` text (C locale, local time) for a Date, as the process census reports it.
+function lstart(d: Date): string {
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const two = (n: number) => String(n).padStart(2, "0");
+  return `${days[d.getDay()]} ${months[d.getMonth()]} ${String(d.getDate()).padStart(2, " ")} ${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())} ${d.getFullYear()}`;
+}
+// Census rows for the fixture's pane: a start before the verdict unless overridden (a later one holds a verified PID it reuses).
+function paneRows(runtime: "claude-code" | "codex", o: { root?: string; native?: string; nativePid?: number } = {}) {
+  const before = "Thu Oct 29 00:00:00 2026";
+  return [{ pid: 10, ppid: 1, command: "zsh", startedAt: o.root ?? before }, { pid: o.nativePid ?? 20, ppid: 10,
+    command: runtime === "codex" ? `codex resume ${A}` : `claude --session-id ${A}`, startedAt: o.native ?? before }];
+}
+const later = () => lstart(new Date(Date.now() + 5_000));
+// A verdict written before dual-PID evidence: it names only the pane root.
+function legacyVerdict(f: ReturnType<typeof fixture>) {
+  new SeatIdentityStore(f.db).upsert({ nodeId: f.node.id, verdict: "verified", evidenceSource: "pane_process", reason: null,
+    evidence: { registeredPane: "%1", observedPid: 10, observedPanePid: null, observedCommand: f.expected.runtime, matchedLayer: 1 },
+    sessionName: f.expected.sessionName, observedAt: new Date().toISOString() } as never);
+}
+const resolve = (f: ReturnType<typeof fixture>) => resolveExpectedConversation(f.expected, f.registry, f.tmux, f.store);
+
+// The verdict records PIDs, not start times. Its writers stamp observedAt before they sample processes, so a process
+// holding a verified PID that started after the verdict is a replacement reusing it, even with the same native id.
+it.each([["claude-code", "pane root"], ["claude-code", "native process"], ["codex", "pane root"], ["codex", "native process"]] as const)(
+  "expected %s identity refuses a verified %s whose PID a later process holds", async (runtime, label) => {
+  const f = fixture(runtime);
+  vi.spyOn(ProcessCensus.prototype, "list").mockImplementation(async () => paneRows(runtime, label === "pane root" ? { root: later() } : { native: later() }));
+  await expect(resolve(f)).rejects.toMatchObject({ code: "expected_identity_unavailable",
+    message: `The pane process no longer matches its verified occupant: its ${label} did not start before it was verified.` });
+});
+
+// The pane root stays; the native process under it changes after the lookup's census, still naming the original id.
+const changes = [
+  ["the verified native process is replaced", false, (r: "claude-code" | "codex") => paneRows(r, { nativePid: 30 })],
+  ["a later process reuses the native PID", false, (r: "claude-code" | "codex") => paneRows(r, { native: later() })],
+  ["a later process reuses the pane root PID", false, (r: "claude-code" | "codex") => paneRows(r, { root: later() })],
+  ["a legacy verdict's native child is replaced", true, (r: "claude-code" | "codex") => paneRows(r, { nativePid: 30 })],
+] as const;
+it.each((["claude-code", "codex"] as const).flatMap(runtime => changes.map(([label, legacy, next]) => [runtime, label, legacy, next] as const)))(
+  "expected %s identity refuses when %s during native resolution", async (runtime, _label, legacy, next) => {
+  const f = fixture(runtime); if (legacy) legacyVerdict(f);
+  let calls = 0;
+  vi.spyOn(ProcessCensus.prototype, "list").mockImplementation(async () => calls++ === 0 ? paneRows(runtime) : next(runtime));
+  await expect(resolve(f)).rejects.toMatchObject({ code: "expected_identity_mismatch", message: "The pane process changed during native resolution." });
+});
+
+// Tenure and binding are read after every await: the closing pane read, and the closing census after it.
+it.each((["claude-code", "codex"] as const).flatMap(runtime => (["pane read", "census"] as const).flatMap(at => ([
+  ["the bound pane moves", (f: ReturnType<typeof fixture>) => f.registry.updateBinding(f.node.id, { tmuxPane: "%2" })],
+  ["a successor tenure starts", (f: ReturnType<typeof fixture>) => f.registry.mintOccupantTenure(f.node.id, "handover", "successor-native-id")],
+] as const).map(([label, change]) => [runtime, label, at, change] as const))))(
+  "expected %s identity refuses when %s during the closing %s", async (runtime, _label, at, change) => {
+  const f = fixture(runtime);
+  let panes = 0, censuses = 0;
+  vi.mocked(f.tmux.getPanePid).mockImplementation(async () => { if (at === "pane read" && ++panes === 3) change(f); return 10; });
+  vi.spyOn(ProcessCensus.prototype, "list").mockImplementation(async () => { if (at === "census" && ++censuses === 2) change(f); return paneRows(runtime); });
+  await expect(resolve(f)).rejects.toMatchObject({ code: "expected_identity_mismatch", message: "The occupant binding changed during the conditional operation." });
+  expect(at === "pane read" ? panes : censuses).toBeGreaterThanOrEqual(at === "pane read" ? 3 : 2);
+});
+
+// A Claude process the seat itself starts (a nested `claude -p`) is not part of a legacy verdict's chain.
+it("expected claude-code identity with a legacy verdict ignores a nested Claude without a session id", async () => {
+  const f = fixture(); legacyVerdict(f);
+  let calls = 0;
+  vi.spyOn(ProcessCensus.prototype, "list").mockImplementation(async () => calls++ === 0 ? paneRows("claude-code")
+    : [...paneRows("claude-code"), { pid: 40, ppid: 20, command: "claude -p summarize", startedAt: later() }]);
+  await expect(resolve(f)).resolves.toMatchObject({ identity: f.expected, path: f.records.get(A) });
+});
+
+it.each(["claude-code", "codex"] as const)("expected %s identity resolves with a legacy verdict and an unchanged pane", async runtime => {
+  const f = fixture(runtime); legacyVerdict(f);
+  await expect(resolve(f)).resolves.toMatchObject({ identity: f.expected, path: f.records.get(A) });
+});
 
 // Observe only the record fd, without counting unrelated module-loader reads.
 function recordReads(file: string, fail = false) {

@@ -239,10 +239,12 @@ export function startedBeforeVerdict(row: ProcessRow | undefined, observedAt: st
 /** The Codex process chain a generation-record read proved, from one census snapshot: every link from the verified native
  *  process (or, for a legacy verdict that names only the pane root, from each Codex under the pane) up to the pane root,
  *  by PID, parent, start time and command. A later snapshot with another value means a link was replaced or its PID
- *  reused in between. Children a Codex spawns for its tools aren't part of it. */
-export function codexPaneChain(processes: ProcessRow[], panePid: number, nativePid?: number): string {
+ *  reused in between. Children a Codex spawns for its tools aren't part of it. `isNative` names another runtime's
+ *  native process for a legacy verdict (Claude: `commandNamesClaude`). */
+export function codexPaneChain(processes: ProcessRow[], panePid: number, nativePid?: number,
+  isNative: (command: string) => boolean = commandBasenameIs("codex")): string {
   const byPid = new Map(processes.map((row) => [row.pid, row]));
-  const leaves = nativePid !== undefined ? [nativePid] : findDescendants(processes, panePid, commandBasenameIs("codex"));
+  const leaves = nativePid !== undefined ? [nativePid] : findDescendants(processes, panePid, isNative);
   return JSON.stringify(leaves.map((leaf) => {
     const chain: Array<[number, number, string | null, string]> = [];
     const seen = new Set<number>();

@@ -120,8 +120,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 type Permissions = "uncorrelated" | "turn_withdrawn" | "runner_turn_unbound" | "absent" | "deny" | "stale" | "revoked" | "broken" | "permitted" | "answer" | "words" | "saidno" | "unknown" | "readfail" | "pending" | "lost" | "late" | "two" | "twoslow";
 interface Hook { auth: string | undefined; body: Record<string, unknown>; at: number }
 
-const cleanups: Array<() => void> = [];
-afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
+const cleanups: Array<() => unknown> = [];
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
 async function fakeOpenRig(permissions: Permissions, turnReportingUnavailable = false) {
   const hooks: Hook[] = [];
@@ -213,7 +213,9 @@ function start(openrig: { url: string }, env: Record<string, string> = {}, binVa
   child.stdout!.on("data", (data: Buffer) => { out += data.toString(); });
   child.stderr!.on("data", (data: Buffer) => { out += data.toString(); });
   const exited = new Promise<number | null>((done) => child.on("exit", (code) => done(code)));
-  cleanups.push(() => { child.kill("SIGKILL"); rmSync(dir, { recursive: true, force: true }); });
+  // The agent the runner spawns shares its stderr and survives a SIGKILL, so `close` waits for both to stop writing into dir.
+  const closed = new Promise<void>((done) => child.on("close", () => done()));
+  cleanups.push(async () => { child.kill("SIGKILL"); await closed; rmSync(dir, { recursive: true, force: true }); });
   return {
     dir, exited,
     out: () => out,
