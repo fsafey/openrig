@@ -132,7 +132,7 @@ test("image-load success, failure and deadline all retain status and remove only
     // container surviving the client process until an explicit named removal.
     writeFileSync(join(root, "bin/node"), `#!${process.execPath}
 import {spawnSync} from 'node:child_process';const args=process.argv.slice(2);
-if(args[1]==='timeout')args[2]='0.4';
+if(args[1]==='timeout'&&args[3]==='docker'&&args[4]==='run')args[2]='0.4';
 const p=spawnSync(${JSON.stringify(process.execPath)},args,{stdio:'inherit'});process.exit(p.status??1);
 `, { mode: 0o755 });
     writeFileSync(join(root, "bin/docker"), `#!${process.execPath}
