@@ -1268,6 +1268,19 @@ export class RestoreOrchestrator {
     }));
   }
 
+  /** The same node's stored cwd when it differs from the snapshot's and is what its latest node.cwd_changed audit set. */
+  private auditedCwdSinceSnapshot(rigId: string, snapshotNode: PlanEntry["node"]): string | null {
+    const live = this.rigRepo.getRig(rigId)?.nodes.find(current => current.id === snapshotNode.id);
+    if (!live?.cwd || live.cwd === snapshotNode.cwd) return null;
+    const row = this.db.prepare("SELECT payload FROM events WHERE node_id = ? AND type = 'node.cwd_changed' ORDER BY seq DESC LIMIT 1")
+      .get(live.id) as { payload: string } | undefined;
+    try {
+      return row && (JSON.parse(row.payload) as { to?: unknown }).to === live.cwd ? live.cwd : null;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Restore one planned seat, checking continuity before launching its occupant.
    * Preserve prior state so a failed launch or resume can be compensated.
@@ -1283,6 +1296,16 @@ export class RestoreOrchestrator {
   ): Promise<RestoreNodeResult> {
     // `--cwd`: the seat launches, resumes and gets its guidance and checkpoint in the given directory, for this run only.
     if (opts?.cwdOverride) entry = { ...entry, node: { ...entry.node, cwd: opts.cwdOverride } };
+    else {
+      // A `rig seat set-cwd` since this snapshot is the seat's current launch setting, like its stored model: the same
+      // node resumes and launches there, not in the directory the snapshot saved. Anything less (no audit, an audit the
+      // stored cwd no longer matches, a recreated node) keeps the snapshot's directory as before.
+      const audited = this.auditedCwdSinceSnapshot(rigId, entry.node);
+      if (audited) {
+        warnings?.push(`Restore: ${entry.node.logicalId} launches in ${audited}, its working directory saved by rig seat set-cwd since this snapshot (which recorded ${entry.node.cwd ?? "none"}).`);
+        entry = { ...entry, node: { ...entry.node, cwd: audited } };
+      }
+    }
     // Compare against the live logical target without changing saved post-launch inputs.
     const node = entry.node;
     // Activity-hook restore gaps (#1530) are collected out-of-band: postLaunchRestore
