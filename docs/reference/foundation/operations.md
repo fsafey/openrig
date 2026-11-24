@@ -2,24 +2,30 @@
 
 ## Current runtime
 
-Since 2026-11-23 the instance runs published OpenRig **0.7.21** (`255fa708`),
-installed with:
+Since 2026-11-24 the instance runs a build of this fork's `main` on OpenRig
+**0.7.22**: the upstream release plus the fork's fixes, which upstream has not
+released yet. `rig-foundation --version` prints `0.7.22 (<commit>)`, naming the
+fork commit it was built from. Build and install it from a clean worktree at that
+commit, never from a working checkout:
 
 ```sh
-PATH=/opt/homebrew/opt/node@22/bin:$PATH npm install --global \
-  --prefix "$HOME/.local/share/openrig/0.7.21" @openrig/cli@0.7.21
+export PATH=/opt/homebrew/opt/node@22/bin:$PATH
+npm ci && npm run pack:release -- "$out"
+npm install --global --prefix "$HOME/.local/share/openrig/0.7.22-fork-<commit>" "$out"/<cli tarball>
 ```
 
-`$HOME/.local/bin/rig-foundation` keeps the wrapper shown below with the prefix
-`$HOME/.local/share/openrig/0.7.21`; port, homes and environment are unchanged.
-Start it with `rig-foundation daemon start --no-kernel`. The upgrade followed the
-release's "Before you upgrade" steps: a confirmed `Daemon stopped`, then a
-database and `-wal` backup beside the database as
-`openrig.sqlite.before-0.7.21-<UTC timestamp>`. The 0.6.10 prefixes remain for
-rollback, which needs that backup: a migrated database is not established on an
-older release. The pilot's `foundation` rig record was removed after the upgrade.
-Check `rig <command> --help` on the installed binary before reusing a command
-from the sections below.
+`$HOME/.local/bin/rig-foundation` keeps the wrapper shown below with that prefix;
+port, homes and environment are unchanged. To switch builds: run
+`rig-foundation daemon stop` until it confirms `Daemon stopped`, copy the database
+with its `-wal` and `-shm` files and the current wrapper to a dated folder under
+`$HOME/.local/state`, point the wrapper at the new prefix, then start it with
+`rig-foundation daemon start --no-kernel`. To roll back, stop the daemon and put
+the saved wrapper back. Earlier prefixes (0.7.21 builds, 0.6.10) remain, but a
+database a newer release migrated is not established on an older one, so a
+rollback across releases also restores that release's database backup. Every
+upstream release needs a fork sync before the next build. Check
+`rig <command> --help` on the installed binary before reusing a command from the
+sections below.
 
 ## October 2026 pilot (historical)
 

@@ -463,7 +463,7 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
     const metadata = await response.json();
     expect(metadata).toMatchObject({ runtime: "codex", sessionId: threadId, totalBytes: Buffer.byteLength(readFileSync(record)) });
     expect(metadata.suffix).toBeUndefined();
-    expect(CodexThreadIdResolver.prototype.resolveWithHome).toHaveBeenCalledWith(20, before);
+    expect(CodexThreadIdResolver.prototype.resolveWithHome).toHaveBeenCalledWith(20, before, true);
 
     const suffix = JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "fixture-turn" } }) + "\n";
     appendFileSync(record, suffix);
@@ -532,12 +532,15 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
       message: `The bound pane for 'dev-codex@codex-rig' no longer matches its verified occupant: its ${label} did not start before it was verified.` });
   });
 
-  it.each<[string, [string?, number?, number?], () => ReturnType<typeof paneRows>]>([
-    ["the verified native Codex process is replaced", [threadId, 20, 10], () => paneRows({ nativePid: 30 })],
-    ["a later process reuses the native Codex PID", [threadId, 20, 10], () => paneRows({ native: later() })],
-    ["a later process reuses the pane root PID", [threadId, 20, 10], () => paneRows({ root: later() })],
-    ["a legacy verdict's Codex child is replaced", [], () => paneRows({ nativePid: 30 })],
-  ])("Codex refuses when %s while its thread resolves", async (_case, seed, next) => {
+  // A changed native Codex process is refused by the resolver's after-read census; a reused pane root PID by the closing
+  // chain check.
+  const readCheck = "changed while its thread was read", chainCheck = "changed while resolving";
+  it.each<[string, [string?, number?, number?], () => ReturnType<typeof paneRows>, string]>([
+    ["the verified native Codex process is replaced", [threadId, 20, 10], () => paneRows({ nativePid: 30 }), readCheck],
+    ["a later process reuses the native Codex PID", [threadId, 20, 10], () => paneRows({ native: later() }), readCheck],
+    ["a later process reuses the pane root PID", [threadId, 20, 10], () => paneRows({ root: later() }), chainCheck],
+    ["a legacy verdict's Codex child is replaced", [], () => paneRows({ nativePid: 30 }), readCheck],
+  ])("Codex refuses when %s while its thread resolves", async (_case, seed, next, refusal) => {
     const { url } = seedCodex(...seed);
     vi.mocked(CodexThreadIdResolver.prototype.resolveWithHome).mockImplementation(async () => {
       vi.mocked(ProcessCensus.prototype.list).mockResolvedValue(next());
@@ -545,7 +548,7 @@ describe("GET /api/sessions/:sessionName/generation-record — the consumption-b
     });
     const response = await app.request(url);
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ error: "record_identity_unverified", message: expect.stringContaining("changed while resolving") });
+    expect(await response.json()).toMatchObject({ error: "record_identity_unverified", message: expect.stringContaining(refusal) });
   });
 
   it.each<[string, (nodeId: string) => void]>([
