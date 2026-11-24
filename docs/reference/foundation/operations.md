@@ -1,6 +1,29 @@
 # Foundation operations
 
-This run uses published OpenRig **0.6.10**, build
+## Current runtime
+
+Since 2026-11-23 the instance runs published OpenRig **0.7.21** (`255fa708`),
+installed with:
+
+```sh
+PATH=/opt/homebrew/opt/node@22/bin:$PATH npm install --global \
+  --prefix "$HOME/.local/share/openrig/0.7.21" @openrig/cli@0.7.21
+```
+
+`$HOME/.local/bin/rig-foundation` keeps the wrapper shown below with the prefix
+`$HOME/.local/share/openrig/0.7.21`; port, homes and environment are unchanged.
+Start it with `rig-foundation daemon start --no-kernel`. The upgrade followed the
+release's "Before you upgrade" steps: a confirmed `Daemon stopped`, then a
+database and `-wal` backup beside the database as
+`openrig.sqlite.before-0.7.21-<UTC timestamp>`. The 0.6.10 prefixes remain for
+rollback, which needs that backup: a migrated database is not established on an
+older release. The pilot's `foundation` rig record was removed after the upgrade.
+Check `rig <command> --help` on the installed binary before reusing a command
+from the sections below.
+
+## October 2026 pilot (historical)
+
+The rest of this document records the pilot. It used published OpenRig **0.6.10**, build
 `3001cc436656c435e54425443e708e3e2d8c7d68`, built 2026-10-11T22:36:45Z.
 The development checkout began at `68fafba04e9838f2c5c79b9cbd2583d221475298`.
 They are different revisions. Commands below were checked against the installed
@@ -162,7 +185,7 @@ Inspect the snapshot selection, target, non-target effects, result, native
 conversation ID, and queue ownership. `launch` requires the rig ID in this
 release; the name `foundation` was refused. `up foundation --existing` was also
 refused while the reviewer remained live. Neither refusal changed the team.
-There is no installed `seat restart --keep-conversation` command.
+Release 0.6.10 had no `seat restart --keep-conversation` command; 0.7.21 provides it.
 
 Do not assume that automatic snapshot selection preserves the conversation.
 The cold-handoff launch selected a snapshot captured after the writer had stopped.

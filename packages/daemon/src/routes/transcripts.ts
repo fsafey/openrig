@@ -1,3 +1,4 @@
+import { savedSessionName } from "../domain/session-registry.js";
 import { Hono } from "hono";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "../domain/rig-repository.js";
@@ -5,6 +6,7 @@ import type { TranscriptIngestHealth, TranscriptStore } from "../domain/transcri
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import { startTmuxTranscriptCapture } from "../domain/transcript-capture.js";
 import { redactTranscriptContent } from "../domain/transcript-redaction.js";
+import { TranscriptGrepTimeoutError } from "../domain/transcript-grep.js";
 
 interface SessionRow {
   node_id: string;
@@ -159,7 +161,7 @@ export function transcriptRoutes(): Hono {
     const db = c.get("db" as never) as Database.Database;
     const rigRepo = c.get("rigRepo" as never) as RigRepository;
     const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter | undefined;
-    const sessionName = c.req.param("session");
+    let sessionName = c.req.param("session");
     const rawLines = parseInt(c.req.query("lines") ?? "50", 10);
     const lines = isNaN(rawLines) || rawLines < 1 ? 50 : rawLines;
 
@@ -170,6 +172,7 @@ export function transcriptRoutes(): Hono {
       );
     }
 
+    sessionName = savedSessionName(db, sessionName);
     const resolution = resolveSessionToRig(db, rigRepo, sessionName);
     if ("error" in resolution) {
       return c.json({ error: resolution.error }, resolution.status as 404);
@@ -207,12 +210,17 @@ export function transcriptRoutes(): Hono {
     const db = c.get("db" as never) as Database.Database;
     const rigRepo = c.get("rigRepo" as never) as RigRepository;
     const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter | undefined;
-    const sessionName = c.req.param("session");
+    let sessionName = c.req.param("session");
     const pattern = c.req.query("pattern");
 
     if (!pattern) {
       return c.json({ error: "Missing required query parameter: pattern" }, 400);
     }
+
+    // The scan runs the caller's regular expression over every line, so it happens on its own thread with
+    // a deadline: on the daemon's thread a catastrophic pattern would stop every other request and every
+    // sweep (domain/transcript-grep.ts). The pattern itself is not bounded here; a long regex is the
+    // caller's to write, and the deadline is what keeps it from costing the daemon.
 
     // Pre-validate regex
     try {
@@ -231,6 +239,7 @@ export function transcriptRoutes(): Hono {
       );
     }
 
+    sessionName = savedSessionName(db, sessionName);
     const resolution = resolveSessionToRig(db, rigRepo, sessionName);
     if ("error" in resolution) {
       return c.json({ error: resolution.error }, resolution.status as 404);
@@ -247,7 +256,16 @@ export function transcriptRoutes(): Hono {
       );
     }
 
-    const matches = transcriptStore.grep(resolution.rigName, sessionName, pattern);
+    let matches: string[] | null;
+    try {
+      matches = await transcriptStore.grep(resolution.rigName, sessionName, pattern);
+    } catch (err) {
+      // A scan that outlived its bound was ended; the request answers honestly instead of holding.
+      if (err instanceof TranscriptGrepTimeoutError) {
+        return c.json({ error: `Grep scan ended: ${err.message}. Try a narrower pattern.` }, 504);
+      }
+      throw err;
+    }
     if (matches === null) {
       return c.json({ error: transcriptIngestError(sessionName, ingestHealth), ingestHealth }, 503);
     }
@@ -257,8 +275,8 @@ export function transcriptRoutes(): Hono {
 
   // GET /:session/full — return the full transcript content for a session.
   //
-  // Per orch decision approved-option-a (escalation
-  // qitem-20260502020833-68e4eca3): this route adopts the existing
+  // Per orch decision approved-option-a (escalation):
+  // this route adopts the existing
   // tail/grep posture (open route, daemon-local trust boundary). No
   // session-scoped auth is enforced because no caller-identity primitive
   // exists in the daemon today. Route-level redaction (M1 contract § 4 /
@@ -273,7 +291,7 @@ export function transcriptRoutes(): Hono {
     const db = c.get("db" as never) as Database.Database;
     const rigRepo = c.get("rigRepo" as never) as RigRepository;
     const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter | undefined;
-    const sessionName = c.req.param("session");
+    let sessionName = c.req.param("session");
 
     if (!transcriptStore?.enabled) {
       return c.json(
@@ -282,6 +300,7 @@ export function transcriptRoutes(): Hono {
       );
     }
 
+    sessionName = savedSessionName(db, sessionName);
     const resolution = resolveSessionToRig(db, rigRepo, sessionName);
     if ("error" in resolution) {
       return c.json({ error: resolution.error }, resolution.status as 404);

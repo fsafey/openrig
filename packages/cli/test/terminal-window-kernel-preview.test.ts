@@ -1,6 +1,6 @@
 // Real daemon routes, kernel composition/plan hashing, both clients and the window opener.
 // HTTP stays in-process; provider availability, tmux commands and desktop launching are simulated.
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import { DaemonClient as CliClient } from "../src/client.js";
 import { openTerminalWindow, type WindowDeps } from "../src/terminal-window.js";
@@ -8,6 +8,8 @@ import { DaemonClient as TuiClient } from "../../tui/src/daemon-client.js";
 import { terminalRoutes } from "../../daemon/src/routes/terminal.js";
 import { TerminalService } from "../../daemon/src/domain/terminal/terminal-service.js";
 import type { TerminalProvider } from "../../daemon/src/domain/terminal/terminal-provider.js";
+
+vi.mock("../src/local-origin.js", () => ({ readLocalOrigin: () => "window-fixture" }));
 
 const stdoutDescriptors = Object.getOwnPropertyDescriptors(process.stdout);
 function terminalWidth(columns?: number): void {
@@ -39,11 +41,13 @@ function fixture() {
     resolveHost: () => null, hasSession: name => alive.has(name), resolveLocalTmux: () => "/fixture/tmux",
   } as ConstructorParameters<typeof TerminalService>[0]);
   const app = new Hono();
+  app.get("/healthz", c => c.json({ selfHostId: "window-fixture" }));
   app.use("*", async (c, next) => { c.set("terminalService" as never, service); await next(); });
   app.route("/api/terminal", terminalRoutes());
   const fetchImpl: typeof fetch = async (url, init) => app.request(String(url), init);
   const baseUrl = "http://127.0.0.1:7433";
   const launched: string[] = [], commands: string[][] = [];
+  let pane = 0, window = 0;
   const deps: WindowDeps = {
     columns: async () => process.stdout.columns,
     platform: "darwin", env: { TERM_PROGRAM: "Apple_Terminal", HOME: "/fixture/home" }, exists: () => false,
@@ -56,7 +60,12 @@ function fixture() {
       commands.push(args);
       if (args.includes("default-size")) return "160x40";
       if (args.includes("window-size")) return "latest";
-      return "%1";
+      if (args.includes("#{session_id}|#{window_id}|#{pane_id}")) {
+        if (args.includes("new-session") || args.includes("new-window")) window++;
+        return `$1|@${window}|%${++pane}`;
+      }
+      if (args.includes("#{pane_id}")) return `%${++pane}`;
+      return "";
     },
     launch: async () => {}, sleep: async () => {}, id: () => "fixture",
   };

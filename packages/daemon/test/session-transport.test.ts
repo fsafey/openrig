@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type Database from "better-sqlite3";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
+import { join } from "node:path";
+import { SettingsStore } from "../src/domain/user-settings/settings-store.js";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
 import { coreSchema } from "../src/db/migrations/001_core_schema.js";
@@ -15,20 +20,37 @@ import { agentspecRebootSchema } from "../src/db/migrations/014_agentspec_reboot
 import { externalCliAttachmentSchema } from "../src/db/migrations/019_external_cli_attachment.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
-import { classifyPaneActivity, classifyStyledFrame, hasExpectedStagedText, inspectStartupStagedText, probeSessionActivity, promptTextIsFaint, SessionTransport, type TransportReadinessChecker } from "../src/domain/session-transport.js";
+import { classifyPaneActivity, classifyStyledFrame, draftDeliveryAllows, readDraftDeliverySetting, hasExpectedStagedText, inspectStartupStagedText, probeSessionActivity, promptTextIsFaint, SessionTransport, writtenFact, type TransportReadinessChecker } from "../src/domain/session-transport.js";
+import { readSendOutcome } from "../src/domain/connection-contract.js";
 import { SeatDeliveryGuard, resolveGuardTarget, type GuardTarget } from "../src/domain/seat-delivery-guard.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
 import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import { EventBus } from "../src/domain/event-bus.js";
+import { QueueRepository } from "../src/domain/queue-repository.js";
+import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { getNodeInventory } from "../src/domain/node-inventory.js";
 import type { TmuxAdapter, TmuxResult } from "../src/adapters/tmux.js";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { StartupOrchestrator } from "../src/domain/startup-orchestrator.js";
-import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
+import { assessNativeResumeProbe } from "../src/domain/native-resume-probe.js";
+import type { NodeBinding, RuntimeAdapter } from "../src/domain/runtime-adapter.js";
+import { recordRotation, requestedToken, rotatedToken, rotation, rowsWith as claudeRows, seat as claudeSeat } from "./helpers/claude-sweeper-seat.js";
 
 describe("agent pane activity classifier", () => {
+  const currentClaudeUpdateLayout = (prompt: string, lastRow = "/rc", status = "● Ready.") => [
+    status,
+    "",
+    `${"─".repeat(40)} operator-agent@kernel ──`,
+    prompt,
+    "─".repeat(80),
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent · 1 feedback draft",
+    "                                                                    911918 tokens",
+    "  current: 2.1.310 · latest: 2.1.311 ✔ Update installed · Restart to update",
+    lastRow,
+  ].join("\n");
+
   it("classifies active Working pane as agent_active", () => {
     const result = classifyPaneActivity("Working on task...\n⠋ Processing files\nesc to interrupt");
 
@@ -220,6 +242,23 @@ describe("agent pane activity classifier", () => {
 
     expect(result.state).toBe("agent_idle");
     expect(result.reason).toBe("idle_status_bar");
+  });
+
+  it("classifies the current Claude update-installed layout with its empty prompt as idle (#1641)", () => {
+    const result = classifyPaneActivity(currentClaudeUpdateLayout("❯ "), { runtime: "claude-code" });
+
+    expect(result).toMatchObject({ state: "agent_idle", reason: "idle_prompt" });
+  });
+
+  it("keeps Claude drafts, active turns, and unknown trailing rows out of the idle state (#1641)", () => {
+    const draft = classifyPaneActivity(currentClaudeUpdateLayout("❯ deploy the release"), { runtime: "claude-code" });
+    expect(draft.state).not.toBe("agent_idle");
+
+    const active = classifyPaneActivity(currentClaudeUpdateLayout("❯ ", "/rc", "✻ Thinking… (2m 38s · ↓ 10.9k tokens · thought for 8s)"), { runtime: "claude-code" });
+    expect(active).toMatchObject({ state: "agent_active", reason: "mid_work_pattern" });
+
+    const unknown = classifyPaneActivity(currentClaudeUpdateLayout("❯ ", "unrecognized output"), { runtime: "claude-code" });
+    expect(unknown).toMatchObject({ state: "unknown", reason: "no_activity_signal" });
   });
 
   it("classifies typed Claude prompt text above an idle footer as attention, not idle", () => {
@@ -492,6 +531,7 @@ function mockTmux(overrides?: Partial<{
   sendText: (target: string, text: string) => Promise<TmuxResult>;
   sendKeys: (target: string, keys: string[]) => Promise<TmuxResult>;
   capturePaneContent: (paneId: string, lines?: number) => Promise<string | null>;
+  listPanes: (sessionName: string) => Promise<Array<{ id: string }>>;
   getPaneCommand: (paneId: string) => Promise<string | null>;
   isPaneInMode: (paneId: string) => Promise<boolean | null>;
   cancelPaneMode: (target: string) => Promise<TmuxResult>;
@@ -510,7 +550,7 @@ function mockTmux(overrides?: Partial<{
     killSession: async () => ({ ok: true as const }),
     listSessions: async () => [],
     listWindows: async () => [],
-    listPanes: async () => [],
+    listPanes: overrides?.listPanes ?? (async () => []),
     startPipePane: async () => ({ ok: true as const }),
     stopPipePane: async () => ({ ok: true as const }),
     getPanePid: async () => null,
@@ -542,6 +582,7 @@ describe("SessionTransport", () => {
     now?: () => Date;
     eventBus?: EventBus;
     runtimeAdapters?: Record<string, TransportReadinessChecker>;
+    deliverOverDraft?: () => boolean;
   }) {
     return new SessionTransport({
       db,
@@ -574,6 +615,84 @@ describe("SessionTransport", () => {
     return { rig, node, session };
   }
 
+  it("community contract: a successful queue wake passes through the transport once", async () => {
+    const { session } = seedCanonicalRig("synth");
+    sessionRegistry.recordCommunityHarnessSelection(session.id, "synth");
+    let screen = "custom harness screen";
+    const sendText = vi.fn(async (_target: string, text: string) => { screen = text; return { ok: true as const }; });
+    const sendKeys = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ getPaneCommand: async () => "node", capturePaneContent: async () => screen, sendText, sendKeys }),
+      { sleep: async () => {} });
+    const queue = new QueueRepository(db, new EventBus(db), { transport, validateRig: () => true });
+    const item = await queue.create({ sourceSession: "sender@my-rig", destinationSession: "dev-impl@my-rig", body: "assigned task", nudge: false });
+    await queue.maybeNudge(item.qitemId, item.destinationSession, true, item.sourceSession);
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(sendText.mock.calls[0]![1]).toContain(item.qitemId);
+    expect(sendKeys).toHaveBeenCalledTimes(1);
+    expect(sendKeys.mock.calls[0]).toEqual(["dev-impl@my-rig", ["Enter"]]);
+    expect(queue.getById(item.qitemId)?.lastNudgeResult).toBe("verified");
+  });
+
+  it.each(["typed", "native"])("%s input with a delivery ID keeps the outbox optional without a guard", async route => {
+    const { node } = seedCanonicalRig();
+    db.prepare("UPDATE nodes SET input_route = ? WHERE id = ?").run(route, node.id);
+    expect(db.prepare("PRAGMA table_info(outbox_entries)").all()).toEqual([]);
+    const sendText = vi.fn(async () => ({ ok: true as const }));
+    const sendKeys = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ sendText, sendKeys }), { sleep: async () => {} });
+
+    const result = await transport.send("dev-impl@my-rig", "optional history", { deliveryId: "optional-history" });
+
+    if (route === "typed") {
+      expect(result.ok).toBe(true);
+      expect(sendText).toHaveBeenCalledOnce();
+      expect(sendKeys).toHaveBeenCalledOnce();
+    } else {
+      expect(result).toMatchObject({ ok: false, sent: false, reason: "guard_unavailable" });
+      expect(sendText).not.toHaveBeenCalled();
+      expect(sendKeys).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([true, false])("a native member with primary present=%s never falls back to unguarded typed input", async primaryPresent => {
+    migrate(db, ALL_MIGRATIONS);
+    const { node } = seedCanonicalRig();
+    const outbox = new OutboxHandler(db);
+    const input = { senderSession: "sender", destinationSession: "dev-impl@my-rig", body: "retained native" };
+    for (const outboxId of ["native-owner", "native-member"]) outbox.record({ ...input, outboxId });
+    outbox.admitRunner({ ...input, outboxId: "native-owner", nodeId: node.id, runId: "run-one", kind: "input",
+      inputRoute: "native", payload: { text: input.body }, memberIds: ["native-owner", "native-member"] });
+    if (!primaryPresent) db.prepare("DELETE FROM outbox_entries WHERE outbox_id = 'native-owner'").run();
+    const sendText = vi.fn(async () => ({ ok: true as const }));
+    const sendKeys = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ sendText, sendKeys }), { sleep: async () => {} });
+
+    const result = await transport.send(input.destinationSession, input.body, { deliveryId: "native-member", actorSession: input.senderSession });
+
+    expect(result).toMatchObject(primaryPresent
+      ? { ok: true, runnerReceipt: { requestId: "native-owner", stage: "pending" } }
+      : { ok: false, reason: "native_receipt_unavailable" });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendKeys).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a shell", "bash", "shell prompt", "target_runtime_unverified"],
+    ["a numbered choice", "node", "› 1. Yes, continue\n  2. No, cancel\n\nPress enter to continue", "target_needs_input"],
+  ])("community contract: refuses %s without pasting text or pressing Enter", async (_label, command, screen, reason) => {
+    const { session } = seedCanonicalRig("synth");
+    sessionRegistry.recordCommunityHarnessSelection(session.id, "synth");
+    const sendText = vi.fn(async () => ({ ok: true as const }));
+    const sendKeys = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ getPaneCommand: async () => command,
+      capturePaneContent: async () => screen, sendText, sendKeys }));
+    const result = await transport.send("dev-impl@my-rig", "ordinary work");
+    expect(result).toMatchObject({ ok: false, reason });
+    expect(result.sent).not.toBe(true);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendKeys).not.toHaveBeenCalled();
+  });
+
   function seedExternalCliRig() {
     const rig = rigRepo.createRig("rigged-buildout");
     const node = rigRepo.addNode(rig.id, "orch1.lead", {
@@ -603,6 +722,135 @@ describe("SessionTransport", () => {
     expect(callOrder).toEqual(["sendText", "sendKeys:Enter"]);
   });
 
+  describe("transport.draft_delivery: a person's draft at the prompt", () => {
+    const DRAFT = ["❯ I am still typing a message", "  ⏵⏵ accept edits on (shift+tab to cycle)"].join("\n");
+    function draftPane(capture = DRAFT) {
+      const callOrder: string[] = [];
+      const tmux = mockTmux({
+        capturePaneContent: async () => capture,
+        sendText: async (_t, text) => { callOrder.push(`sendText:${text}`); return { ok: true }; },
+        sendKeys: async (_t, keys) => { callOrder.push(`sendKeys:${keys.join(",")}`); return { ok: true }; },
+      });
+      return { tmux, callOrder };
+    }
+
+    it("refuses when the setting is refuse, the opt-out", async () => {
+      seedCanonicalRig();
+      const { tmux, callOrder } = draftPane();
+      const result = await createTransport(tmux, { deliverOverDraft: () => false }).send("dev-impl@my-rig", "hello");
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", sent: false, activity: { reason: "prompt_draft" } });
+      expect(callOrder).toEqual([]);
+    });
+
+    it("keeps refusing in a transport built without the daemon's setting reader", async () => {
+      seedCanonicalRig();
+      const { tmux, callOrder } = draftPane();
+      const result = await createTransport(tmux).send("dev-impl@my-rig", "hello");
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", sent: false, activity: { reason: "prompt_draft" } });
+      expect(callOrder).toEqual([]);
+    });
+
+    it("pastes into the draft at the cursor and sends Enter for the combined input when the setting is deliver", async () => {
+      seedCanonicalRig();
+      const { tmux, callOrder } = draftPane();
+      const result = await createTransport(tmux, { deliverOverDraft: () => true }).send("dev-impl@my-rig", "hello");
+      expect(result).toMatchObject({ ok: true });
+      expect(callOrder).toEqual(["sendText:hello", "sendKeys:Enter"]);
+      expect(result.warning).toContain("transport.draft_delivery is deliver");
+    });
+
+    it("still refuses a numbered choice under deliver: a message never answers a menu", async () => {
+      seedCanonicalRig();
+      const { tmux, callOrder } = draftPane(["› 1. Yes, continue", "  2. Yes, allow all tools", "  3. No, cancel"].join("\n"));
+      const result = await createTransport(tmux, { deliverOverDraft: () => true }).send("dev-impl@my-rig", "hello");
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", activity: { state: "needs_input", reason: "selection_prompt" } });
+      expect(callOrder).toEqual([]);
+    });
+
+    it("still refuses a hook-reported permission prompt under deliver, even over a draft-shaped pane", async () => {
+      seedCanonicalRig();
+      const eventBus = new EventBus(db);
+      const agentActivityStore = new AgentActivityStore({ db, eventBus });
+      agentActivityStore.recordHookEvent({ runtime: "claude-code", sessionName: "dev-impl@my-rig", hookEvent: "Notification", subtype: "permission_prompt" });
+      const { tmux, callOrder } = draftPane();
+      const result = await createTransport(tmux, { agentActivityStore, deliverOverDraft: () => true }).send("dev-impl@my-rig", "hello");
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", activity: { state: "needs_input", evidenceSource: "runtime_hook" } });
+      expect(callOrder).toEqual([]);
+    });
+
+    it("keeps refusing a send that must not join a draft (managed compaction's preserveInput)", async () => {
+      seedCanonicalRig();
+      const { tmux, callOrder } = draftPane();
+      const result = await createTransport(tmux, { deliverOverDraft: () => true }).send("dev-impl@my-rig", "/compact", { preserveInput: true });
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", activity: { reason: "prompt_draft" } });
+      expect(callOrder).toEqual([]);
+    });
+
+    it("keeps waiting for idle when the caller asked to wait", async () => {
+      seedCanonicalRig();
+      const { tmux, callOrder } = draftPane();
+      const transport = createTransport(tmux, { deliverOverDraft: () => true, sleep: async () => undefined, waitForIdlePollMs: 1 });
+      const result = await transport.send("dev-impl@my-rig", "hello", { waitForIdleMs: 50 });
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input", sent: false });
+      expect(callOrder).toEqual([]);
+    });
+
+    it("reads the setting as the daemon does: only a readable refuse opts out of the deliver default", () => {
+      expect(draftDeliveryAllows(() => "refuse")).toBe(false);
+      expect(draftDeliveryAllows(() => "deliver")).toBe(true);
+      expect(draftDeliveryAllows(() => undefined)).toBe(true);
+      expect(draftDeliveryAllows(() => "something-else")).toBe(true);
+      expect(draftDeliveryAllows(() => { throw new Error("settings unreadable"); })).toBe(true);
+    });
+
+    it("honours an explicit environment refuse when config.json can't be parsed (the real settings reader)", () => {
+      const dir = mkdtempSync(join(tmpdir(), "draft-delivery-settings-"));
+      try {
+        const malformed = join(dir, "config.json");
+        writeFileSync(malformed, "{ not json");
+        const store = new SettingsStore(malformed);
+        const fromStore = () => store.resolveOne("transport.draft_delivery").value;
+        // The store reads the file before its environment override, so it throws here whatever the environment says.
+        expect(fromStore).toThrow(/malformed/);
+        expect(draftDeliveryAllows(() => readDraftDeliverySetting(fromStore, { OPENRIG_TRANSPORT_DRAFT_DELIVERY: "refuse" }))).toBe(false);
+        // A padded value isn't one the store accepts, so it goes to the store, as the store's own resolver would.
+        expect(draftDeliveryAllows(() => readDraftDeliverySetting(fromStore, { OPENRIG_TRANSPORT_DRAFT_DELIVERY: " refuse " }))).toBe(true);
+        // No valid opt-out: an unreadable file and an invalid environment value both follow the deliver default.
+        expect(draftDeliveryAllows(() => readDraftDeliverySetting(fromStore, {}))).toBe(true);
+        expect(draftDeliveryAllows(() => readDraftDeliverySetting(fromStore, { OPENRIG_TRANSPORT_DRAFT_DELIVERY: "maybe" }))).toBe(true);
+
+        // A readable file's refuse still applies without an environment value, and the environment outranks it.
+        const readable = join(dir, "readable.json");
+        writeFileSync(readable, JSON.stringify({ transport: { draftDelivery: "refuse" } }));
+        const fileStore = new SettingsStore(readable);
+        const fromFile = () => fileStore.resolveOne("transport.draft_delivery").value;
+        expect(draftDeliveryAllows(() => readDraftDeliverySetting(fromFile, {}))).toBe(false);
+        expect(draftDeliveryAllows(() => readDraftDeliverySetting(fromFile, { OPENRIG_TRANSPORT_DRAFT_DELIVERY: "deliver" }))).toBe(true);
+        // A padded environment value doesn't defeat the file's refuse: the store's own resolver rejects it (it reads the
+        // real environment) and reads the file, and the early read defers to it.
+        const saved = process.env.OPENRIG_TRANSPORT_DRAFT_DELIVERY;
+        process.env.OPENRIG_TRANSPORT_DRAFT_DELIVERY = " deliver ";
+        try {
+          expect(fileStore.resolveOne("transport.draft_delivery")).toMatchObject({ value: "refuse", source: "file" });
+          expect(draftDeliveryAllows(() => readDraftDeliverySetting(fromFile))).toBe(false);
+        } finally {
+          if (saved === undefined) delete process.env.OPENRIG_TRANSPORT_DRAFT_DELIVERY;
+          else process.env.OPENRIG_TRANSPORT_DRAFT_DELIVERY = saved;
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps refusing when a transport's own reader throws (the daemon's reader never does)", async () => {
+      seedCanonicalRig();
+      const { tmux, callOrder } = draftPane();
+      const result = await createTransport(tmux, { deliverOverDraft: () => { throw new Error("settings unreadable"); } }).send("dev-impl@my-rig", "hello");
+      expect(result).toMatchObject({ ok: false, reason: "target_needs_input" });
+      expect(callOrder).toEqual([]);
+    });
+  });
+
   describe("#331: pane in tmux copy mode", () => {
     // A pane that stays in its mode until cancelPaneMode runs, recording every call in order.
     function modalPane(opts: { leaves: boolean; callOrder: string[]; capture?: string }) {
@@ -626,6 +874,40 @@ describe("SessionTransport", () => {
       expect(callOrder).toEqual(["cancelPaneMode", "sendText", "sendKeys:Enter"]);
     });
 
+    it("leaves the mode through the seat's address when a stale binding elsewhere names the same pane", async () => {
+      const { node } = seedCanonicalRig();
+      sessionRegistry.updateBinding(node.id, { tmuxPane: "%27" });
+      // tmux reuses pane ids after a server restart: another rig's binding can still name %27.
+      const studio = rigRepo.createRig("studio-build");
+      const stale = rigRepo.addNode(studio.id, "sdk.impl", { role: "worker", runtime: "claude-code" });
+      sessionRegistry.registerSession(stale.id, "sdk-impl@studio-build");
+      sessionRegistry.updateBinding(stale.id, { tmuxSession: "sdk-impl@studio-build", tmuxPane: "%27" });
+      // The guard can't resolve the raw pane id to one seat, so a write addressed to it is refused before any key.
+      expect(resolveGuardTarget(db, "%27")).toBeNull();
+      expect(resolveGuardTarget(db, "dev-impl@my-rig")).toMatchObject({ nodeId: node.id, pane: "%27" });
+      const callOrder: string[] = [];
+      const tmux = modalPane({ leaves: true, callOrder });
+      const modeReads: string[] = [];
+      let left = false;
+      tmux.isPaneInMode = vi.fn(async (target: string) => { modeReads.push(target); return !left; });
+      const cancelTargets: string[] = [];
+      // As the adapter's guarded write does: an unresolvable target writes nothing, so the pane stays in its mode.
+      tmux.cancelPaneMode = vi.fn(async (target: string) => {
+        cancelTargets.push(target); callOrder.push("cancelPaneMode");
+        if (!resolveGuardTarget(db, target)) return { ok: false as const, code: "guard_target_unknown", message: `Cannot establish managed input target ${target}; no input written.` };
+        left = true;
+        return { ok: true as const };
+      });
+      const transport = createTransport(tmux);
+
+      const result = await transport.send("dev-impl@my-rig", "hello");
+      // The person's harm first: the message is delivered and submitted, not refused as pane_in_mode.
+      expect(result).toMatchObject({ ok: true });
+      expect(callOrder).toEqual(["cancelPaneMode", "sendText", "sendKeys:Enter"]);
+      expect(cancelTargets).toEqual(["dev-impl@my-rig"]);
+      expect(modeReads.every(target => target === "%27")).toBe(true);
+    });
+
     it("leaves the mode before a submitOnly Enter", async () => {
       seedCanonicalRig();
       const callOrder: string[] = [];
@@ -636,6 +918,22 @@ describe("SessionTransport", () => {
       expect(callOrder).toEqual(["cancelPaneMode", "sendKeys:Enter"]);
     });
 
+    it("reports an unconfirmed submitOnly Enter after the key write was attempted", async () => {
+      seedCanonicalRig();
+      const tmux = modalPane({ leaves: true, callOrder: [], capture: "❯ staged message" });
+      let submits = 0;
+      tmux.sendKeys = vi.fn(async (_target, _keys, beforeInput) => {
+        beforeInput?.();
+        submits++;
+        return { ok: false as const, code: "unknown", message: "response lost" };
+      });
+      const result = await createTransport(tmux).send("dev-impl@my-rig", "", { submitOnly: true, expectedStagedText: "staged message" });
+      expect(submits).toBe(1);
+      expect(result).toMatchObject({ ok: false, inputPhase: "attempted" });
+      expect(result.error).toContain("unconfirmed");
+      expect(result.error).not.toContain("did not land");
+    });
+
     it("types nothing when the pane cannot leave the mode", async () => {
       seedCanonicalRig();
       const callOrder: string[] = [];
@@ -644,6 +942,19 @@ describe("SessionTransport", () => {
       const result = await transport.send("dev-impl@my-rig", "hello");
       expect(result).toMatchObject({ ok: false, reason: "pane_in_mode", sent: false });
       expect(result.error).toContain("could not leave it");
+      expect(result.error).toContain("No text was sent.");
+      expect(callOrder).toEqual(["cancelPaneMode"]);
+    });
+
+    it("says why leaving the mode failed when tmux or the input guard refused it", async () => {
+      seedCanonicalRig();
+      const callOrder: string[] = [];
+      const tmux = modalPane({ leaves: false, callOrder });
+      tmux.cancelPaneMode = async () => { callOrder.push("cancelPaneMode"); return { ok: false, code: "unknown", message: "not in a mode" }; };
+
+      const result = await createTransport(tmux).send("dev-impl@my-rig", "hello");
+      expect(result).toMatchObject({ ok: false, reason: "pane_in_mode", sent: false });
+      expect(result.error).toContain("Leaving it failed: not in a mode.");
       expect(result.error).toContain("No text was sent.");
       expect(callOrder).toEqual(["cancelPaneMode"]);
     });
@@ -724,8 +1035,8 @@ describe("SessionTransport", () => {
     const result = await transport.send("dev-impl@my-rig", "hello");
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("submit_failed");
-    expect(result.error).toContain("visible");
-    expect(result.error).toContain("not submitted");
+    expect(result.error).toContain("the Enter reported a failure");
+    expect(result.error).toContain("submission outcome is unconfirmed");
   });
 
   // Test 6: send with verify captures pane and checks for text
@@ -1115,6 +1426,39 @@ describe("SessionTransport", () => {
     expect(submitFailed.outcome).toBe("failed");
   });
 
+  it.each(["draft_input_busy", "draft_input_unknown", "draft_input_changed"])(
+    "a %s refusal at the text step is labeled not_reached and sends no Enter (fake receipt, not a real-guard proof)", async (code) => {
+    seedCanonicalRig();
+    const keys: string[][] = [];
+    const tmux = mockTmux({
+      sendText: async () => ({ ok: false, code, message: "held by the guard" }),
+      sendKeys: async (_target, k) => { keys.push(k); return { ok: true as const }; },
+    });
+    const result = await createTransport(tmux).send("dev-impl@my-rig", "hello");
+    expect(result).toMatchObject({ ok: false, reason: code, outcome: "failed", sent: false, inputPhase: "not_reached" });
+    expect(keys).toEqual([]);
+  });
+
+  it("a draft refusal of Enter after a successful paste stays written with sent:true", async () => {
+    seedCanonicalRig();
+    const texts: string[] = [];
+    const tmux = mockTmux({
+      sendText: async (_target, text) => { texts.push(text); return { ok: true as const }; },
+      sendKeys: async () => ({ ok: false, code: "draft_input_changed", message: "Enter was not sent." }),
+    });
+    const result = await createTransport(tmux).send("dev-impl@my-rig", "hello");
+    expect(texts).toEqual(["hello"]);
+    expect(result).toMatchObject({ ok: false, reason: "draft_input_changed", outcome: "failed", sent: true, inputPhase: "written" });
+  });
+
+  it("a generic failed text write stays attempted, never not_reached", async () => {
+    seedCanonicalRig();
+    const tmux = mockTmux({ sendText: async () => ({ ok: false, code: "session_not_found", message: "gone" }) });
+    const result = await createTransport(tmux).send("dev-impl@my-rig", "hello");
+    expect(result).toMatchObject({ ok: false, reason: "send_failed", inputPhase: "attempted" });
+    expect(result.sent).toBeUndefined();
+  });
+
   it("send without verify carries no outcome field (additive, verify-scoped)", async () => {
     seedCanonicalRig();
     const transport = createTransport(mockTmux());
@@ -1125,8 +1469,8 @@ describe("SessionTransport", () => {
 
   // Test 7: send with mid-work detected → DELIVER WITH ADVISORY (OPR.0.4.3.28 fast-follow —
   // mid_work downgraded from a hard refuse to a non-blocking advisory; busy is not a block).
-  it("send with mid-work detected DELIVERS with a non-blocking advisory (not a refusal)", async () => {
-    seedCanonicalRig();
+  it.each(["codex", "claude-code"])("%s send with mid-work detected DELIVERS with a non-blocking advisory (not a refusal)", async (runtime) => {
+    seedCanonicalRig(runtime);
     const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
     const tmux = mockTmux({
       capturePaneContent: async () => "Working on task...\n⠋ Processing files\nesc to interrupt",
@@ -1138,6 +1482,13 @@ describe("SessionTransport", () => {
     expect(result.ok).toBe(true);
     expect(result.warning).toContain("mid-task");
     expect(result.warning).toContain("busy is advisory");
+    if (runtime === "codex") {
+      expect(result.warning).toContain("joins its running turn and may redirect it");
+      expect(result.warning).toContain("--wait-for-idle <seconds>");
+    } else {
+      expect(result.warning).not.toContain("joins its running turn");
+      expect(result.warning).not.toContain("--wait-for-idle");
+    }
     expect(sendTextSpy).toHaveBeenCalled();
   });
 
@@ -1499,11 +1850,16 @@ describe("SessionTransport", () => {
   it("R1-d: REAL timers: perpetual unknown never sends and returns within the deadline plus scheduling slack", async () => {
     seedCanonicalRig();
     const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
-    const tmux = mockTmux({ capturePaneContent: scriptedPanes([UNREADABLE]), sendText: sendTextSpy });
+    let observationStarted: number | undefined;
+    const tmux = mockTmux({ capturePaneContent: async () => {
+      observationStarted ??= performance.now();
+      throw new Error("capture failed");
+    }, sendText: sendTextSpy });
     const transport = createTransport(tmux, { waitForIdlePollMs: 10 });
-    const t0 = performance.now();
     const result = await transport.send("dev-impl@my-rig", "hello", { waitForIdleMs: 60 });
-    const wall = performance.now() - t0;
+    // The readiness budget starts after admission; database/setup work is outside it.
+    expect(observationStarted).toBeDefined();
+    const wall = performance.now() - observationStarted!;
     expect(result).toMatchObject({ ok: false, reason: "target_activity_unknown", sent: false });
     expect(result.waitedMs!).toBeGreaterThanOrEqual(60);
     expect(result.attempts!).toBeGreaterThanOrEqual(2);
@@ -1647,6 +2003,154 @@ describe("SessionTransport", () => {
     expect(result.ok).toBe(true);
     expect(result.warning).toBeDefined();
     expect(result.attempts).toBeUndefined();
+    expect(sendTextSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("a fresh Claude working hook cannot override a visible MCP approval menu", async () => {
+    seedCanonicalRig();
+    const eventBus = new EventBus(db);
+    const agentActivityStore = new AgentActivityStore({ db, eventBus });
+    agentActivityStore.recordHookEvent({
+      runtime: "claude-code",
+      sessionName: "dev-impl@my-rig",
+      hookEvent: "UserPromptSubmit",
+    });
+    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+    const capture = vi.fn(async () => [
+      "2 new MCP servers found in this project",
+      "Select any you wish to enable.",
+      "MCP servers may execute code or access system resources. All tool calls",
+      "require approval. Learn more in the MCP documentation.",
+      "❯ [✔] dummy1",
+      "  [✔] dummy2",
+      "     Enable selected",
+      "Space to select · Esc to reject all",
+    ].join("\n"));
+    const transport = createTransport(mockTmux({ capturePaneContent: capture, sendText: sendTextSpy }), {
+      agentActivityStore,
+    });
+
+    const result = await transport.send("dev-impl@my-rig", "hello");
+
+    expect(result).toMatchObject({ ok: false, reason: "target_needs_input" });
+    expect(result.activity).toMatchObject({ state: "needs_input", reason: "selection_prompt" });
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { newer: "StopFailure", older: "Stop", state: "unknown", ok: false },
+    { newer: "Stop", older: "StopFailure", state: "idle", ok: true },
+  ])("send readiness keeps the newer Claude $newer when $older arrives later", async ({ newer, older, state, ok }) => {
+    seedCanonicalRig();
+    const now = new Date();
+    const eventBus = new EventBus(db);
+    const agentActivityStore = new AgentActivityStore({ db, eventBus, now: () => now });
+    for (const [index, hookEvent] of [newer, older].entries()) {
+      expect(agentActivityStore.recordHookEvent({ runtime: "claude-code", sessionName: "dev-impl@my-rig", hookEvent,
+        subtype: hookEvent === "StopFailure" ? "rate_limit" : null,
+        occurredAt: new Date(now.getTime() - (index + 1) * 1000).toISOString() }).ok).toBe(true);
+    }
+    const sendText = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ sendText }), { agentActivityStore, now: () => now, sleep: async () => undefined });
+    const result = await transport.send("dev-impl@my-rig", "follow-on work", { waitForIdleMs: 50 });
+    expect(result).toMatchObject({ ok, activity: { state, rawEvent: newer } });
+    expect(sendText).toHaveBeenCalledTimes(ok ? 1 : 0);
+  });
+
+  it("producer-link diagnostics keep the newer Claude hook when an expired Stop arrives later", async () => {
+    seedCanonicalRig();
+    const now = new Date();
+    const eventBus = new EventBus(db);
+    const agentActivityStore = new AgentActivityStore({ db, eventBus, now: () => now });
+    expect(agentActivityStore.recordHookEvent({ runtime: "claude-code", sessionName: "dev-impl@my-rig",
+      hookEvent: "StopFailure", subtype: "rate_limit", occurredAt: new Date(now.getTime() - 1000).toISOString() }).ok).toBe(true);
+    expect(agentActivityStore.recordHookEvent({ runtime: "claude-code", sessionName: "dev-impl@my-rig",
+      hookEvent: "Stop", occurredAt: new Date(now.getTime() - agentActivityStore.freshnessMs - 1000).toISOString() }).ok).toBe(true);
+    const sendText = vi.fn(async () => ({ ok: true as const }));
+    const transport = createTransport(mockTmux({ sendText }), { agentActivityStore, now: () => now });
+    const result = await transport.send("dev-impl@my-rig", "follow-on work");
+    expect(result.ok).toBe(true);
+    expect(result.warning).toContain("producer-link: a recent activity hook exists");
+    expect(sendText).toHaveBeenCalledOnce();
+  });
+
+  it("uses the recorded pane when a fresh Claude hook checks a split session", async () => {
+    const { node } = seedCanonicalRig();
+    sessionRegistry.updateBinding(node.id, { tmuxPane: "%7" });
+    const eventBus = new EventBus(db);
+    const agentActivityStore = new AgentActivityStore({ db, eventBus });
+    agentActivityStore.recordHookEvent({
+      runtime: "claude-code",
+      sessionName: "dev-impl@my-rig",
+      hookEvent: "UserPromptSubmit",
+    });
+    const captures: string[] = [];
+    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+    const tmux = mockTmux({
+      listPanes: async () => [{ id: "%7" }],
+      capturePaneContent: async (target) => {
+        captures.push(target);
+        return target === "%7"
+          ? "2 new MCP servers found in this project\nSelect any you wish to enable.\nMCP servers may execute code or access system resources. All tool calls\nrequire approval. Learn more in the MCP documentation.\n❯ [✔] dummy1\n  [✔] dummy2\n     Enable selected\nSpace to select · Esc to reject all"
+          : "idle prompt\n❯ ";
+      },
+      sendText: sendTextSpy,
+    });
+    const transport = createTransport(tmux, { agentActivityStore, eventBus });
+
+    const result = await transport.send("dev-impl@my-rig", "hello");
+
+    expect(result).toMatchObject({ ok: false, reason: "target_needs_input" });
+    expect(captures).toContain("%7");
+    expect(captures).not.toContain("dev-impl@my-rig");
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("uses the recorded pane for Codex foreground verification in a split session", async () => {
+    const { node } = seedCanonicalRig("codex");
+    sessionRegistry.updateBinding(node.id, { tmuxPane: "%7" });
+    const paneCommands: string[] = [];
+    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+    const tmux = mockTmux({
+      getPaneCommand: async (target) => {
+        paneCommands.push(target);
+        return target === "%7" ? "-codex" : "-bash";
+      },
+      capturePaneContent: async () => "idle prompt\n❯ ",
+      sendText: sendTextSpy,
+    });
+    const transport = createTransport(tmux);
+
+    const result = await transport.send("dev-impl@my-rig", "hello");
+
+    expect(result.ok).toBe(true);
+    expect(result.reason).not.toBe("target_runtime_unverified");
+    expect(paneCommands).toContain("%7");
+    expect(paneCommands).not.toContain("dev-impl@my-rig");
+    expect(sendTextSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps busy sends advisory when a fresh Claude working hook has no visible prompt", async () => {
+    seedCanonicalRig();
+    const eventBus = new EventBus(db);
+    const agentActivityStore = new AgentActivityStore({ db, eventBus });
+    agentActivityStore.recordHookEvent({
+      runtime: "claude-code",
+      sessionName: "dev-impl@my-rig",
+      hookEvent: "UserPromptSubmit",
+    });
+    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+    const capture = vi.fn(async () => "Working on task...\n⠋ Processing files\nesc to interrupt");
+    const transport = createTransport(mockTmux({ capturePaneContent: capture, sendText: sendTextSpy }), {
+      agentActivityStore,
+    });
+
+    const result = await transport.send("dev-impl@my-rig", "hello");
+
+    expect(result.ok).toBe(true);
+    expect(result.warning).toContain("target pane appears mid-task");
+    expect(capture).toHaveBeenCalledTimes(1);
     expect(sendTextSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -2283,6 +2787,250 @@ describe("SessionTransport", () => {
     expect(hasSessionSpy).not.toHaveBeenCalled();
   });
 
+  // A stored kind that isn't one of today's (only reachable by writing the column directly) takes today's path, the tmux
+  // one, for send and capture: the seat boundary adds no refusal and changes nothing for it.
+  it("a binding whose stored kind isn't tmux or external_cli sends and captures through tmux, as before the boundary", async () => {
+    const { node } = seedCanonicalRig();
+    db.prepare("UPDATE bindings SET attachment_type = 'herdr' WHERE node_id = ?").run(node.id);
+    const callOrder: string[] = [];
+    const tmux = mockTmux({
+      sendText: async () => { callOrder.push("sendText"); return { ok: true }; },
+      sendKeys: async (_t, keys) => { callOrder.push(`sendKeys:${keys.join(",")}`); return { ok: true }; },
+      capturePaneContent: async () => "line1",
+    });
+    const transport = createTransport(tmux);
+
+    const sent = await transport.send("dev-impl@my-rig", "hello");
+    expect(sent.reason).not.toBe("transport_unavailable");
+    expect(callOrder).toContain("sendText");
+    const captured = await transport.capture("dev-impl@my-rig");
+    expect(captured.ok).toBe(true);
+    expect(captured.content).toContain("line1");
+  });
+
+  describe("delivery evidence", () => {
+    const evidence = () => (db.prepare("SELECT payload FROM events WHERE type = 'transport.delivery_evidence' ORDER BY seq").all() as Array<{ payload: string }>)
+      .map((row) => JSON.parse(row.payload));
+    const typing = () => mockTmux({ capturePaneContent: async () => "hello" });
+
+    it("records one fact per send beside an unchanged result: the seat, its occupant, what was written and the screen check", async () => {
+      seedCanonicalRig();
+      const plain = await createTransport(typing()).send("dev-impl@my-rig", "hello");
+      const withEvidence = await createTransport(typing(), { eventBus: new EventBus(db) }).send("dev-impl@my-rig", "hello");
+      expect(withEvidence).toEqual(plain);
+      const [fact, ...more] = evidence();
+      expect(more).toEqual([]);
+      // Stored with no node, so a node's own "last N events" reads never see a per-send record.
+      expect(db.prepare("SELECT node_id FROM events WHERE type = 'transport.delivery_evidence'").all()).toEqual([{ node_id: null }]);
+      expect(fact).toMatchObject({ sessionName: "dev-impl@my-rig", seatKind: "tmux", admitted: "none", inputBoundary: "unknown",
+        source: "send_result", terminalObserved: { outcome: withEvidence.outcome ?? null, verified: withEvidence.verified ?? null } });
+      // An ordinary send issues the text and Enter and checks no screen: submitted, with no screen check recorded.
+      expect(withEvidence).toMatchObject({ ok: true });
+      expect(withEvidence.outcome).toBeUndefined();
+      expect(fact).toMatchObject({ written: "submitted", terminalObserved: { outcome: null, verified: null } });
+      expect(fact.messageId).toBe(fact.attemptId);
+      // In the shared words: the typed route took it, as OpenRig saw. Never that the member read it.
+      expect(fact.outcome).toEqual({ fact: "accepted", reporter: "openrig-observed", route: "typed" });
+    });
+
+    it("records a typed wake to a Codex seat with its own labelled outcome, on the typed route", async () => {
+      seedCanonicalRig("codex");
+      await createTransport(typing(), { eventBus: new EventBus(db) }).send("dev-impl@my-rig", "hello");
+      expect(evidence()).toEqual([expect.objectContaining({ sessionName: "dev-impl@my-rig",
+        outcome: { fact: "accepted", reporter: "openrig-observed", route: "typed" } })]);
+    });
+
+    it("reads each result shape's outcome in the shared words: unknown when the result doesn't establish one", () => {
+      const s = "dev-impl@my-rig";
+      expect([
+        { ok: true, sessionName: s },
+        { ok: true, sessionName: s, verified: true, outcome: "delivered" },
+        { ok: true, sessionName: s, verified: false, outcome: "rendered-unconfirmed" },
+        { ok: true, sessionName: s, outcome: "retained", sent: false, verified: false },
+        { ok: false, sessionName: s, outcome: "failed", inputPhase: "attempted" },
+        { ok: false, sessionName: s, sent: true, outcome: "failed", inputPhase: "written", reason: "submit_refused" },
+        { ok: false, sessionName: s, sent: false, inputPhase: "not_reached" },
+        { ok: false, sessionName: s, reason: "transport_unavailable" },
+        // A prompt answer typed without Enter: it succeeded, but whether the prompt took it isn't known.
+        { ok: true, sessionName: s, sent: true, verified: false, outcome: "rendered-unconfirmed", promptInteraction: "unverified" },
+        // Text written and Enter refused before it was pressed: the text may sit in the input box.
+        { ok: false, sessionName: s, sent: true, outcome: "failed", inputPhase: "written", reason: "draft_input_changed" },
+      ].map((result) => {
+        const outcome = readSendOutcome(result, writtenFact(result as Parameters<typeof writtenFact>[0]));
+        return outcome.fact === "accepted" && outcome.renderVerified ? "accepted, render verified" : outcome.fact;
+      }))
+        .toEqual(["accepted", "accepted, render verified", "accepted", "held", "failed-effect-unknown", "failed-effect-unknown",
+          "not-delivered", "unknown", "unknown", "failed-effect-unknown"]);
+    });
+
+    it("uses the caller's delivery id as the message, and gives each attempt its own id", async () => {
+      seedCanonicalRig();
+      const transport = createTransport(typing(), { eventBus: new EventBus(db) });
+      await transport.send("dev-impl@my-rig", "hello", { deliveryId: "msg-1" });
+      await transport.send("dev-impl@my-rig", "hello", { deliveryId: "msg-1" });
+      const facts = evidence();
+      expect(facts.map((fact) => fact.messageId)).toEqual(["msg-1", "msg-1"]);
+      expect(new Set(facts.map((fact) => fact.attemptId)).size).toBe(2);
+    });
+
+    it.each([
+      ["pending", {}, "none"], ["offered", {}, "unknown"], ["accepted", {}, "unknown"],
+      ["rejected", {}, "none"], ["submitted", {}, "submitted"], ["completed", {}, "submitted"],
+      ["completed", { result: { completion: "failed" } }, "submitted"],
+      ["completed", { result: { submissionUnknown: true } }, "uncertain"],
+      ["accepted", { reconciliation: "receiver_state_lost" }, "uncertain"],
+      ["submitted", { reconciliation: "native_ownership_unknown" }, "uncertain"],
+      ["pending", { erasedAt: "2026-11-16" }, "unknown"],
+    ])("native written evidence follows %s and its uncertainty (%j)", (stage, extra, fact) => {
+      expect(writtenFact({ ok: true, sessionName: "native@r", runnerReceipt: { stage, ...extra as object } } as Parameters<typeof writtenFact>[0])).toBe(fact);
+    });
+
+    it("reads what was written from each result shape, and nothing the result doesn't show", () => {
+      const s = "dev-impl@my-rig";
+      expect([
+        { ok: true, sessionName: s },
+        { ok: true, sessionName: s, verified: true, outcome: "delivered" },
+        { ok: true, sessionName: s, verified: false, outcome: "rendered-unconfirmed" },
+        { ok: true, sessionName: s, outcome: "rendered-unconfirmed", submitOnly: true },
+        { ok: true, sessionName: s, sent: true, verified: false, outcome: "rendered-unconfirmed", promptInteraction: "unverified" },
+        { ok: true, sessionName: s, outcome: "retained", sent: false, verified: false },
+        { ok: false, sessionName: s, outcome: "failed", inputPhase: "attempted" },
+        { ok: false, sessionName: s, outcome: "failed", inputPhase: "written", reason: "submit_failed" },
+        { ok: false, sessionName: s, sent: true, outcome: "failed", inputPhase: "written", reason: "submit_refused" },
+        { ok: false, sessionName: s, sent: true, outcome: "failed", inputPhase: "written", reason: "draft_input_changed" },
+        { ok: false, sessionName: s, sent: false, inputPhase: "not_reached" },
+        { ok: false, sessionName: s, reason: "transport_unavailable" },
+      ].map((result) => writtenFact(result as Parameters<typeof writtenFact>[0])))
+        .toEqual(["submitted", "submitted", "submitted", "submit_only", "text_only", "none", "uncertain",
+          "text_submit_unknown", "text_submit_unknown", "text_only", "none", "unknown"]);
+    });
+
+    it("counts as admitted only an outbox row that was written, and names the message by the first outbox id", async () => {
+      seedCanonicalRig();
+      db.exec(outboxEntriesSchema.sql);
+      const row = new OutboxHandler(db).record({ senderSession: "sender@my-rig", destinationSession: "dev-impl@my-rig", body: "hello" });
+      await createTransport(typing(), { eventBus: new EventBus(db) }).send("dev-impl@my-rig", "hello", { committedOutboxIds: [row.outboxId, "outbox-never-written"] });
+      expect(evidence()).toMatchObject([{ admitted: { outboxIds: [row.outboxId] }, messageId: row.outboxId }]);
+    });
+
+    it("names the occupant the send was for, even when a new one takes the seat while it runs", async () => {
+      const { node } = seedCanonicalRig();
+      const ordinal = (db.prepare("SELECT MAX(generation_ordinal) AS m FROM occupant_tenures WHERE node_id = ?").get(node.id) as { m: number | null }).m ?? 0;
+      const tenure = db.prepare("INSERT INTO occupant_tenures (id, node_id, generation_ordinal, generation_uuid, kind) VALUES (?, ?, ?, ?, ?)");
+      tenure.run("g-before", node.id, ordinal + 1, "uuid-before", "adopt");
+      const handover = mockTmux({ capturePaneContent: async () => "hello", sendText: async () => {
+        tenure.run("g-after", node.id, ordinal + 2, "uuid-after", "adopt");
+        return { ok: true as const };
+      } });
+      await createTransport(handover, { eventBus: new EventBus(db) }).send("dev-impl@my-rig", "hello");
+      expect(evidence()).toMatchObject([{ occupantGeneration: "uuid-before" }]);
+    });
+
+    it("an external CLI seat's refusal records nothing written and no screen check", async () => {
+      seedExternalCliRig();
+      await createTransport(mockTmux(), { eventBus: new EventBus(db) }).send("orch1-lead@rigged-buildout", "hello");
+      expect(evidence()).toMatchObject([{ seatKind: "external_cli", written: "none", terminalObserved: { outcome: null, verified: null },
+        wireSha256: null, wireBytes: null, writtenAt: null }]);
+    });
+
+    it("a write that may have landed reads uncertain and is written once, never resent", async () => {
+      seedCanonicalRig();
+      let writes = 0;
+      const killed = mockTmux({ sendText: async () => { writes += 1; return { ok: false, code: "tmux_error", message: "execution deadline exceeded; client killed" }; } });
+      const unknown = await createTransport(killed, { eventBus: new EventBus(db) }).send("dev-impl@my-rig", "hello");
+      expect(unknown).toMatchObject({ outcome: "failed", inputPhase: "attempted" });
+      expect(writes).toBe(1);
+      expect(evidence().map((fact) => fact.written)).toEqual(["uncertain"]);
+    });
+
+    it("text whose Enter failed or threw keeps the submission unknown; only a pre-Enter refusal reads text only", async () => {
+      seedCanonicalRig();
+      const send = (sendKeys: () => Promise<{ ok: false; code: string; message: string }>) =>
+        createTransport(mockTmux({ capturePaneContent: async () => "hello", sendKeys }), { eventBus: new EventBus(db) }).send("dev-impl@my-rig", "hello");
+      expect(await send(async () => ({ ok: false, code: "tmux_error", message: "boom" }))).toMatchObject({ inputPhase: "written", reason: "submit_failed" });
+      // A thrown Enter is caught on the guarded path, which reports the text written and the Enter attempted.
+      const thrown = mockTmux({ capturePaneContent: async () => "hello", sendKeys: async () => { throw new Error("send-keys: lost reply"); } });
+      attachGuard(thrown);
+      const lost = await createTransport(thrown, { eventBus: new EventBus(db) }).send("dev-impl@my-rig", "hello");
+      expect(lost).toMatchObject({ inputPhase: "written" });
+      expect(lost.error).toContain("the submission (Enter) outcome is unconfirmed");
+      expect(await send(async () => ({ ok: false, code: "draft_input_changed", message: "Human input arrived during this delivery." })))
+        .toMatchObject({ inputPhase: "written", reason: "draft_input_changed" });
+      expect(evidence().map((fact) => fact.written)).toEqual(["text_submit_unknown", "text_submit_unknown", "text_only"]);
+    });
+
+    it("an outbox read that fails leaves admission unknown, even beside a row that was read, and the send unchanged", async () => {
+      seedCanonicalRig();
+      db.exec(outboxEntriesSchema.sql);
+      const row = new OutboxHandler(db).record({ senderSession: "sender@my-rig", destinationSession: "dev-impl@my-rig", body: "hello" });
+      const real = OutboxHandler.prototype.getById;
+      const read = vi.spyOn(OutboxHandler.prototype, "getById").mockImplementation(function (this: OutboxHandler, id: string) {
+        if (id === "outbox-unreadable") throw new Error("database is locked");
+        return real.call(this, id);
+      });
+      const opts = { committedOutboxIds: [row.outboxId, "outbox-unreadable"] };
+      const plain = await createTransport(typing()).send("dev-impl@my-rig", "hello", opts);
+      const result = await createTransport(typing(), { eventBus: new EventBus(db) }).send("dev-impl@my-rig", "hello", opts);
+      read.mockRestore();
+      expect(result).toEqual(plain);
+      expect(evidence()).toMatchObject([{ admitted: "unknown" }]);
+    });
+
+    it("names a kind only from a binding the seat has: no session or no binding reads unknown, a binding written without a kind reads tmux", async () => {
+      const { node } = seedCanonicalRig();
+      const transport = () => createTransport(typing(), { eventBus: new EventBus(db) });
+      await transport().send("ghost@nowhere", "hello");
+      const binding = db.prepare("SELECT * FROM bindings WHERE node_id = ?").get(node.id) as Record<string, unknown>;
+      db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+      await transport().send("dev-impl@my-rig", "hello");
+      // A binding row written the legacy way, naming no kind, takes the column's default.
+      db.prepare("INSERT INTO bindings (id, node_id, tmux_session, tmux_pane) VALUES (?, ?, ?, ?)").run(binding.id, node.id, binding.tmux_session, binding.tmux_pane);
+      await transport().send("dev-impl@my-rig", "hello");
+      expect(evidence().map((fact) => fact.seatKind)).toEqual(["unknown", "unknown", "tmux"]);
+    });
+
+    it("a record that can't be written leaves the send and its result untouched", async () => {
+      seedCanonicalRig();
+      const plain = await createTransport(typing()).send("dev-impl@my-rig", "hello");
+      const broken = new EventBus(db);
+      broken.emit = () => { throw new Error("disk full"); };
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const result = await createTransport(typing(), { eventBus: broken }).send("dev-impl@my-rig", "hello");
+      expect(result).toEqual(plain);
+      expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
+    });
+
+    it("fingerprints the text the paste wrote, never the text itself: a terminal seat's exact text, not the envelope", async () => {
+      seedCanonicalRig("terminal");
+      let typed = "";
+      const tmux = mockTmux({ capturePaneContent: async () => "hello", sendText: async (_target, text) => { typed = text; return { ok: true as const }; } });
+      await createTransport(tmux, { eventBus: new EventBus(db) }).send("dev-impl@my-rig", "env lines\nhello", { exactText: "hello" });
+      const [fact] = evidence();
+      expect(typed).toBe("hello");
+      expect(fact).toMatchObject({ wireSha256: createHash("sha256").update("hello").digest("hex"), wireBytes: 5 });
+      expect(Number.isNaN(Date.parse(fact.writtenAt))).toBe(false);
+      expect(JSON.stringify(fact)).not.toContain("hello");
+    });
+
+    it("fingerprints what was pasted, an urgent send's added line included, not the text the caller passed", async () => {
+      seedCanonicalRig();
+      let typed = "";
+      const tmux = mockTmux({ capturePaneContent: async () => "hello", sendText: async (_target, text) => { typed = text; return { ok: true as const }; } });
+      await createTransport(tmux, { eventBus: new EventBus(db) }).send("dev-impl@my-rig", "hello", { urgent: { by: "orch@r" } });
+      const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+      expect(typed).not.toBe("hello");
+      expect(evidence()).toMatchObject([{ wireSha256: sha(typed), wireBytes: Buffer.byteLength(typed) }]);
+      expect(evidence()[0].wireSha256).not.toBe(sha("hello"));
+    });
+
+    it("a terminal seat's exact-text send, which re-enters send, records once", async () => {
+      seedCanonicalRig("terminal");
+      await createTransport(typing(), { eventBus: new EventBus(db) }).send("dev-impl@my-rig", "env lines\nhello", { exactText: "hello" });
+      expect(evidence()).toHaveLength(1);
+    });
+  });
+
   // Test 11: resolveSessions by rig returns running sessions
   it("resolveSessions by rig returns running sessions", async () => {
     seedCanonicalRig();
@@ -2381,6 +3129,22 @@ describe("SessionTransport", () => {
     }
   });
 
+  it("#2895 (a): a fan-out from a sender with no session here ends with the plain note; a known sender keeps the rig send line", async () => {
+    seedCanonicalRig(); // dev-impl@my-rig
+    seedLegacyRig(); // r00-legacy-worker-a
+    const sent: string[] = [];
+    const tmux = mockTmux({ sendText: async (_t, text) => { sent.push(text); return { ok: true }; } });
+    const transport = createTransport(tmux);
+
+    await transport.broadcast({ sessions: ["dev-impl@my-rig"] }, "status", { envelopeSender: "planner@global", stampISO: "2026-08-06T17:42:09Z" });
+    await transport.broadcast({ sessions: ["dev-impl@my-rig"] }, "status", { envelopeSender: "r00-legacy-worker-a", stampISO: "2026-08-06T17:42:09Z" });
+
+    expect(sent.map((text) => text.split("\n").at(-1))).toEqual([
+      "↩ No reply by rig send: planner@global has no session.",
+      '↩ Reply: rig send r00-legacy-worker-a "..."',
+    ]);
+  });
+
   it("raw broadcast (no envelopeSender) is delivered unwrapped — no header change", async () => {
     seedCanonicalRig();
     const sent: string[] = [];
@@ -2475,21 +3239,25 @@ describe("SessionTransport", () => {
 
   it("#1084: a pre-waited send re-checks readiness just before typing and refuses a new prompt", async () => {
     seedCanonicalRig();
-    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
-    // The wait sees busy then idle (resolves); the in-lease re-check sees a
-    // freshly posted picker and must refuse with the existing reason.
-    const tmux = mockTmux({
-      capturePaneContent: scriptedPanes([BUSY_PANE, IDLE_PANE, MENU_PANE]),
-      sendText: sendTextSpy,
-    });
-    const transport = transportWithGuard(tmux);
-    const result = await transport.send("dev-impl@my-rig", "hello", { waitForIdleMs: 50 });
+    // Exercise the readiness transition without spending the budget on host scheduling.
+    const clock = steppedClock();
+    try {
+      const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+      // The wait sees busy then idle (resolves); the in-lease re-check sees a
+      // freshly posted picker and must refuse with the existing reason.
+      const tmux = mockTmux({
+        capturePaneContent: scriptedPanes([BUSY_PANE, IDLE_PANE, MENU_PANE]),
+        sendText: sendTextSpy,
+      });
+      const transport = transportWithGuard(tmux, { sleep: clock.sleep });
+      const result = await transport.send("dev-impl@my-rig", "hello", { waitForIdleMs: 50 });
 
-    expect(result.ok).toBe(false);
-    expect(result.reason).toBe("target_needs_input");
-    expect(result.sent).toBe(false);
-    expect(result.activity?.state).toBe("needs_input");
-    expect(sendTextSpy).not.toHaveBeenCalled();
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("target_needs_input");
+      expect(result.sent).toBe(false);
+      expect(result.activity?.state).toBe("needs_input");
+      expect(sendTextSpy).not.toHaveBeenCalled();
+    } finally { clock.restore(); }
   });
 
   it("#1084: a wait-mode send with the typing guard enabled retains immediately without waiting", async () => {
@@ -2585,6 +3353,107 @@ describe("SessionTransport", () => {
       expect(result.waitedMs).toBe(100);
       expect(sendTextSpy).not.toHaveBeenCalled();
     } finally { clock.restore(); }
+  });
+
+  // A terminal seat's shell runs every typed line, so it gets the exact text, never the envelope.
+  function seedTerminalSeat() {
+    const rig = rigRepo.createRig("term-rig");
+    const node = rigRepo.addNode(rig.id, "infra.ui", { role: "ui", runtime: "terminal" });
+    const session = sessionRegistry.registerSession(node.id, "infra-ui@term-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "infra-ui@term-rig" });
+  }
+  const HEREDOC = "cat <<'EOF'\nSent: as typed\nEOF";
+
+  it("send to a terminal seat types exactText exactly, with no envelope and no delivered segment", async () => {
+    seedTerminalSeat();
+    const sent: string[] = [];
+    const tmux = mockTmux({ getPaneCommand: async () => "zsh", sendText: async (_t, text) => { sent.push(text); return { ok: true }; } });
+    // The write moment is 30s after the compose stamp: an enveloped send would gain "delivered +30s".
+    const transport = createTransport(tmux, { now: () => new Date("2026-08-06T17:42:39Z") });
+
+    const result = await transport.send("infra-ui@term-rig", H_ENVELOPE, { exactText: HEREDOC, stampISO: "2026-08-06T17:42:09Z" });
+
+    expect(result.ok).toBe(true);
+    expect(result.envelopeOmitted).toBe(true);
+    expect(sent).toEqual([HEREDOC]);
+  });
+
+  it("send to an agent seat ignores exactText and keeps the envelope", async () => {
+    seedCanonicalRig();
+    const sent: string[] = [];
+    const transport = createTransport(mockTmux({ sendText: async (_t, text) => { sent.push(text); return { ok: true }; } }));
+
+    const result = await transport.send("dev-impl@my-rig", H_ENVELOPE, { exactText: "hi" });
+
+    expect(result.ok).toBe(true);
+    expect(result.envelopeOmitted).toBeUndefined();
+    expect(sent).toEqual([H_ENVELOPE]);
+  });
+
+  it("enveloped fan-out to a terminal seat and an agent seat gives each the right text", async () => {
+    seedCanonicalRig(); // dev-impl@my-rig, claude-code
+    seedTerminalSeat(); // infra-ui@term-rig, terminal
+    const sent = new Map<string, string>();
+    const tmux = mockTmux({ getPaneCommand: async () => "zsh", sendText: async (target, text) => { sent.set(target, text); return { ok: true }; } });
+    const transport = createTransport(tmux);
+
+    const result = await transport.broadcast(
+      { sessions: ["dev-impl@my-rig", "infra-ui@term-rig"] },
+      "make test",
+      { envelopeSender: "orch@my-rig", stampISO: "2026-08-06T17:42:09Z" },
+    );
+
+    expect(result.sent).toBe(2);
+    expect(sent.get("infra-ui@term-rig")).toBe("make test");
+    expect(sent.get("dev-impl@my-rig")).toContain("From: orch@my-rig");
+    expect(sent.get("dev-impl@my-rig")).toContain("make test");
+    const byName = new Map(result.results.map((r) => [r.sessionName, r]));
+    expect(byName.get("infra-ui@term-rig")?.envelopeOmitted).toBe(true);
+    expect(byName.get("dev-impl@my-rig")?.envelopeOmitted).toBeUndefined();
+  });
+
+  it("a person's send (a seat actor) to a terminal seat still gets the exact text", async () => {
+    seedTerminalSeat();
+    const sent: string[] = [];
+    const transport = createTransport(mockTmux({ getPaneCommand: async () => "zsh", sendText: async (_t, text) => { sent.push(text); return { ok: true }; } }));
+    const result = await transport.send("infra-ui@term-rig", H_ENVELOPE, { exactText: "make test", actorSession: "dev-impl@my-rig" });
+    expect(result).toMatchObject({ ok: true, envelopeOmitted: true });
+    expect(sent).toEqual(["make test"]);
+  });
+
+  it("an urgent send to a terminal seat types the exact text without the urgent line, and keeps the mark", async () => {
+    seedTerminalSeat();
+    const sent: string[] = [];
+    const transport = createTransport(mockTmux({ getPaneCommand: async () => "zsh", sendText: async (_t, text) => { sent.push(text); return { ok: true }; } }));
+    const result = await transport.send("infra-ui@term-rig", H_ENVELOPE, { exactText: "make test", actorSession: "dev-impl@my-rig", urgent: { by: "dev-impl@my-rig" } });
+    expect(result).toMatchObject({ ok: true, envelopeOmitted: true, urgent: { by: "dev-impl@my-rig" } });
+    expect(sent).toEqual(["make test"]);
+  });
+
+  it("a terminal seat known only by its composed name (binding, no session row): exact text for a person; a watchdog notice carries only its marker (with no delivery guard here, it types as given)", async () => {
+    const rig = rigRepo.createRig("term-rig");
+    const node = rigRepo.addNode(rig.id, "infra.logs", { role: "logs", runtime: "terminal" });
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "infra-logs@term-rig" });
+    const sent: string[] = [];
+    const transport = createTransport(mockTmux({ getPaneCommand: async () => "zsh", sendText: async (_t, text) => { sent.push(text); return { ok: true }; } }));
+
+    const personal = await transport.send("infra-logs@term-rig", H_ENVELOPE, { exactText: "tail -f app.log", actorSession: "dev-impl@my-rig" });
+    expect(personal).toMatchObject({ ok: true, envelopeOmitted: true });
+    expect(sent).toEqual(["tail -f app.log"]);
+
+    const notice = await transport.send("infra-logs@term-rig", "[OpenRig watchdog] a reminder", { actorSession: "watchdog@system", openrigNotice: true });
+    expect(notice).toMatchObject({ ok: true });
+    expect(sent).toEqual(["tail -f app.log", "[OpenRig watchdog] a reminder"]);
+  });
+
+  it("a person's send from a seat in a rig named system still gets the exact text", async () => {
+    seedTerminalSeat();
+    const sent: string[] = [];
+    const transport = createTransport(mockTmux({ getPaneCommand: async () => "zsh", sendText: async (_t, text) => { sent.push(text); return { ok: true }; } }));
+    const result = await transport.send("infra-ui@term-rig", H_ENVELOPE, { exactText: "make test", actorSession: "ops-member@system" });
+    expect(result).toMatchObject({ ok: true, envelopeOmitted: true });
+    expect(sent).toEqual(["make test"]);
   });
 });
 
@@ -3005,6 +3874,109 @@ describe("startup readiness reconciliation on session interaction (#7)", () => {
     ]);
   });
 
+  describe("a Claude seat with no launch record (#1477 section 2)", () => {
+    const resumeToken = "00000000-0000-4000-8000-000000001477";
+    function seedClaude(status: "failed" | "attention_required") {
+      const { rig, node, session } = seedRig("claude-code");
+      sessionRegistry.updateStartupStatus(session.id, status);
+      sessionRegistry.updateResumeToken(session.id, "claude_id", resumeToken);
+      sessionRegistry.updateBinding(node.id, { tmuxPane: "%1" });
+      seedStartupFailureEvent(rig.id, node.id, session.id, { requestedResumeToken: resumeToken, requestedResumeType: "claude_id" });
+      return { rig, node, session };
+    }
+    const transportWith = (checkReady: (binding: NodeBinding, opts?: { resumeToken?: string | null }) => Promise<{ ready: boolean }>) =>
+      new SessionTransport({ db, rigRepo, sessionRegistry, eventBus,
+        tmuxAdapter: mockTmux({ capturePaneContent: async () => "› Current idle prompt\n────────────\n" }),
+        runtimeAdapters: { "claude-code": { checkReady } as never } });
+    const startupStatus = (id: string) => (db.prepare("SELECT startup_status FROM sessions WHERE id = ?").get(id) as { startup_status: string }).startup_status;
+
+    it("passes the seat's real binding and its recorded resume token to the readiness check", async () => {
+      const { node } = seedClaude("attention_required");
+      const check = vi.fn(async () => ({ ready: false }));
+      await transportWith(check).capture("worker-1@test-rig");
+      expect(check).toHaveBeenCalledTimes(1);
+      const [binding, options] = check.mock.calls[0] as unknown as [NodeBinding, { resumeToken?: string }];
+      expect(binding).toMatchObject({ nodeId: node.id, tmuxSession: "worker-1@test-rig", tmuxPane: "%1" });
+      expect(options).toEqual({ resumeToken: resumeToken });
+    });
+
+    it.each(["failed", "attention_required"] as const)("promotes a %s seat the real adapter proves, with no attention-cleared event", async from => {
+      const { session } = seedClaude(from);
+      const { adapter } = claudeSeat();
+      const cleared: unknown[] = [];
+      eventBus.subscribe(evt => { if (evt.type === "seat.attention_cleared") cleared.push(evt); });
+      await transportWith((binding, opts) => adapter.checkReady(binding, opts)).capture("worker-1@test-rig");
+      expect(startupStatus(session.id)).toBe("ready");
+      expect(cleared).toEqual([]);
+    });
+
+    it("passes the rotation recorded with the token, and the real adapter promotes a rotated seat by it", async () => {
+      const { session } = seedClaude("attention_required");
+      recordRotation(db, session.id);
+      const check = vi.fn(async () => ({ ready: false }));
+      await transportWith(check).capture("worker-1@test-rig");
+      expect(check.mock.calls[0]![1]).toEqual({ resumeToken: rotatedToken, resumeRotation: rotation });
+      const { adapter } = claudeSeat();
+      await transportWith((binding, opts) => adapter.checkReady(binding, opts)).capture("worker-1@test-rig");
+      expect(startupStatus(session.id)).toBe("ready");
+    });
+
+    // The anchor (#1477, the maintainer's shape) is the reconcile's own existing comparison; these pin it beside the proof.
+    describe("the requested conversation", () => {
+      const reconcile = async (session: { id: string }) => {
+        const { adapter } = claudeSeat();
+        await transportWith((binding, opts) => adapter.checkReady(binding, opts)).capture("worker-1@test-rig");
+        return startupStatus(session.id);
+      };
+      const reseed = (ids: ReturnType<typeof seedClaude>, fields: Record<string, unknown>) => {
+        db.prepare("DELETE FROM events WHERE type = 'node.startup_failed'").run();
+        seedStartupFailureEvent(ids.rig.id, ids.node.id, ids.session.id, fields);
+      };
+
+      it("leaves flagged a seat whose record and process are on another conversation than the one it asked for", async () => {
+        const ids = seedClaude("attention_required");
+        reseed(ids, { requestedResumeToken: requestedToken, requestedResumeType: "claude_id" });
+        expect(await reconcile(ids.session)).toBe("attention_required");
+      });
+
+      it("promotes a seat whose recorded rotation started from the requested conversation, which the process names", async () => {
+        const ids = seedClaude("attention_required");
+        recordRotation(db, ids.session.id);
+        reseed(ids, { requestedResumeToken: resumeToken, requestedResumeType: "claude_id" });
+        expect(await reconcile(ids.session)).toBe("ready");
+      });
+
+      it("promotes a fresh launch (null request)", async () => {
+        const fresh = seedClaude("attention_required");
+        reseed(fresh, { requestedResumeToken: null, requestedResumeType: null });
+        expect(await reconcile(fresh.session)).toBe("ready");
+      });
+
+      it("keeps the reconcile's existing hold for an older event without the request fields", async () => {
+        const older = seedClaude("attention_required");
+        db.prepare("DELETE FROM events WHERE type = 'node.startup_failed' AND node_id = ?").run(older.node.id);
+        db.prepare("INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, ?, 'node.startup_failed', ?)").run(older.rig.id, older.node.id,
+          JSON.stringify({ type: "node.startup_failed", sessionId: older.session.id, stage: "readiness_check", hasPendingWork: false, error: "x" }));
+        expect(await reconcile(older.session)).toBe("attention_required");
+      });
+
+      it("still compares the process with the record after an in-process /resume", async () => {
+        const ids = seedClaude("attention_required");
+        db.prepare("UPDATE sessions SET resume_token = ? WHERE id = ?").run(rotatedToken, ids.session.id);
+        reseed(ids, { requestedResumeToken: resumeToken, requestedResumeType: "claude_id" });
+        expect(await reconcile(ids.session)).toBe("attention_required");
+      });
+    });
+
+    it("leaves a seat whose pane runs another conversation flagged", async () => {
+      const { session } = seedClaude("attention_required");
+      const { adapter, set } = claudeSeat();
+      set(claudeRows({ command: "/x/claude --permission-mode auto --resume other --name seat@rig" }));
+      await transportWith((binding, opts) => adapter.checkReady(binding, opts)).capture("worker-1@test-rig");
+      expect(startupStatus(session.id)).toBe("attention_required");
+    });
+  });
+
   it("does not reconcile non-recoverable startup failure even if prompt is responsive", async () => {
     const { rig, node, session } = seedRig("codex");
     sessionRegistry.updateStartupStatus(session.id, "failed");
@@ -3327,6 +4299,67 @@ describe("startup readiness reconciliation on session interaction (#7)", () => {
 
       const sessionRow = db.prepare("SELECT startup_status FROM sessions WHERE id = ?").get(session.id) as { startup_status: string };
       expect(sessionRow.startup_status).toBe("failed");
+    });
+  });
+
+  // #1405: the shared classifier drives the adapter's readiness here, through the real startup flow.
+  describe("Claude's not-logged-in footer and a current login refusal through startup", () => {
+    const frame = ["", "─".repeat(40), "❯ ", "─".repeat(40), "                    Not logged in · Run /login", "  ⏵⏵ accept edits on (shift+tab to cycle)"];
+    const footerOnly = [" ▐▛███▛█   Claude Code v2.1.296", ...frame].join("\n");
+    const refused = [" ▐▛███▛█   Claude Code v2.1.296", "", "❯ /init", "", "● Not logged in · Please run /login", ...frame].join("\n");
+    const readiness = (paneContent: string) => {
+      const probe = assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "claude", paneContent });
+      return probe.status === "resumed" ? { ready: true } : { ready: false, code: probe.code, reason: probe.detail };
+    };
+
+    async function startWithPanes(panes: string[]) {
+      const { rig, node, session } = seedRig("claude-code");
+      let reads = 0;
+      const adapter: RuntimeAdapter = {
+        runtime: "claude-code",
+        listInstalled: vi.fn(async () => []),
+        project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+        deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+        checkReady: vi.fn(async () => readiness(panes[Math.min(reads++, panes.length - 1)]!)),
+        launchHarness: vi.fn(async () => ({ ok: true })),
+      };
+      const orchestrator = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: mockTmux(), sleep: async () => {} });
+      const result = await orchestrator.startNode({
+        rigId: rig.id, nodeId: node.id, sessionId: session.id,
+        binding: { id: "b1", nodeId: node.id, tmuxSession: "worker-1@test-rig", tmuxWindow: null, tmuxPane: null,
+          cmuxWorkspace: null, cmuxSurface: null, updatedAt: "", cwd: "." },
+        adapter,
+        plan: { runtime: "claude-code", cwd: ".", entries: [], startup: { files: [], actions: [] }, conflicts: [], noOps: [], diagnostics: [] },
+        resolvedStartupFiles: [],
+        startupActions: [{ type: "slash_command", value: "/init", phase: "after_files", appliesOn: ["fresh_start"], idempotent: true }],
+        isRestore: false,
+      });
+      const status = (db.prepare("SELECT startup_status FROM sessions WHERE id = ?").get(session.id) as { startup_status: string }).startup_status;
+      const failed = db.prepare("SELECT payload FROM events WHERE node_id = ? AND type = 'node.startup_failed' ORDER BY seq DESC LIMIT 1").get(node.id) as { payload: string } | undefined;
+      return { result, status, reads: (adapter.checkReady as ReturnType<typeof vi.fn>).mock.calls.length, failedStage: failed ? JSON.parse(failed.payload).stage : null };
+    }
+
+    it("starts a seat that shows only the footer and delivers its startup context", async () => {
+      const started = await startWithPanes([footerOnly]);
+      expect(started.result.ok).toBe(true);
+      expect(started.status).toBe("ready");
+      expect(started.failedStage).toBeNull();
+    });
+
+    it("needs attention when a current refusal is visible at the post-delivery observation", async () => {
+      const started = await startWithPanes([footerOnly, refused]);
+      expect(started.result.ok).toBe(false);
+      expect(started.status).toBe("attention_required");
+      expect(started.failedStage).toBe("post_delivery_readiness");
+    });
+
+    it("does not see a refusal that appears only after the one post-delivery observation", async () => {
+      const started = await startWithPanes([footerOnly, footerOnly, refused]);
+      expect(started.reads).toBe(2);
+      expect(started.result.ok).toBe(true);
+      expect(started.status).toBe("ready");
+      // A later read of the same pane reports it; startup does not wait or poll for one.
+      expect(readiness(refused)).toMatchObject({ ready: false, code: "login_required" });
     });
   });
 

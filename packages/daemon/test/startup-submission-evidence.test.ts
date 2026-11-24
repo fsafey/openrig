@@ -64,6 +64,14 @@ describe("our own collapsed startup paste", () => {
     expect(startupOwnCollapsedPaste(pane, prompt)).toBe(true);
   });
 
+  // Claude Code 2.1.326 leaves the count off a paste with no newline (#2429).
+  it("recognizes a single-line paste's label without a count, and only for a single-line prompt", () => {
+    const line = `a single-line prompt ${"x".repeat(900)}`;
+    expect(startupOwnCollapsedPaste(composer("[Pasted text #1]"), line)).toBe(true);
+    expect(startupOwnCollapsedPaste(composer("[Pasted text #1]", "paste again to expand  12% until auto-compact"), line)).toBe(true);
+    expect(startupOwnCollapsedPaste(composer("[Pasted text #1 +1 lines]"), line)).toBe(false);
+  });
+
   it("counts a trailing newline, as Claude does", () => {
     expect(startupOwnCollapsedPaste(composer("[Pasted text #2 +29 lines]"), file)).toBe(true);
     expect(startupOwnCollapsedPaste(composer("[Pasted text #2 +28 lines]"), file)).toBe(false);
@@ -132,5 +140,31 @@ describe("a rule and a mode-bar line inside the prompt text", () => {
     const text = "first\n──────────\n⏸ plan mode on\nlast";
     const frame = `❯ ${text}\n────────────────────\n  -- NORMAL --\n`;
     expect(inspectStartupStagedText(frame, text)).toBe("unverified");
+  });
+});
+
+describe("Claude's startup composer with a person's own statusLine between the closing rule and the footer (#2798)", () => {
+  const STATUS = "  gpt-6.1-sol-fast · ctx 171.1k/872k (19.6%) · orchestrator";
+  const framed = (body: string, rows: string[], footer = "⏵⏵ bypass permissions on (shift+tab to cycle)") =>
+    `────────────────────\n❯ ${body}\n────────────────────\n${rows.join("\n")}\n  ${footer}\n`;
+
+  it("reads the staged prompt and the cleared box as without the statusLine", () => {
+    expect(inspectStartupStagedText(framed(expected, [STATUS]), expected, "claude-code")).toBe("staged");
+    expect(inspectStartupStagedText(framed("", [STATUS], "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"), expected, "claude-code")).toBe("clear");
+    expect(inspectStartupStagedText(framed(expected, []), expected, "claude-code")).toBe("staged");
+  });
+
+  it.each([
+    ["a selected choice behind a side border", ["│ ❯ 1. Yes │"]],
+    ["a numbered choice", ["  1. Yes"]],
+    ["a box corner", ["╭──────────────╮"]],
+    ["a blank row above a statusLine row", ["", STATUS]],
+  ])("keeps the composer unverified with %s where the statusLine goes", (_name, rows) => {
+    expect(inspectStartupStagedText(framed(expected, rows), expected, "claude-code")).toBe("unverified");
+  });
+
+  it("leaves other runtimes as they were: a row under the closing rule that is not a footer stays unverified", () => {
+    expect(inspectStartupStagedText(framed(expected, [STATUS]), expected)).toBe("unverified");
+    expect(inspectStartupStagedText(framed(expected, [STATUS]), expected, "codex")).toBe("unverified");
   });
 });

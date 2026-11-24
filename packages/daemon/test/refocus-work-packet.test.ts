@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,7 +28,7 @@ afterEach(() => {
 const nothingElse: WorkCandidateLookups = { getRow: () => null, continuationOf: () => null };
 
 function world() {
-  root = mkdtempSync(join(tmpdir(), "refocus-work-packet-"));
+  root = realpathSync(mkdtempSync(join(tmpdir(), "refocus-work-packet-")));
   const workspace = join(root, "workspace");
   const missions = join(workspace, "missions");
   const topology = join(root, "topology");
@@ -55,6 +55,9 @@ if [ "$1 $2" = "queue whoami" ]; then
 fi
 if [ "$1 $2" = "whoami --json" ]; then printf '{"identity":{"rigName":"demo","sessionName":"builder@demo"}}\\n'; exit 0; fi
 if [ "$1 $2" = "config --json" ]; then printf '{}'; exit 0; fi
+if [ "$1 $2 $3" = "scope mission show" ]; then
+  case "$4" in */release-a) if [ -n "$RIG_PARENT_REPLY" ]; then printf '%s' "$RIG_PARENT_REPLY"; else printf '{"mission":{"parentChain":[],"parentGap":null}}'; fi;; *) printf '{"mission":{"parentChain":[],"parentGap":null}}';; esac; exit 0
+fi
 if [ "$1 $2" = "scope resolve-notes" ]; then
   if [ -r "$3/NOTES.md" ]; then printf '{"ok":true,"resolution":{"path":"%s","name":"NOTES.md"}}\\n' "$3/NOTES.md"; exit 0; fi
   printf '{"ok":true,"resolution":null}\\n'; exit 0
@@ -72,7 +75,7 @@ exit 1
     OPENRIG_REFOCUS_NOTES_MAX_AGE_DAYS: undefined,
     RIG_CALL_LOG: calls,
   };
-  const trace = (args: string[], evidence?: unknown, extra: NodeJS.ProcessEnv = {}) => spawnSync("python3", [TRACE, ...args], {
+  const trace = (args: string[], evidence?: unknown, extra: NodeJS.ProcessEnv = {}) => spawnSync(process.env.OPENRIG_TEST_PYTHON || "python3", [TRACE, ...args], {
     encoding: "utf8", env: { ...env, ...extra }, input: evidence === undefined ? "" : JSON.stringify(evidence),
   });
   return { root, workspace, missions, topology, seat, slice, bin, env, trace,
@@ -84,7 +87,7 @@ describe("deriveWorkCandidates — labelled evidence beside the strict derivatio
     const w = world();
     const out = deriveWorkCandidates([{ qitemId: "q-1", state: "in-progress", tags: ["mission:release-a"] }], w.missions, nothingElse);
     expect(out.candidates).toEqual([{
-      kind: "tag", qitemId: "q-1", mission: "release-a", slice: null,
+      kind: "tag", qitemId: "q-1", projects: [], mission: "release-a", slice: null,
       workNodePath: join(w.missions, "release-a"), intent: "Ship A",
       source: "tag mission:release-a on row q-1", unresolved: null,
     }]);
@@ -238,6 +241,77 @@ describe("frontmatterIntent — folded and literal intents", () => {
 });
 
 describe("trace-to-root --packet — the work packet as text", () => {
+  it("keeps the age cue for old progress without a current-state section", () => {
+    const w = world();
+    writeFileSync(join(w.slice, "PROGRESS.md"), "---\nupdated: 2020-01-02\n---\n# Progress\n\n## Notes\n\nOld work\n", "utf8");
+    const result = w.trace(["--trees", "work", "--packet", "--work-start", w.slice]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("OLD NOTES");
+    expect(result.stdout).not.toContain("CURRENT STATE —");
+  });
+
+  it.each([
+    '"progress_rail": readme-only\n"current_state_updated": "2020-01-02T03:04:05.000Z"',
+    '{progress_rail: readme-only, current_state_updated: "2020-01-02T03:04:05.000Z"}',
+  ])("parses quoted and flow YAML metadata: %s", (frontmatter) => {
+    const w = world();
+    writeFileSync(join(w.slice, "SPEC.md"), `---\n${frontmatter}\n---\n# Slice\n\n## Current state ##\n\nReady\n`, "utf8");
+    const result = w.trace(["--trees", "work", "--packet", "--work-start", w.slice]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout, result.stdout).toContain("PROGRESS · SPEC.md");
+    expect(result.stdout).toContain("CURRENT STATE — written 2020-01-02T03:04:05.000Z");
+    expect(result.stdout).toContain("Ready");
+  });
+
+  it("reports the current-state timestamp instead of the file modification time", () => {
+    const w = world();
+    writeFileSync(join(w.slice, "PROGRESS.md"), '---\ncurrent_state_updated: "2020-01-02T03:04:05.000Z"\n---\n# Progress\n\n## Current state\n\nWaiting\n', "utf8");
+    const result = w.trace(["--trees", "work", "--packet", "--work-start", w.slice]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("CURRENT STATE — written 2020-01-02T03:04:05.000Z");
+    expect(result.stdout).toContain("Waiting");
+  });
+  it("includes a readme-only rail in the work packet", () => {
+    const w = world();
+    writeFileSync(join(w.slice, "SPEC.md"), '---\nintent: Work\nprogress_rail: readme-only\ncurrent_state_updated: "2020-01-02T03:04:05.000Z"\n---\n# Slice\n\n## Current state\n\nReady\n', "utf8");
+    const result = w.trace(["--trees", "work", "--packet", "--work-start", w.slice]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("PROGRESS · SPEC.md");
+    expect(result.stdout).toContain("CURRENT STATE — written 2020-01-02T03:04:05.000Z");
+    expect(result.stdout).toContain("Ready");
+  });
+  it("traces the logical parent intent, not just filesystem ancestors", () => {
+    const w = world();
+    writeFileSync(join(w.missions, "release-a", "mission.yaml"), "metadata:\n  parent: M.2\n");
+    const reply = JSON.stringify({ mission: { parentChain: [{ id: "M.2", path: join(w.missions, "release-b"), kind: "mission", intent: "Ship B" }], parentGap: null } });
+    const result = w.trace(["--trees", "work", "--packet", "--work-start", w.slice], undefined, { RIG_PARENT_REPLY: reply });
+    expect(result.stdout).toContain("PARENT · M.2");
+    expect(result.stdout).toContain("intent: Ship B");
+  });
+  it("selects the project workspace for a nested missions root", () => {
+    const w = world();
+    const nested = join(w.workspace, "internal", "nested");
+    const child = join(nested, "release-a");
+    const parent = join(nested, "release-b");
+    mkdirSync(child, { recursive: true }); mkdirSync(parent, { recursive: true });
+    writeFileSync(join(w.workspace, "project.yaml"), "missions:\n  root: internal/nested\n");
+    writeFileSync(join(child, "SPEC.md"), "---\nintent: Child\n---\n");
+    writeFileSync(join(child, "mission.yaml"), "metadata:\n  parent: M.2\n");
+    const reply = JSON.stringify({ mission: { parentChain: [{ id: "M.2", path: parent, kind: "mission", intent: "Parent" }], parentGap: null } });
+    const result = w.trace(["--trees", "work", "--packet", "--work-start", child], undefined, { RIG_PARENT_REPLY: reply });
+    expect(result.stdout).toContain("PARENT · M.2");
+    expect(w.calls()).toContain(`--workspace ${w.workspace} --json`);
+  });
+  it("does not select a project above the selected work root", () => {
+    const w = world();
+    writeFileSync(join(w.root, "project.yaml"), "missions:\n  root: outside\n");
+    writeFileSync(join(w.missions, "release-a", "mission.yaml"), "metadata:\n  parent: M.2\n");
+    const reply = JSON.stringify({ mission: { parentChain: [{ id: "M.2", path: join(w.missions, "release-b"), kind: "mission", intent: "Parent" }], parentGap: null } });
+    const result = w.trace(["--trees", "work", "--packet", "--work-start", join(w.missions, "release-a")], undefined, { RIG_PARENT_REPLY: reply });
+    expect(result.stdout).toContain("PARENT · M.2");
+    expect(w.calls()).toContain(`--workspace ${w.missions} --json`);
+    expect(w.calls()).not.toContain(`--workspace ${w.root} --json`);
+  });
   it("shows one direct candidate as the work, labelled with its source, without a root fallback (W2)", () => {
     const w = world();
     const evidence = deriveWorkCandidates([{ qitemId: "q-1", state: "in-progress", tags: ["mission:release-a"] }], w.missions, nothingElse);
@@ -308,11 +382,11 @@ describe("trace-to-root --packet — the work packet as text", () => {
     const trace = (flags: Record<string, boolean>) =>
       w.trace(["--trees", "work", "--packet", "--work-candidates", "-"], { ...evidence, ...flags }).stdout;
     const nextCut = trace({ heldTruncated: false, nextTruncated: true, heldAndNextTruncated: true });
-    expect(nextCut).toContain("(the next list was cut; `rig queue list --owned --state pending` has the rest)");
+    expect(nextCut).toContain("(the next list was cut: 1 of more than 1 shown; `rig queue list --owned --state pending` has the rest)");
     expect(nextCut).not.toContain("held list was cut");
     expect(nextCut).not.toContain("held and next lists were cut");
     const heldCut = trace({ heldTruncated: true, nextTruncated: false, heldAndNextTruncated: true });
-    expect(heldCut).toContain("(the held list was cut; `rig queue list --owned --state blocked` has the rest)");
+    expect(heldCut).toContain("(the held list was cut: 1 of more than 1 shown; `rig queue list --owned --state blocked` has the rest)");
     expect(heldCut).not.toContain("next list was cut");
     expect(trace({ heldTruncated: false, nextTruncated: false, heldAndNextTruncated: false })).not.toContain("was cut");
     // A daemon from before the per-list flags sends only the combined one.
@@ -400,6 +474,57 @@ describe("trace-to-root --packet — the work packet as text", () => {
     expect(out).not.toContain(">-");
   });
 
+  it("bounds each held and next row to one line with a pointer, and shows at most 20 held and 10 next with the full count", () => {
+    const w = world();
+    const long = (word: string, n: number) => `${word} `.repeat(n).trim();
+    const rows = [
+      ...Array.from({ length: 23 }, (_, i) => ({ qitemId: `q-held-${i}`, state: "blocked", tags: [], blockedOn: "q-gate",
+        summary: i === 0 ? `first line\n${long("summary", 100)}` : `held ${i}` })),
+      ...Array.from({ length: 12 }, (_, i) => ({ qitemId: `q-next-${i}`, state: "pending", tags: [], summary: `next ${i}` })),
+    ];
+    const evidence = deriveWorkCandidates(rows, w.missions,
+      { getRow: () => null, continuationOf: (id) => (id === "q-held-0" ? long("continue", 300) : null) });
+    const out = w.trace(["--trees", "work", "--packet", "--work-candidates", "-"],
+      { ...evidence, heldTruncated: false, nextTruncated: false, heldAndNextTruncated: false }).stdout;
+    const first = out.split("\n").find((line) => line.startsWith("- q-held-0 "))!;
+    expect(first.length).toBeLessThan(500);
+    expect(first).toContain("first line summary summary");
+    expect(first).toContain("…");
+    expect(first).toMatch(/— full row: rig queue show q-held-0$/);
+    expect(out).not.toContain("continue ".repeat(100));
+    expect(out).toContain("- q-held-19 — held 19");
+    expect(out).not.toContain("q-held-20");
+    expect(out).toContain("(the held list was cut: 20 of 23 shown; `rig queue list --owned --state blocked` has the rest)");
+    expect(out).toContain("- q-next-9 — next 9");
+    expect(out).not.toContain("q-next-10");
+    expect(out).toContain("(the next list was cut: 10 of 12 shown; `rig queue list --owned --state pending` has the rest)");
+    // A short row is unchanged: no ellipsis, no pointer.
+    expect(out).toContain("- q-held-1 — held 1 — blocked on q-gate — continuation: none recorded\n");
+  });
+
+  it("cuts a long matched section body at about 1,500 characters with the --depth full pointer", () => {
+    const w = world();
+    const state = Array.from({ length: 200 }, (_, i) => `- state line ${i}`).join("\n");
+    writeFileSync(join(w.slice, "NOTES.md"), `## Current state\n${state}\n\n## Log\nold\n`, "utf8");
+    writeFileSync(join(w.slice, "PROGRESS.md"), `## Current state\n${state}\n`, "utf8");
+    writeFileSync(join(w.seat, "LEARNED.md"), `# Builder\n\n## MY JOB HERE\n${state}\n\n## STANDING DUTIES\n- keep rows honest\n`, "utf8");
+    const work = w.trace(["--trees", "work", "--packet", "--work-start", w.slice]).stdout;
+    for (const label of ["NOTES · NOTES.md", "PROGRESS · PROGRESS.md"]) {
+      const body = work.slice(work.indexOf(label)).split("\n\n")[0]!;
+      expect(body.length).toBeLessThan(1_700);
+      expect(body).toContain("- state line 0");
+      expect(body).toContain("[… use --depth full for the rest]");
+    }
+    expect(work).not.toContain("- state line 199");
+    const duties = w.trace(["--trees", "topology", "--packet", "--topology-start", w.seat]).stdout;
+    expect(duties).toContain("[… use --depth full for the rest]");
+    expect(duties).toContain("STANDING DUTIES\n- keep rows honest");
+    expect(duties).not.toContain("- state line 199");
+    // At full depth nothing is cut.
+    const full = w.trace(["--trees", "work", "--packet", "--depth", "full", "--work-start", w.slice]).stdout;
+    expect(full).toContain("- state line 199");
+  });
+
   it("keeps today's pointer rendering when --packet is off", () => {
     const w = world();
     writeFileSync(join(w.slice, "NOTES.md"), "## Current state\nAll green.\n", "utf8");
@@ -410,7 +535,7 @@ describe("trace-to-root --packet — the work packet as text", () => {
 });
 
 describe("refocus hook — OPENRIG_REFOCUS_WORK_PACKET switch", () => {
-  function fire(w: ReturnType<typeof world>, extra: NodeJS.ProcessEnv) {
+  function fire(w: ReturnType<typeof world>, extra: NodeJS.ProcessEnv, runtime: "claude" | "codex" = "claude") {
     const home = join(w.root, "home");
     mkdirSync(home, { recursive: true });
     const argvLog = join(w.root, "python-argv.log");
@@ -424,7 +549,7 @@ describe("refocus hook — OPENRIG_REFOCUS_WORK_PACKET switch", () => {
       role: { state: "not-declared", files: [] },
       workCandidates: deriveWorkCandidates([{ qitemId: "q-1", state: "in-progress", tags: ["mission:release-a"] }], w.missions, nothingElse),
     };
-    const result = spawnSync(process.execPath, [HOOK, "--runtime", "claude"], {
+    const result = spawnSync(process.execPath, [HOOK, "--runtime", runtime], {
       input: JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "packet-fixture", transcript_path: "" }),
       encoding: "utf8",
       env: { ...w.env, OPENRIG_HOME: home, OPENRIG_SESSION_NAME: "builder@demo", OPENRIG_REFOCUS_NOW: "1",
@@ -438,14 +563,37 @@ describe("refocus hook — OPENRIG_REFOCUS_WORK_PACKET switch", () => {
     };
   }
 
-  it("is off by default: no candidates are requested and the trace argv is unchanged", () => {
+  // The default per runtime: on only where native delivery and the agent's next action have been checked. Neither
+  // runtime is yet, so both default off; turning one on changes the hook's table and this line together.
+  const DEFAULT_ON = { claude: false, codex: false } as const;
+
+  it.each(["claude", "codex"] as const)("defaults per runtime (%s), and =0 always gives today's trace argv", (runtime) => {
     const w = world();
-    const { argv, stdin } = fire(w, { OPENRIG_REFOCUS_WORK_PACKET: undefined });
-    expect(w.calls()).toContain("queue whoami --json\n");
-    expect(w.calls()).not.toContain("--work-candidates");
-    expect(argv).toContain(`--work-start ${w.slice}`);
-    expect(argv).not.toContain("--packet");
-    expect(stdin).toBe("");
+    const { argv, stdin } = fire(w, { OPENRIG_REFOCUS_WORK_PACKET: undefined }, runtime);
+    if (DEFAULT_ON[runtime]) {
+      expect(argv).toContain("--packet");
+      expect(argv).toContain("--work-candidates -");
+    } else {
+      expect(w.calls()).toContain("queue whoami --json\n");
+      expect(w.calls()).not.toContain("--work-candidates");
+      expect(argv).toContain(`--work-start ${w.slice}`);
+      expect(argv).not.toContain("--packet");
+      expect(stdin).toBe("");
+    }
+    for (const off of ["0", "off", "false", "no"]) {
+      const v = world();
+      const offRun = fire(v, { OPENRIG_REFOCUS_WORK_PACKET: off }, runtime);
+      expect(v.calls()).not.toContain("--work-candidates");
+      expect(offRun.argv).toBe(`${TRACE} --trees work --depth light --check --unresolved-work-advisory --work-start ${v.slice}\n`);
+      expect(offRun.stdin).toBe("");
+    }
+  });
+
+  it.each(["claude", "codex"] as const)("=1 turns the packet on for %s whatever its default", (runtime) => {
+    const w = world();
+    const { argv } = fire(w, { OPENRIG_REFOCUS_WORK_PACKET: "1" }, runtime);
+    expect(w.calls()).toContain("queue whoami --json --work-candidates");
+    expect(argv).toContain("--packet");
   });
 
   it("when on, passes the daemon's candidates to the trace instead of the strict node", () => {

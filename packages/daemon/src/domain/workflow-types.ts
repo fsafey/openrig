@@ -12,6 +12,9 @@ import type { WorkflowScope } from "./workflow-scope.js";
 
 export type WorkflowExitKind = "handoff" | "waiting" | "done" | "failed";
 
+/** A step-trail row's reason: an exit, or `resumed` for a resume line (no exit; the step's packet is redriven). */
+export type WorkflowTrailReason = WorkflowExitKind | "resumed";
+
 /** OPR.0.4.6.WF2 FR-1: the closed v1 branch-key set — exactly the recorded
  *  exit enum. Growth ONLY via the step-declared-outcome-enums rail (PRD §6
  *  named deferral); never free-text, identity, or opaque evidence JSON. */
@@ -174,6 +177,12 @@ export interface WorkflowExceptionRoutingSpec {
   classes?: Record<string, WorkflowExceptionDialPosition>;
 }
 
+/** #2607: the spec an instance started with, and the file that spec came from. */
+export interface StartedWorkflowSpec {
+  sourcePath: string;
+  spec: WorkflowSpec;
+}
+
 export interface WorkflowSpec {
   id: string;
   version: string;
@@ -258,9 +267,19 @@ export interface WorkflowInstance {
    * site. null = unbound = pre-FAC-1 behavior byte-identical.
    */
   boundRig: string | null;
+  boundPod?: string | null;
   lifecycleOperationKey: string | null;
   compiledInputDigest: string | null;
   lifecycleBinding: Record<string, unknown> | null;
+  /**
+   * #2607 (migration 152): the spec this instance started with (rig placeholders resolved) and the file it came from.
+   * The instance reads the cache row for its id and version while that row still comes from this file, so an edit to
+   * the file reaches it; once another file with the same id and version has replaced the row, it runs this copy.
+   * null for instances from before it, and after a lifecycle revision: they read the cache row.
+   */
+  startedSpec?: StartedWorkflowSpec | null;
+  /** #2730 (migration 154): the root objective it was started with. null for instances from before it: not recorded. */
+  rootObjective?: string | null;
 }
 
 export interface WorkflowFrontierBinding {
@@ -295,7 +314,7 @@ export interface WorkflowStepTrailEntry {
   stepId: string;
   stepRole: string;
   closedAt: string;
-  closureReason: WorkflowExitKind;
+  closureReason: WorkflowTrailReason;
   closureEvidence: Record<string, unknown> | null;
   actorSession: string;
   nextQitemId: string | null;

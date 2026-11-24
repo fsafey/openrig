@@ -1,7 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type Database from "better-sqlite3";
 import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
+import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
+import { migrate } from "../src/db/migrate.js";
+import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
+import { TmuxAdapter } from "../src/adapters/tmux.js";
 
 describe("Rig lifecycle routes", () => {
   let db: Database.Database;
@@ -14,6 +18,154 @@ describe("Rig lifecycle routes", () => {
 
   afterEach(() => {
     db.close();
+  });
+
+  it.each([
+    ["nodes/infra.server", false], ["nodes/infra.server", true],
+    ["pods/infra", false], ["pods/infra", true],
+  ] as const)("preserves work arriving during %s removal (fallback=%s)", async (target, fallback) => {
+    migrate(db, ALL_MIGRATIONS);
+    const rig = setup.rigRepo.createRig("removal-arrival");
+    const expand = (id: string, member: string) => setup.rigExpansionService.expand({ rigId: rig.id,
+      pod: { id, label: id, members: [{ id: member, runtime: "terminal", agentRef: "builtin:terminal", profile: "none", cwd: "/tmp" }], edges: [] } });
+    const worker = await expand("infra", "server");
+    const receiver = await expand("safe", "fallback");
+    expect(worker.ok && receiver.ok).toBe(true);
+    if (!worker.ok || !receiver.ok) return;
+    const session = worker.nodes[0]!.sessionName;
+    const fallbackSession = receiver.nodes[0]!.sessionName;
+    const queue = new QueueRepository(db, setup.eventBus);
+    Object.assign(setup.tmuxAdapter, { deliveryGuard: new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name)) });
+    vi.mocked(setup.tmuxAdapter.hasSession).mockResolvedValue(true);
+    const stopped: string[] = [];
+    setup.eventBus.subscribe(event => { if (event.type === "session.detached") stopped.push(event.sessionName); });
+    let arrived = "";
+    vi.mocked(setup.tmuxAdapter.killSession).mockImplementationOnce(async () => {
+      arrived = (await queue.create({ sourceSession: "source@removal-arrival", destinationSession: session,
+        body: "accepted while tmux was stopping", nudge: false })).qitemId;
+      return { ok: true };
+    });
+
+    const response = await setup.app.request(`/api/rigs/${rig.id}/${target}${fallback ? `?fallback=${encodeURIComponent(fallbackSession)}` : ""}`, { method: "DELETE" });
+    const result = await response.json();
+    const nodes = setup.rigRepo.getRig(rig.id)!.nodes.map(node => node.logicalId);
+    if (fallback) {
+      expect(response.status).toBe(200);
+      expect(result.reroutedQitemIds).toContain(arrived);
+      expect(queue.getById(arrived)?.destinationSession).toBe(fallbackSession);
+      expect(nodes).not.toContain("infra.server");
+    } else {
+      expect(response.status).toBe(409);
+      expect(result.code).toBe("active_qitems");
+      expect(result.activeQitemIds).toContain(arrived);
+      expect(result.sessionsKilled).toBe(1);
+      expect(nodes).toContain("infra.server");
+      expect(queue.getById(arrived)?.destinationSession).toBe(session);
+      expect(result.error).toContain(`session '${session}' was stopped and stays stopped`);
+      if (target.startsWith("nodes/")) expect(result).toMatchObject({ retained: true, sessionStopped: true });
+      else expect(result.nodes).toMatchObject([{ logicalId: "infra.server", status: "failed", code: "active_qitems",
+        retained: true, sessionStopped: true, sessionsKilled: 1, activeQitemIds: [arrived] }]);
+      expect(db.prepare("SELECT status, intentionally_stopped FROM sessions WHERE session_name = ?").get(session))
+        .toEqual({ status: "exited", intentionally_stopped: 1 });
+      expect(stopped).toEqual([session]);
+    }
+    expect(queue.getById(arrived)?.state).toBe("pending");
+  });
+
+  it("reports partial pod removal honestly when work arrives while a later member stops", async () => {
+    migrate(db, ALL_MIGRATIONS);
+    const rig = setup.rigRepo.createRig("partial-arrival");
+    const expanded = await setup.rigExpansionService.expand({ rigId: rig.id,
+      pod: { id: "infra", label: "Infrastructure", members: ["a", "b"].map(id => ({
+        id, runtime: "terminal", agentRef: "builtin:terminal", profile: "none", cwd: "/tmp",
+      })), edges: [] } });
+    expect(expanded.ok).toBe(true);
+    if (!expanded.ok) return;
+    const second = expanded.nodes.find(node => node.logicalId === "infra.b")!;
+    const queue = new QueueRepository(db, setup.eventBus);
+    Object.assign(setup.tmuxAdapter, { deliveryGuard: new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name)) });
+    let arrived = "";
+    vi.mocked(setup.tmuxAdapter.killSession).mockImplementation(async session => {
+      if (session === second.sessionName) arrived = (await queue.create({ sourceSession: "source@partial-arrival",
+        destinationSession: session, body: "late work", nudge: false })).qitemId;
+      return { ok: true };
+    });
+
+    const response = await setup.app.request(`/api/rigs/${rig.id}/pods/infra`, { method: "DELETE" });
+    expect(response.status).toBe(207);
+    const result = await response.json();
+    expect(result).toMatchObject({ status: "partial", sessionsKilled: 2, removedLogicalIds: ["infra.a"],
+      nodes: [{ logicalId: "infra.a", status: "removed", sessionsKilled: 1 },
+        { logicalId: "infra.b", status: "failed", sessionsKilled: 1, code: "active_qitems", retained: true, sessionStopped: true }] });
+    expect(result.nodes[1].error).toContain(arrived);
+    expect(setup.rigRepo.getRig(rig.id)!.nodes.map(node => node.logicalId)).toEqual(["infra.b"]);
+    expect(queue.getById(arrived)?.destinationSession).toBe(second.sessionName);
+  });
+
+  it("completes a pod shrink whose unused fallback stops running after the pod-level check", async () => {
+    migrate(db, ALL_MIGRATIONS);
+    const rig = setup.rigRepo.createRig("unused-fallback");
+    const expand = (id: string, members: string[]) => setup.rigExpansionService.expand({ rigId: rig.id,
+      pod: { id, label: id, members: members.map(member => ({ id: member, runtime: "terminal", agentRef: "builtin:terminal",
+        profile: "none", cwd: "/tmp" })), edges: [] } });
+    const worker = await expand("infra", ["a", "b"]);
+    const receiver = await expand("safe", ["fallback"]);
+    expect(worker.ok && receiver.ok).toBe(true);
+    if (!worker.ok || !receiver.ok) return;
+    const fallbackSession = receiver.nodes[0]!.sessionName;
+    Object.assign(setup.tmuxAdapter, { deliveryGuard: new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name)) });
+    vi.mocked(setup.tmuxAdapter.hasSession).mockResolvedValueOnce(true).mockResolvedValue(false);
+    vi.mocked(setup.tmuxAdapter.killSession).mockResolvedValue({ ok: true });
+
+    const response = await setup.app.request(`/api/rigs/${rig.id}/pods/infra?fallback=${encodeURIComponent(fallbackSession)}`, { method: "DELETE" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "ok", sessionsKilled: 2, removedLogicalIds: ["infra.a", "infra.b"], reroutedQitemIds: [] });
+    expect(setup.tmuxAdapter.hasSession).toHaveBeenCalledTimes(1);
+    expect(setup.rigRepo.getRig(rig.id)!.nodes.map(node => node.logicalId)).toEqual(["safe.fallback"]);
+  });
+
+  it.each(["nodes/infra.server", "pods/infra"])("reports the real code and effects when the fallback is lost before late work in %s removal", async (target) => {
+    migrate(db, ALL_MIGRATIONS);
+    const rig = setup.rigRepo.createRig("lost-fallback");
+    const expand = (id: string, member: string) => setup.rigExpansionService.expand({ rigId: rig.id,
+      pod: { id, label: id, members: [{ id: member, runtime: "terminal", agentRef: "builtin:terminal", profile: "none", cwd: "/tmp" }], edges: [] } });
+    const worker = await expand("infra", "server");
+    const receiver = await expand("safe", "fallback");
+    expect(worker.ok && receiver.ok).toBe(true);
+    if (!worker.ok || !receiver.ok) return;
+    const session = worker.nodes[0]!.sessionName;
+    const fallbackSession = receiver.nodes[0]!.sessionName;
+    const queue = new QueueRepository(db, setup.eventBus);
+    Object.assign(setup.tmuxAdapter, { deliveryGuard: new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name)) });
+    const early = (await queue.create({ sourceSession: "source@lost-fallback", destinationSession: session,
+      body: "queued before removal", nudge: false })).qitemId;
+    let fallbackRunning = true;
+    vi.mocked(setup.tmuxAdapter.hasSession).mockImplementation(async () => fallbackRunning);
+    let late = "";
+    vi.mocked(setup.tmuxAdapter.killSession).mockImplementationOnce(async () => {
+      late = (await queue.create({ sourceSession: "source@lost-fallback", destinationSession: session,
+        body: "accepted while tmux was stopping", nudge: false })).qitemId;
+      fallbackRunning = false;
+      return { ok: true };
+    });
+
+    const response = await setup.app.request(`/api/rigs/${rig.id}/${target}?fallback=${encodeURIComponent(fallbackSession)}`, { method: "DELETE" });
+    expect(response.status).toBe(409);
+    const result = await response.json();
+    expect(result).toMatchObject({ code: "fallback_not_running", sessionsKilled: 1, fallbackDestination: fallbackSession,
+      reroutedQitemIds: [early], activeQitemIds: [late] });
+    if (target.startsWith("nodes/")) expect(result).toMatchObject({ retained: true, sessionStopped: true });
+    else expect(result.nodes).toMatchObject([{ logicalId: "infra.server", status: "failed", code: "fallback_not_running",
+      retained: true, sessionStopped: true, sessionsKilled: 1, activeQitemIds: [late] }]);
+    expect(result.error).not.toContain("No queue or topology changes were made");
+    expect(result.error).toContain(early);
+    expect(result.error).toContain(late);
+    expect(result.error).toContain("stays stopped");
+    expect(queue.getById(early)?.destinationSession).toBe(fallbackSession);
+    expect(queue.getById(late)).toMatchObject({ destinationSession: session, state: "pending" });
+    expect(setup.rigRepo.getRig(rig.id)!.nodes.map(node => node.logicalId)).toContain("infra.server");
+    expect(db.prepare("SELECT status, intentionally_stopped FROM sessions WHERE session_name = ?").get(session))
+      .toEqual({ status: "exited", intentionally_stopped: 1 });
   });
 
   it("POST /api/sessions/:sessionRef/unclaim releases a claimed session and reactivates discovery", async () => {
@@ -395,6 +547,33 @@ describe("Rig lifecycle routes", () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual(expect.objectContaining({ ok: false, code: "fallback_in_target" }));
     expect(setup.rigRepo.getRig(rig.id)?.nodes.map((node) => node.logicalId)).toEqual(["infra.server"]);
+  });
+
+  it("removes a running external_cli seat without a tmux server or stopping the caller's program", async () => {
+    migrate(db, ALL_MIGRATIONS);
+    const exec = vi.fn(async () => { throw new Error("no server running on /tmp/tmux-1000/fixture"); });
+    const tmux = new TmuxAdapter(exec);
+    tmux.deliveryGuard = new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name));
+    setup = createTestApp(db, { tmux });
+    const rig = setup.rigRepo.createRig("remove-external");
+    const node = setup.rigRepo.addNode(rig.id, "external.helper", { runtime: "terminal" });
+    const attached = await setup.selfAttachService.attachToNode({
+      rigId: rig.id, logicalId: node.logicalId, displayName: "raw@remove-external", cwd: "/tmp",
+    });
+    expect(attached.ok).toBe(true);
+    if (!attached.ok) return;
+    expect(setup.sessionRegistry.getBindingForNode(node.id)).toMatchObject({ attachmentType: "external_cli", tmuxSession: null });
+    expect(setup.sessionRegistry.getSessionsForRig(rig.id).find(session => session.nodeId === node.id))
+      .toMatchObject({ origin: "claimed", status: "running" });
+    exec.mockClear();
+    const kill = vi.spyOn(tmux, "killSession");
+    const response = await setup.app.request(`/api/rigs/${rig.id}/nodes/${node.id}`, { method: "DELETE" });
+    const body = await response.json();
+    expect(response.status, JSON.stringify(body)).toBe(200);
+    expect(body).toMatchObject({ ok: true, sessionsKilled: 0 });
+    expect(setup.rigRepo.getRig(rig.id)?.nodes.some(candidate => candidate.id === node.id)).toBe(false);
+    expect(kill).not.toHaveBeenCalled();
+    expect(exec).not.toHaveBeenCalled();
   });
 
   it("DELETE /api/rigs/:rigId/nodes/:nodeRef preserves a previously detached claimed session while removing the node", async () => {

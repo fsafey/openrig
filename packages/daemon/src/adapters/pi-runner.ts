@@ -1,9 +1,10 @@
+import type { PiManagedRequest } from "./pi-runner-protocol.js";
 // OPR.0.4.6.PI1 — the pane-hosted pi-runner (compiled entry in the daemon dist).
 //
 // The runner is what makes a Pi seat behave like a normal OpenRig tmux seat
 // while everything underneath stays structured RPC:
 //
-//   pane stdin (rig send / human typing)  ──▶ RPC prompt / steer / follow_up
+//   pane stdin (rig send / human typing)  ──▶ RPC prompt (queued as a steer while busy) / follow_up
 //   pi RPC events (typed JSONL)           ──▶ (a) human-readable pane mirror
 //                                             (b) activity + session_identity
 //                                                 POSTs to the daemon
@@ -21,7 +22,8 @@
 import fs from "node:fs";
 import nodePath from "node:path";
 import readline from "node:readline";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
+import stringWidth from "string-width";
 import { StringDecoder } from "node:string_decoder";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
@@ -29,6 +31,7 @@ import { stripVTControlCharacters } from "node:util";
 import { formatDaemonHostForUrl } from "./daemon-url.js";
 import { credentialTaint, judgeChargeProvenance, piCredentialEvidence, piCredentialNotice, type PiCredentialEvidence } from "./pi-readiness.js";
 import { extractPiUsageFacts, parsePiSessionHeader, tiesPiForkHeader, type PiSessionBoundary, type PiUsageFact } from "../domain/pi-usage-facts.js";
+import { validateLaunchWrapper } from "../domain/launch-wrapper.js";
 import { OpenRouterChargeLookup, openRouterGenerationFetcher, type ChargeProvenance } from "./pi-openrouter-charge.js";
 import { OMP_MAX_FRAME_BYTES, OmpFrameDecoder, ompProtocolV2Limit } from "./omp-rpc-frame.js";
 import {
@@ -37,19 +40,464 @@ import {
   type PiRunnerState, type RunnerRuntime,
 } from "./pi-runner-protocol.js";
 
+/** Bind the selected account's credentials while retaining the seat's own Pi resources. */
+export function preparePiAccount(agentDir: string, accountHome: string | undefined): void {
+  fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  const marker = nodePath.join(agentDir, ".openrig-account");
+  const auth = nodePath.join(agentDir, "auth.json");
+  // Validate every explicit home, including the seat's own directory, before changing any link.
+  if (accountHome) {
+    const source = nodePath.join(accountHome, "auth.json");
+    fs.accessSync(source, fs.constants.R_OK);
+    if (!fs.statSync(source).isFile()) throw new Error("Selected Pi auth must be a file");
+  }
+  if (accountHome && fs.realpathSync(accountHome) !== fs.realpathSync(agentDir)) {
+    const source = nodePath.join(accountHome, "auth.json");
+    const current = fs.lstatSync(auth, { throwIfNoEntry: false });
+    if (current && (!current.isSymbolicLink() || !fs.existsSync(marker))) {
+      throw new Error("Existing Pi login is not a managed account link; use a confirmed account switch");
+    }
+    fs.rmSync(auth, { force: true });
+    // Record ownership before linking so a crash between these writes is retryable.
+    fs.writeFileSync(marker, accountHome, { mode: 0o600 });
+    fs.symlinkSync(source, auth);
+  } else if (!accountHome && fs.existsSync(marker)) {
+    // A Pi login may have replaced the link since it was installed.
+    if (fs.lstatSync(auth, { throwIfNoEntry: false })?.isSymbolicLink()) fs.rmSync(auth);
+    fs.rmSync(marker);
+  }
+}
+
 // ── Submitted input boundaries ─────────────────────────────────────────────
 // Canonical TTY buffers can overflow before Node sees even the paste terminator.
 // Use Node's line editor in raw mode, with only paste framing handled here.
 export const MAX_PI_INPUT_BYTES = 1024 * 1024;
 
+// ── The compose region's physical layout ──────────────────────────────────────────
+// One layout model for painting, erasing and the caret: cells fill terminal rows
+// greedily, a wide character that no longer fits wraps whole to the next row, and
+// an explicit newline starts one. Every row the compositor paints or erases, and
+// the caret it places, derives from here — measured with the daemon's string-width.
+
+/** Where a compose region sits on screen, and where its caret lands. */
+export interface ComposeLayout { rows: number; caretRow: number; caretColumn: number; }
+
+const SEGMENTER = (() => {
+  try {
+    return new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  } catch {
+    return null;
+  }
+})();
+
+/** Grapheme clusters: what a terminal lays out. A ZWJ family emoji is one cluster
+ *  taking two cells where its code points would sum to six; a combining mark adds none. */
+export function* graphemesOf(text: string): Generator<string> {
+  if (SEGMENTER) {
+    for (const part of SEGMENTER.segment(text)) yield part.segment;
+  } else {
+    for (const character of text) yield character;
+  }
+}
+
+const TAB_WIDTH = 8;
+
+export function composeLayout(text: string, width: number, caret = text.length): ComposeLayout {
+  if (!text) return { rows: 0, caretRow: 0, caretColumn: 0 };
+  if (width <= 0) return { rows: text.split("\n").length, caretRow: 0, caretColumn: 0 };
+  let row = 0;
+  let column = 0;
+  let caretRow = 0;
+  let caretColumn = 0;
+  let index = 0;
+  const place = () => { caretRow = row; caretColumn = column; };
+  for (const segment of graphemesOf(text)) {
+    if (index === caret) place();
+    if (segment === "\n") {
+      row += 1;
+      column = 0;
+    } else if (segment === "\t") {
+      // A tab advances to the next ordinary tab stop, clamped to the last column.
+      column = Math.min((Math.floor(column / TAB_WIDTH) + 1) * TAB_WIDTH, width - 1);
+    } else {
+      const cells = Math.max(0, stringWidth(segment));
+      if (column + cells > width) {
+        row += 1;
+        column = 0;
+      }
+      column += cells;
+    }
+    index += segment.length;
+  }
+  if (index === caret) place();
+  return { rows: row + 1, caretRow, caretColumn };
+}
+
+// ── Pane text styles ───────────────────────────────────────────────────────
+// Emphasis for the lines the runner itself writes. The words carry the meaning on their
+// own — a plain log or a captured pane reads the same — so colour is an addition, never
+// the only signal. Model output and the READY/EXITED/ERROR markers stay unstyled: adapters
+// grep the transcript for those markers. NO_COLOR and a non-TTY output disable styling.
+export interface PaneStyle {
+  bold(text: string): string;
+  dim(text: string): string;
+  /** The operator's own lines: `you ▸ …`, `you (steer) ▸ …`. */
+  commit(text: string): string;
+  /** A failed tool call's verdict. */
+  failed(text: string): string;
+}
+
+export function paneStyles(enabled: boolean): PaneStyle {
+  const sgr = (open: string) => (text: string) => (enabled ? `\u001b[${open}m${text}\u001b[0m` : text);
+  return { bold: sgr("1"), dim: sgr("2"), commit: sgr("1;36"), failed: sgr("1;31") };
+}
+
+const STYLE: PaneStyle = paneStyles(process.stdout.isTTY === true && !process.env.NO_COLOR);
+
+// ── Pane live region (compose + status) ────────────────────────────────────────
+// A seat pane is a plain terminal: one bottom live region holds the operator's draft
+// and the runner's status line, and is erased and repainted around every transcript
+// write. Nothing else may write at the cursor, or a draft freezes into scrollback and
+// streamed text fuses with it mid-word. When the terminal's width is unknown the
+// compositor places nothing — the pane falls back to plain output, and the draft,
+// though still editable, is not drawn.
+
+/** The live region a pane host repaints around transcript writes. */
+export interface PaneCompositor {
+  /** Bind the line editor the compose line renders from, and where its cursor sits. */
+  attach(read: () => string, redraw: () => void, caretUp?: () => number, readCursor?: () => number): void;
+  /** Unbind the editor; any held streamed tail is flushed and the live region is dropped. */
+  detach(): void;
+  /** A keystroke changed the draft: repaint the live region from readline's state. A
+   *  draft that just went away flushes a held streamed tail first, as plain output would. */
+  refresh(): void;
+  /** Streamed model text: verbatim while no live region exists; once a draft or a
+   *  status line is on the bottom, complete lines go above the region and an
+   *  unfinished line is held, so no live line is split or frozen into scrollback. */
+  transcript(text: string): void;
+  /** One complete line of transcript. */
+  line(text: string): void;
+  /** A keypress is about to echo: close an open transcript line first, or the echo
+   *  and the next streamed deltas would land on top of it. */
+  beforeInput(): void;
+  /** Pin the latest diagnostic on the region's diagnostic row. The transcript copy is the
+   *  caller's; this pin is never the only copy. The seat's own status row is untouched. */
+  diagnostic(text: string): void;
+  /** Drop the pinned diagnostic. The seat's own status row stays. */
+  clearStatus(): void;
+  /** The seat's own status row above the diagnostic row: what it runs and the state the
+   *  runner observed. Empty text clears it. */
+  status(text: string): void;
+  /** Before the submit commits: drop the draft line so no partial copy scrolls, and
+   *  finish any held streamed line; the durable copy is the commit line below. */
+  beforeSubmit(): void;
+  /** Repaint the live region in place. */
+  repaint(): void;
+}
+
+export function createPaneCompositor(out: NodeJS.WriteStream): PaneCompositor {
+  /** The seat's own status row (`model · thinking:… · state`), and the pinned diagnostic
+   *  below it. They are independent: a turn clears the pin and keeps the seat row. */
+  let seat: string | null = null;
+  let pinned: string | null = null;
+  /** The status rows actually on screen, clipped when they were painted. A resize must
+   *  size the region from these, not from the longer text they were set with. */
+  let paintedSeat: string | null = null;
+  let paintedPinned: string | null = null;
+  /** The unfinished streamed line, as displayed above the status rows (null when it is not). */
+  let paintedHeld: string | null = null;
+  let readInput: (() => string) | null = null;
+  let redrawLine: (() => void) | null = null;
+  let held = "";
+  let openLine = false;
+  let screenRows = 0;
+  let readCaretUp: (() => number) | null = null;
+  let readCaretIndex: (() => number) | null = null;
+  const widthKnown = () => typeof out.columns === "number" && out.columns > 0;
+  const composeText = () => (readInput && redrawLine ? readInput() : "");
+  const composeRows = () => {
+    const text = composeText();
+    return text && widthKnown() ? composeLayout(text, out.columns).rows : 0;
+  };
+  const clip = (text: string) => {
+    const flat = text.replace(/[\r\n\t]+/g, " ").trimEnd();
+    if (!widthKnown() || stringWidth(flat) < out.columns) return flat;
+    let used = 0;
+    let clipped = "";
+    for (const segment of graphemesOf(flat)) {
+      const cells = Math.max(0, stringWidth(segment));
+      if (used + cells > out.columns - 1) break;
+      clipped += segment;
+      used += cells;
+    }
+    return `${clipped}\u2026`;
+  };
+  const eraseLines = (lines: number) => {
+    let sequence = "";
+    for (let index = 0; index < lines; index += 1) sequence += index === 0 ? "\r\u001b[2K" : "\u001b[1A\r\u001b[2K";
+    if (sequence) out.write(sequence);
+  };
+  /** The visible tail of the held streamed line: at most the pane's spare rows, so a
+   *  newline-free paragraph longer than the viewport never scrolls its own repaint —
+   *  what scrolls stays in history, and the whole line is committed once when it ends. */
+  const heldTail = (text: string): string => {
+    const height = typeof out.rows === "number" && out.rows > 0 ? out.rows : 24;
+    const budget = Math.max(1, height - 2
+      - (seat !== null ? 1 : 0) - (pinned !== null ? 1 : 0) - composeRows());
+    if (composeLayout(text, out.columns).rows <= budget) return text;
+    // Bound by the final wrapped layout, ellipsis included: at an odd width a two-cell
+    // character can't fill the last column, so a cell-count bound would overflow the
+    // region. A shorter suffix never wraps to more rows, so bisect on its start.
+    const graphemes = [...graphemesOf(text)];
+    const fits = (start: number) =>
+      composeLayout(`\u2026${graphemes.slice(start).join("")}`, out.columns).rows <= budget;
+    let low = 0;
+    let high = graphemes.length; // the ellipsis alone fits any budget
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (fits(mid)) high = mid;
+      else low = mid + 1;
+    }
+    return `\u2026${graphemes.slice(low).join("")}`;
+  };
+  /** Rows this compositor has on screen, recorded when it painted them. Readline never writes
+   *  to the terminal, so nothing else can change these rows behind the compositor's back —
+   *  except a reflow, which the resize handler owns. */
+  const paint = () => {
+    // Without a width nothing can be placed, erased or measured; the status text is kept
+    // and painted once a width is known (a resize or the next write calls back here).
+    if (!widthKnown()) {
+      paintedSeat = null;
+      paintedPinned = null;
+      paintedHeld = null;
+      screenRows = 0;
+      return;
+    }
+    // A transcript line a verbatim write left open must not be spliced by the region:
+    // close it first, so the region starts on its own row and the line stays whole.
+    if (openLine && (seat !== null || pinned !== null || composeRows() > 0)) {
+      out.write("\n");
+      openLine = false;
+    }
+    paintedSeat = seat !== null ? clip(seat) : null;
+    paintedPinned = pinned !== null ? clip(pinned) : null;
+    const statusRows = [paintedSeat, paintedPinned].filter((text): text is string => text !== null);
+    // An in-progress streamed line stays visible as the region's first row while a status
+    // row is painted — bounded to the pane's spare rows so its own repaint never scrolls;
+    // without one the pane keeps its verbatim fallback and the line is held until it ends.
+    paintedHeld = statusRows.length > 0 && held.length > 0 ? heldTail(held) : null;
+    let heldRows = 0;
+    if (paintedHeld !== null) {
+      out.write(paintedHeld);
+      out.write("\n");
+      heldRows = Math.max(1, composeLayout(paintedHeld, out.columns).rows);
+    }
+    for (const text of statusRows) {
+      out.write(text);
+      out.write("\n");
+    }
+    const rows = composeRows();
+    if (rows) redrawLine?.();
+    screenRows = heldRows + statusRows.length + (rows || (heldRows + statusRows.length > 0 ? 1 : 0));
+    // Only a painted region closes an open transcript line. With nothing painted the
+    // cursor still sits on the line a flush left open, and the next keystroke belongs
+    // to that line's context, not to a fresh one.
+    if (screenRows > 0) openLine = false;
+  };
+  const eraseScreen = () => {
+    // Nothing painted: there is no region to erase, and stepping down from a stale
+    // caret count would move the cursor off the transcript line it is still on.
+    if (screenRows === 0) return;
+    const down = readCaretUp ? readCaretUp() : 0;
+    if (down > 0) out.write(`\u001b[${down}B`);
+    eraseLines(screenRows);
+    screenRows = 0;
+  };
+  const flushHeld = () => {
+    if (!held) return;
+    out.write(held.endsWith("\n") ? held : `${held}\n`);
+    held = "";
+    openLine = false;
+  };
+  const writeVerbatim = (text: string) => {
+    out.write(text);
+    openLine = !text.endsWith("\n");
+  };
+  const writeAbove = (text: string) => {
+    eraseScreen();
+    out.write(text.endsWith("\n") ? text : `${text}\n`);
+    paint();
+  };
+  // A tile attaching or detaching reflows the pane, and the terminal keeps the cursor on
+  // its character. So the old paint now occupies exactly what the new width says it does:
+  // the pinned status wraps to ceil(cells/columns) rows, the draft to its layout rows.
+  // Move down to the region's last row — past the lines below the caret — erase exactly
+  // that many rows, and repaint at the new width. No max(): under-erasing leaves a stale
+  // copy of a wrapped status, over-erasing drops a transcript line off the screen.
+  const onResize = () => {
+    if (!widthKnown()) {
+      screenRows = 0;
+      return;
+    }
+    if (screenRows === 0) {
+      // Nothing painted: nothing to erase. A line a verbatim write left open is closed
+      // so the retained region starts on its own row instead of splicing into it.
+      if (openLine) {
+        out.write("\n");
+        openLine = false;
+      }
+      paint();
+      return;
+    }
+    const draft = composeText();
+    const layout = draft ? composeLayout(draft, out.columns, readCaretIndex ? readCaretIndex() : draft.length) : null;
+    const draftRows = layout ? layout.rows : 0;
+    const statusLines = [paintedSeat, paintedPinned].reduce((sum, text) =>
+      text !== null ? sum + Math.max(1, Math.ceil(stringWidth(text) / out.columns)) : sum, 0);
+    // The held streamed row reflowed at the new width: a long partial line wraps here too.
+    const heldLines = paintedHeld !== null ? composeLayout(paintedHeld, out.columns).rows : 0;
+    const down = layout ? layout.rows - 1 - layout.caretRow : 0;
+    if (down > 0) out.write(`\u001b[${down}B`);
+    // Status and held rows without a draft also own the blank row their trailing newline
+    // left the cursor on — the same row paint() counts into screenRows.
+    eraseLines(heldLines + statusLines + (draftRows || (heldLines + statusLines > 0 ? 1 : 0)));
+    screenRows = 0;
+    paint();
+  };
+  out.on("resize", onResize);
+  const pane: PaneCompositor = {
+    attach(read, redraw, caretUp, readCursor) {
+      readInput = read;
+      redrawLine = redraw;
+      readCaretUp = caretUp ?? null;
+      readCaretIndex = readCursor ?? null;
+    },
+    detach() {
+      eraseScreen();
+      flushHeld();
+      readInput = null;
+      redrawLine = null;
+      readCaretUp = null;
+      readCaretIndex = null;
+      // The region is gone; nothing of it may be repainted after the pane falls back.
+      seat = null;
+      pinned = null;
+      paintedSeat = null;
+      paintedPinned = null;
+      paintedHeld = null;
+      openLine = false;
+      screenRows = 0;
+    },
+    refresh() {
+      eraseScreen();
+      // With no region left, an unfinished streamed line goes out verbatim so the
+      // next delta continues it on the same row instead of splitting mid-word.
+      if (held && (!widthKnown() || (pinned === null && seat === null)) && !composeText()) {
+        writeVerbatim(held);
+        held = "";
+      }
+      paint();
+    },
+    transcript(text) {
+      if (!text) return;
+      if (!widthKnown() || (pinned === null && seat === null && composeRows() === 0 && screenRows === 0)) {
+        if (held) {
+          writeVerbatim(held);
+          held = "";
+        }
+        writeVerbatim(text);
+        return;
+      }
+      held += text;
+      const first = held.indexOf("\n");
+      if (first < 0) {
+        // A delta with no newline yet must still show as it streams: repaint the region
+        // (the painted tail is bounded) while a status row is painted.
+        if (seat !== null || pinned !== null) {
+          eraseScreen();
+          paint();
+        }
+        return;
+      }
+      // Drain every complete line in one batch: erase once, write them above in order,
+      // then repaint. Painting the remainder between lines would scroll a long chunk.
+      const last = held.lastIndexOf("\n");
+      const complete = held.slice(0, last + 1);
+      held = held.slice(last + 1);
+      eraseScreen();
+      out.write(complete);
+      openLine = false;
+      paint();
+    },
+    line(text) {
+      pane.transcript(`${text}\n`);
+    },
+    beforeInput() {
+      if (!openLine) return;
+      out.write("\n");
+      openLine = false;
+    },
+    diagnostic(text) {
+      // Without a known width there is no region to pin into. Callers already wrote
+      // the transcript copy; printing here would duplicate it.
+      if (!widthKnown()) return;
+      if (openLine) {
+        out.write("\n");
+        openLine = false;
+      }
+      eraseScreen();
+      pinned = text;
+      paint();
+    },
+    clearStatus() {
+      if (pinned === null) return;
+      eraseScreen();
+      pinned = null;
+      paint();
+    },
+    status(text) {
+      const next = text ? text : null;
+      if (next === seat) return;
+      // Without a width nothing is painted or measured, but the text is kept: the next
+      // resize (or paint with a width) shows the state it named, instead of dropping it
+      // until some later state change.
+      if (!widthKnown()) {
+        seat = next;
+        return;
+      }
+      eraseScreen();
+      seat = next;
+      paint();
+    },
+    beforeSubmit() {
+      eraseScreen();
+      openLine = false;
+      flushHeld();
+    },
+    repaint() {
+      paint();
+    },
+  };
+  return pane;
+}
+
 export function createRunnerInput(
-  input: NodeJS.ReadStream,
-  output: NodeJS.WriteStream,
+  input: NodeJS.ReadableStream & { readonly isTTY?: boolean; readonly isRaw?: boolean; setRawMode: (raw: boolean) => unknown },
+  output: NodeJS.WritableStream & { readonly isTTY?: boolean; readonly columns?: number; readonly rows?: number },
   onSubmit: (block: string) => void,
+  pane?: PaneCompositor,
 ): readline.Interface {
-  const reject = () => output.write(
-    "[pi-runner] input rejected: maximum 1048576 UTF-8 bytes; send a smaller message. Ctrl-C clears unfinished input.\n",
-  );
+  const say = (text: string) => {
+    if (pane) {
+      pane.line(text);
+      pane.diagnostic(text);
+    } else {
+      output.write(`${text}\n`);
+    }
+  };
+  const reject = () => {
+    say("[pi-runner] input rejected: maximum 1048576 UTF-8 bytes; send a smaller message. Ctrl-C clears unfinished input.");
+  };
   const submit = (block: string) => {
     if (Buffer.byteLength(block) > MAX_PI_INPUT_BYTES) reject();
     else if (block.trim()) onSubmit(block);
@@ -59,15 +507,43 @@ export function createRunnerInput(
     return readline.createInterface({ input, crlfDelay: Infinity }).on("line", submit);
   }
 
+  const [major = 0, minor = 0, patch = 0] = process.versions.node.split(".").map(Number);
+  const batchText = (major === 22 && (minor === 21 || (minor === 22 && patch === 0)))
+    || (major === 24 && minor >= 9 && (minor < 11 || (minor === 11 && patch <= 1)))
+    || (major === 25 && (minor === 0 || (minor === 1 && patch === 0)));
   const keys = new PassThrough();
+  const editorInput = batchText ? new PassThrough() : keys;
+  // Readline edits against a discard sink: it must never draw on the terminal, because
+  // _refreshLine does moveCursor(0, -prevRows) + clearScreenDown(), which erases whatever the
+  // compositor put above the draft. The compositor owns every terminal byte instead.
+  const sink = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+  // Readline wraps its edit against output.columns; carry the terminal's geometry onto the sink.
+  Object.assign(sink, { columns: output.columns, rows: output.rows });
+  let caretUp = 0;
+  const renderCompose = () => {
+    const text = `${editor.line ?? ""}`;
+    if (!text) return;
+    const width = typeof output.columns === "number" && output.columns > 0 ? output.columns : 0;
+    output.write(text);
+    if (!width) return;
+    const cursor = Math.max(0, Math.min(Number(editor.cursor) || 0, text.length));
+    const layout = composeLayout(text, width, cursor);
+    caretUp = layout.rows - 1 - layout.caretRow;
+    if (caretUp > 0) output.write(`\u001b[${caretUp}A`);
+    output.write("\r");
+    if (layout.caretColumn > 0) output.write(`\u001b[${layout.caretColumn}C`);
+  };
+  pane?.attach(() => `${editor.line ?? ""}`, renderCompose, () => caretUp, () => Math.max(0, Math.min(Number(editor.cursor) || 0, `${editor.line ?? ""}`.length)));
+
   const editor = readline.createInterface({
-    input: keys, output, terminal: true, prompt: "", historySize: 0, crlfDelay: Infinity,
+    input: editorInput, output: sink, terminal: true, prompt: "", historySize: 0, crlfDelay: Infinity,
   });
   // Node forces dumb-terminal mode without editing if TERM=dumb. When terminal: true
   // was requested, remove the dumb-mode override so VT100 line editing is preserved.
   if (Object.prototype.hasOwnProperty.call(editor, "_ttyWrite")) {
     delete (editor as any)._ttyWrite;
   }
+
   const decoder = new StringDecoder("utf8");
   let pending = "";
   let paste: string | null = null;
@@ -77,12 +553,35 @@ export function createRunnerInput(
     // Node documents changing rl.line together with rl.cursor. The installed
     // typings mark them readonly, so assign this pair through one explicit seam.
     Object.assign(editor, { line, cursor });
-    editor.prompt(true);
+    pane?.refresh();
   };
   const clear = () => setLine("", 0);
+  // Node 22.21–22.22.0 (also some 24/25 releases) appends batched text after
+  // cursor edits. Decode keys with Node, then write each plain-text run at once;
+  // controls flush that run first. Fixed Node keeps its original undo grouping.
+  let typed = "";
+  const flushTyped = () => {
+    if (!typed) return;
+    const text = typed;
+    typed = "";
+    editor.write(text);
+  };
+  const keypress = (text: string | undefined, key: readline.Key) => {
+    if (text && !key.ctrl && !key.meta && !/[\u0000-\u001f\u007f]/.test(text)) typed += text;
+    else {
+      flushTyped();
+      editor.write(text ?? "", key);
+    }
+  };
+  if (batchText) {
+    readline.emitKeypressEvents(keys);
+    keys.on("keypress", keypress);
+  }
   const consume = (text: string) => {
     if (paste === null) {
+      pane?.beforeInput();
       keys.write(text);
+      if (batchText) flushTyped();
     } else if (!discarded) {
       pasteBytes += Buffer.byteLength(text);
       if (pasteBytes > MAX_PI_INPUT_BYTES) {
@@ -114,7 +613,7 @@ export function createRunnerInput(
         paste = null;
         discarded = false;
         clear();
-        output.write("\n[pi-runner] input cleared\n");
+        say("[pi-runner] input cleared");
         onSubmit("/abort");
       } else if (paste === null) {
         paste = "";
@@ -133,20 +632,27 @@ export function createRunnerInput(
         paste = null;
       }
     }
+    pane?.refresh();
   };
-  const wasRaw = input.isRaw;
+  const wasRaw = input.isRaw ?? false;
   const end = () => editor.close();
   input.setRawMode(true);
   output.write("\u001b[?2004h");
   input.on("data", receive);
   input.once("end", end);
-  editor.on("line", submit);
+  editor.on("line", (line) => {
+    pane?.beforeSubmit();
+    submit(line);
+  });
   editor.once("close", () => {
     input.removeListener("data", receive);
     input.removeListener("end", end);
     input.setRawMode(wasRaw);
     input.pause();
+    keys.removeListener("keypress", keypress);
     keys.destroy();
+    pane?.detach();
+    if (editorInput !== keys) editorInput.destroy();
     output.write("\u001b[?2004l");
   });
   return editor;
@@ -179,11 +685,22 @@ function piCredentialHint(message: string): string {
     : " For managed Pi, configure this provider in the seat's PI_CODING_AGENT_DIR (auth.json or models.json). Its key is not in OpenRig's Pi environment passthrough map; default Pi logins are not automatically shared.";
 }
 
-function errorNotice(details: unknown[], runtime: RunnerRuntime): string {
-  // Empty or control-only fields must not hide a later usable diagnostic.
-  const text = details.map(detail => typeof detail === "string"
+/** The first usable diagnostic, on one line with control characters removed. Empty or control-only fields must not hide
+ *  a later usable one. */
+function diagnosticText(details: unknown[]): string {
+  return details.map(detail => typeof detail === "string"
     ? stripVTControlCharacters(detail).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/g, " ").trim()
     : "").find(Boolean) ?? "";
+}
+/** A runner-owned label for the pane (a configured model or effort): painted as given, so
+ *  terminal controls and bidi/format characters are neutralized first, as diagnostics are. */
+function paneLabel(text: string): string {
+  return stripVTControlCharacters(text).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/g, " ").trim();
+}
+
+
+function errorNotice(details: unknown[], runtime: RunnerRuntime | string): string {
+  const text = diagnosticText(details);
   const marker = runtime === "omp" ? "[omp-runner] ERROR" : PI_RUNNER_ERROR_MARKER;
   return `${marker} ${text.slice(0, 400) || "request failed"}${runtime === "pi" ? piCredentialHint(text) : ""}`;
 }
@@ -193,7 +710,7 @@ function errorNotice(details: unknown[], runtime: RunnerRuntime): string {
  *  turn normally; OMP repeats the message on turn_end, and either runtime can
  *  announce it again when automatic retries exhaust. The core coalesces the
  *  repeats into one notice per failure. */
-function modelErrorNotice(event: Record<string, unknown>, runtime: RunnerRuntime): { errorNotice?: string } {
+function modelErrorNotice(event: Record<string, unknown>, runtime: RunnerRuntime | string): { errorNotice?: string } {
   if (event.type === "auto_retry_end") {
     return event.success === false ? { errorNotice: errorNotice([event.finalError, event.error], runtime) } : {};
   }
@@ -204,7 +721,7 @@ function modelErrorNotice(event: Record<string, unknown>, runtime: RunnerRuntime
   return {};
 }
 
-export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntime = "pi"): MirrorAndActivity {
+export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntime | string = "pi", style: PaneStyle = STYLE): MirrorAndActivity {
   const type = typeof event.type === "string" ? event.type : "";
   switch (type) {
     case "agent_start":
@@ -218,6 +735,10 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
       // Pi keeps main's mapping: turn_end carries no notice.
       return runtime === "omp" ? { mirrorLines: [], ...modelErrorNotice(event, runtime) } : { mirrorLines: [] };
     case "turn_start":
+      // Some turn paths omit agent_start; turn_start still opens a turn, so it reports the seat
+      // working and opens the streaming flag — the beat must cover a turn whose only opening
+      // event was turn_start, or a long quiet turn on that path still loses its working state.
+      return { mirrorLines: [], activity: { hookEvent: "active", subtype: "turn_start" }, streaming: runtime === "omp" ? undefined : true };
     case "message_start":
       return { mirrorLines: [] };
     case "message_update": {
@@ -227,8 +748,11 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
       // same deltas, so appending it repeated the growing text. Thinking and
       // tool-call argument deltas stay out of the pane; tool calls get their
       // own one-line summaries from tool_execution_*.
+      // OMP and Pi both provide text_delta frames. The enclosing message is a
+      // cumulative snapshot, not another delta: appending it duplicates replies.
       const update = event.assistantMessageEvent as Record<string, unknown> | undefined;
-      const delta = update?.type === "text_delta" && typeof update.delta === "string" ? update.delta : "";
+      const hasDelta = update?.type === "text_delta" && typeof update.delta === "string";
+      const delta = hasDelta ? update.delta as string : "";
       return delta ? { mirrorLines: [], mirrorAppend: delta } : { mirrorLines: [] };
     }
     case "message_end":
@@ -239,19 +763,25 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
       return { mirrorLines: [""], ...modelErrorNotice(event, runtime) };
     case "tool_execution_start": {
       const tool = typeof event.toolName === "string" ? event.toolName : (typeof event.name === "string" ? event.name : "tool");
-      return { mirrorLines: [`  ⚙ ${tool} …`], activity: { hookEvent: "PreToolUse", subtype: tool } };
+      return { mirrorLines: [`  ${style.dim(`⚙ ${tool} …`)}`], activity: { hookEvent: "PreToolUse", subtype: tool } };
     }
     case "tool_execution_end": {
       const tool = typeof event.toolName === "string" ? event.toolName : (typeof event.name === "string" ? event.name : "tool");
       const failed = event.isError === true || event.error != null;
-      return { mirrorLines: [`  ⚙ ${tool} ${failed ? "FAILED" : "done"}`] };
+      return { mirrorLines: [`  ${style.dim(`⚙ ${tool}`)} ${failed ? style.failed("FAILED") : "done"}`] };
     }
     case "queue_update":
       return { mirrorLines: [] };
     case "compaction_start":
       return { mirrorLines: [`[${runtime}] compacting context…`], activity: { hookEvent: "active", subtype: "compaction" } };
-    case "compaction_end":
-      return { mirrorLines: [`[${runtime}] compaction done`] };
+    case "compaction_end": {
+      // Pi's compaction_end says `aborted` when it was cancelled, and carries `errorMessage` when it failed and wrote no
+      // summary (Pi's docs/rpc.md). An end that names neither is done.
+      const failure = diagnosticText([event.errorMessage]).slice(0, 400);
+      return { mirrorLines: [event.aborted === true ? `[${runtime}] compaction cancelled`
+        : failure ? `[${runtime}] compaction failed: ${failure}` : `[${runtime}] compaction done`],
+        ...(runtime === "pi" ? { activity: { hookEvent: "Stop", subtype: "compaction" } } : {}) };
+    }
     // OMP names its automatic compaction separately. Pi keeps main's mapping
     // (unmapped), so an idle Pi seat never reads as running after one.
     case "auto_compaction_start":
@@ -278,12 +808,23 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
 // ── The runner core (injected effects; owns protocol state) ─────────────────
 
 export interface RunnerIo {
+  /** Retries transport failures; false means permanent authority/receipt refusal. */
+  postRunner?(payload: Record<string, unknown>): Promise<boolean>;
+  withdrawNativeTurn?(payload: Record<string, unknown>): Promise<{ confirmed: boolean; notThisTurn?: boolean; pendingSubmissions?: number } | null>;
   /** Write one JSONL command to pi stdin. */
   sendRpc(cmd: Record<string, unknown>): void;
   /** Print a full line to the pane. */
   mirrorLine(line: string): void;
   /** Append raw text to the current pane line (streamed deltas). */
   mirrorAppend(text: string): void;
+  /** Pin a copy of a diagnostic on the pane's status line, when the pane provides one.
+   *  The transcript copy is written by the caller; this pin is never the only copy. */
+  diagnostic?(text: string): void;
+  /** Drop a pinned status line at the start of a new agent turn. */
+  clearStatus?(): void;
+  /** Paint the seat's own status row (what it runs, and the state the runner observed).
+   *  Always plain text: the pane clips and repaints it, and an empty string clears it. */
+  status?(text: string): void;
   /** POST to the daemon activity endpoint. May resolve to the parsed JSON
    *  response (null on transport failure) so identity delivery can retry. */
   postActivity(payload: Record<string, unknown>): void | Promise<Record<string, unknown> | null>;
@@ -308,7 +849,16 @@ export interface RunnerIo {
   now(): string;
 }
 
+export function writePiRunnerSidecar(path: string, state: PiRunnerState): void {
+  const temporary = `${path}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(state), { mode: 0o600 });
+  fs.renameSync(temporary, path);
+}
+
 const GET_STATE_ID = "pi-runner-get-state";
+/** The reserved manual-compaction input carries its attempt id in the RPC id, so a
+ *  reply and the sidecar record can name exactly the request OpenRig made. */
+const COMPACT_ID = "pi-runner-compact:";
 const CATCH_UP_ID = "pi-runner-catch-up";
 const CURSOR_REFRESH_ID = "pi-runner-cursor-refresh";
 const NEGOTIATE_ID = "omp-runner-negotiate";
@@ -375,20 +925,77 @@ export async function readPiSessionEntryIds(
   }
 }
 
+interface PiManagedEntry {
+  frame: PiManagedRequest; acceptance?: Promise<void>; state: "accepting" | "queued" | "writing" | "submitted" | "terminal" | "unavailable";
+  reports: Promise<unknown>; nativeAccepted?: boolean; terminalResult?: Record<string, unknown>; wakeOpened?: boolean; contaminated?: boolean; answer?: string[]; stopReason?: string;
+  disposition?: string; preDispositionEvents?: boolean; nativeTerminal?: boolean;
+  acceptedTurnId?: string; nativeTurnId?: string;
+}
+
 export class RunnerCore {
+  private compaction: PiRunnerState["compaction"];
+  /** The last attempt-stamped record, kept beside `compaction` so a later
+   *  automatic run cannot erase a requested attempt's result. */
+  private requestedCompaction: PiRunnerState["requestedCompaction"];
+  /** The attempt a `/openrig-compact <id>` input named, awaiting its compaction_start. */
+  private pendingCompactAttemptId: string | null = null;
+  /** Durable copy of that pending attempt: written before the compact RPC, so a
+   *  restarted daemon reads the newest request as uncertain, not as an older run. */
+  private pendingCompaction: PiRunnerState["pendingCompaction"];
+  private readonly managed = new Map<string, PiManagedEntry>();
+  private readonly managedQueue: PiManagedEntry[] = [];
+  private readonly managedRpc = new Map<string, PiManagedEntry>();
+  private managedWake: PiManagedEntry | null = null;
+  private managedQuarantined = false;
+  private pendingManagedStart = false;
+  private readonly personPreflights = new Set<string>();
+  private promptRevision = 0;
+  private idleRevision = -1;
+  private idleQuery: { id: string; revision: number } | null = null;
+  private nativeQueueStateAvailable = false;
   private streaming = false;
+  /** The child is gone; the status row says exited, never idle. */
+  private paneExited = false;
+  /** A failure is known and no new turn has started: the status row says error, not idle. */
+  private paneError = false;
+  /** A runtime-reported automatic retry is in flight; the row says retrying until it ends. */
+  private paneRetrying = false;
+  private nativeEpoch = 0;
+  private nativeTurn: { id: string; accepted: string[]; owned: boolean } | null = null;
+  private nativeTurnSequence = 0;
+  private nativeTurnPosts: Promise<unknown> = Promise.resolve();
+  private cancellationFence: string | null = null;
+  private cancellation: { entry: PiManagedEntry; target: { runId: string; nativeTurnId: string }; submitted: boolean; acknowledged: boolean; ended: boolean; aborted: boolean; revision: number; pendingMessages?: number } | null = null;
+  private nativeQueues: { steering: string[]; followUp: string[] } | null = null;
+  private readonly epochSteers = new Set<string>();
+  private readonly personSteers = new Set<string>();
+  private readonly heldPersonPrompts: Record<string, unknown>[] = [];
+  private readonly pendingNativeInputs = new Set<PiManagedEntry>();
+  /** Pi runs this runner has opened, each posted as an accepted turn (contract section 4): the working beat names it. */
+  private turn = 0;
   private sessionFile: string | undefined;
   private sessionId: string | undefined;
   private lastEntryId: string | undefined;
   private ready = false;
+  private lastHeartbeatMs: number | null = null;
+  /** When this runner last posted any activity payload, so the streaming beat spaces itself
+   *  behind real events (a tool call is evidence enough; the beat covers the silent gaps). */
+  private lastActivityPostMs: number | null = null;
+  /** Hook event of the last activity this runner posted; null until it posts one. */
+  private lastPostedHook: string | null = null;
   private assistantErrorShown = false;
   private started = false;
-  /** OMP attention (runtime_error | permission_prompt) that must survive the
-   *  end of the turn; cleared by the next agent_start. */
-  private attention: "runtime_error" | "permission_prompt" | null = null;
+  /** OMP failures/approvals survive the turn until agent_start, except typed
+   *  transient assistant failures, released only when agent_end completes. */
+  private attention: "runtime_error" | "permission_prompt" | "transient_turn_error" | null = null;
   /** Whether the last activity posted is that attention. Later activity in
    *  the same turn (a tool call after a denied approval) replaces it. */
   private attentionIsLatest = false;
+  // Native OMP retry summaries have no message/status. Correlate only within
+  // the announced attempt, using the latest typed assistant failure's exact
+  // diagnostic as an identity check, never as a transient-error classifier.
+  private retryAttempt: number | null = null;
+  private retryFailure: string | null = null;
   /** Set once the daemon confirms it persisted the resume token. */
   private identityPersisted = false;
   private identityInFlight = false;
@@ -412,10 +1019,16 @@ export class RunnerCore {
 
   constructor(
     private io: RunnerIo,
-    private identity: { sessionName: string; nodeId?: string; launchId?: string; generation?: string },
-    private opts: { catchUpSince?: string; runtime?: RunnerRuntime; usageFacts?: boolean; openRouterCharge?: boolean;
+    private identity: { sessionName: string; nodeId?: string; launchId?: string; generation?: string; runId?: string },
+    private opts: { catchUpSince?: string; runtime?: RunnerRuntime | string; usageFacts?: boolean; openRouterCharge?: boolean;
+      /** The seat profile's configured model and effort, shown on the status row when known. */
+      model?: string; thinking?: string;
+      /** How the runner emphasises its own pane lines. */
+      style?: PaneStyle;
       /** K4: the credential observation taken before Pi was spawned. */
-      launchCredentialEvidence?: PiCredentialEvidence } = {},
+      launchCredentialEvidence?: PiCredentialEvidence;
+      /** The session file this launch resumes (--session). */
+      requestedSessionFile?: string } = {},
   ) {
     // The durable cursor seeds from the carried-over value (FR-5) so this
     // instance's own sidecar writes never regress it to undefined before a
@@ -424,6 +1037,45 @@ export class RunnerCore {
   }
   /** Runner readiness is the sidecar's acknowledged get_state, not RPC transport ready. */
   isReady(): boolean { return this.ready; }
+  /** A permanent reporting-authority refusal fences new managed dispatch, not person input or native work already in flight. */
+  quarantineManagedChannel(): void {
+    this.managedQuarantined = true;
+    if (this.cancellation && !this.cancellation.submitted)
+      this.rejectNativeCancellation(this.cancellation.entry, "runner_reporting_authority_lost");
+  }
+
+  nativeChannelCapabilities() { return { input: this.ready && !this.managedQuarantined, wake: this.ready && !this.managedQuarantined && this.nativeQueueStateAvailable && this.runtime === "pi", cancel: this.ready && !this.managedQuarantined && this.runtime === "pi" && !!this.io.withdrawNativeTurn }; }
+
+  /** Install the local preparation fence; this method alone submits no native operation. */
+  prepareNativeCancellation(target: { runId: string; nativeTurnId: string }): boolean {
+    if (this.runtime !== "pi" || !this.ready || this.managedQuarantined || !this.nativeTurn
+      || !this.nativeTurn.owned || target.runId !== this.identity.runId || target.nativeTurnId !== this.nativeTurn.id
+      || this.cancellationFence && this.cancellationFence !== target.nativeTurnId) return false;
+    this.cancellationFence = target.nativeTurnId;
+    return true;
+  }
+
+  /** After withdrawal, retain E's fence if still live; release only a pre-submit mismatch. */
+  recheckNativeCancellation(target: { runId: string; nativeTurnId: string }): boolean {
+    if (target.runId !== this.identity.runId || this.cancellationFence !== target.nativeTurnId) return false;
+    if (this.cancellation?.ended || this.nativeTurn?.id === target.nativeTurnId) return true;
+    this.cancellationFence = null;
+    this.pumpPersonPrompts(); this.pumpManaged();
+    return false;
+  }
+
+  private reportNativeTurn(state: "opened" | "closed"): void {
+    if (!this.nativeTurn || !this.identity.runId || !this.io.postRunner || this.runtime !== "pi") return;
+    const body = { type: "turn", runId: this.identity.runId, sequence: ++this.nativeTurnSequence,
+      nativeTurnId: this.nativeTurn.id, state, acceptedTurnIds: [...this.nativeTurn.accepted] };
+    this.nativeTurnPosts = this.nativeTurnPosts.then(() => this.io.postRunner!(body)).catch(() => {});
+  }
+
+  private pumpPersonPrompts(): void {
+    if (this.streaming || this.pendingManagedStart || !this.ready || this.cancellation?.submitted || this.cancellation?.ended) return;
+    const command = this.heldPersonPrompts.shift();
+    if (command) this.personPrompt(command.type === "follow_up" ? { type: "prompt", message: command.message, streamingBehavior: "steer" } : command);
+  }
 
   /** Kick off identity capture. Called once pi's RPC stream is up; for OMP, with its `ready` frame. */
   start(ready?: Record<string, unknown>): void {
@@ -450,6 +1102,7 @@ export class RunnerCore {
       // are live-only signals.
       this.io.sendRpc({ type: "get_entries", since: this.opts.catchUpSince, id: CATCH_UP_ID });
     }
+    this.refreshPaneStatus();
   }
 
   /** One LF-delimited JSONL record from pi stdout. */
@@ -502,68 +1155,409 @@ export class RunnerCore {
 
   /** A frame that can't be reassembled is lost, and said so. If it was a get_entries reply, the cursor stays where it was. */
   private reportDroppedFrame(reason: string | null | undefined): void {
-    if (reason) this.io.mirrorLine(`[omp-runner] ERROR rpc frame: ${reason}; the chunked frame was dropped`);
+    if (reason) this.diag(`[omp-runner] ERROR rpc frame: ${reason}; the chunked frame was dropped`);
   }
 
-  private get runtime(): RunnerRuntime { return this.opts.runtime ?? "pi"; }
+  private get runtime(): string { return this.opts.runtime ?? "pi"; }
+
+  async acceptRunnerRequest(frame: PiManagedRequest): Promise<void> {
+    if (!this.ready || this.runtime !== "pi" && frame.kind !== "input" || !this.io.postRunner || frame.version !== 1 || frame.runId !== this.identity.runId
+      || !Number.isSafeInteger(frame.sequence) || frame.sequence < 1 || typeof frame.requestId !== "string"
+      || !["input", "wake", "cancel"].includes(frame.kind)
+      || (frame.kind === "cancel" ? !frame.payload?.target || frame.payload.target.runId !== frame.runId || typeof frame.payload.target.nativeTurnId !== "string"
+        : typeof (frame.kind === "wake" ? frame.payload?.question : frame.payload?.text) !== "string")) return;
+    frame = { version: 1, runId: frame.runId, requestId: frame.requestId, sequence: frame.sequence, kind: frame.kind,
+      payload: frame.kind === "cancel" ? { target: { ...frame.payload.target! } } : frame.kind === "wake" ? { question: frame.payload.question! } : { text: frame.payload.text! } };
+    if ([...this.managed.values()].some(entry => entry.frame.sequence === frame.sequence && entry.frame.requestId !== frame.requestId)) throw new Error("Conflicting native sequence");
+    const old = this.managed.get(frame.requestId);
+    if (old) {
+      if (JSON.stringify(old.frame) !== JSON.stringify(frame)) throw new Error("Conflicting native request identity");
+      await old.acceptance; return;
+    }
+    const entry: PiManagedEntry = { frame, state: "accepting", reports: Promise.resolve() };
+    this.managed.set(frame.requestId, entry);
+    const named = frame.kind === "cancel" ? frame.payload.target! : null;
+    const prepared = named && !this.cancellation && this.prepareNativeCancellation(named);
+    const operation = prepared ? { entry, target: named!, submitted: false, acknowledged: false, ended: false, aborted: false, revision: this.promptRevision } : null;
+    if (operation) this.cancellation = operation;
+    entry.acceptance = (async () => {
+      const accepted = await this.io.postRunner!({ type: "ack", runId: frame.runId, requestId: frame.requestId, sequence: frame.sequence, state: "accepted" });
+      if (!accepted) {
+        entry.state = "unavailable";
+        if (operation && this.cancellation === operation && !operation.submitted && !operation.ended) {
+          this.cancellation = null;
+          if (this.cancellationFence === operation.target.nativeTurnId) this.cancellationFence = null;
+          this.pumpPersonPrompts();
+        }
+        this.pumpManaged(); return;
+      }
+      if (operation && this.cancellation !== operation) return;
+      if (named) {
+        entry.state = "queued";
+        if (!prepared) {
+          if (this.cancellation) this.rejectNativeCancellation(entry, "cancellation_in_progress");
+          else if (this.nativeTurn && this.nativeTurn.id !== named.nativeTurnId) {
+            entry.state = "terminal"; this.reportManaged(entry, "result", { kind: "cancel", outcome: "not-this-turn", confirmed: false });
+          } else this.rejectNativeCancellation(entry, "native_turn_ownership_unknown");
+        }
+        else void this.performNativeCancellation(operation!).catch(() => {
+          if (this.cancellation === operation && !operation!.submitted) this.rejectNativeCancellation(entry, "preparation_failed");
+        });
+        return;
+      }
+      entry.state = "queued"; this.managedQueue.push(entry); this.managedQueue.sort((a, b) => a.frame.sequence - b.frame.sequence); this.pumpManaged();
+    })();
+    await entry.acceptance;
+  }
+
+  private reportManaged(entry: PiManagedEntry, type: "submitted" | "result" | "rejected", result?: Record<string, unknown>): void {
+    const f = entry.frame;
+    if (type !== "submitted" && result) entry.terminalResult = result;
+    entry.reports = entry.reports.then(async () => {
+      await entry.acceptance;
+      if (entry.state === "unavailable") return;
+      return this.io.postRunner?.({ type, runId: f.runId, requestId: f.requestId, sequence: f.sequence,
+      ...(entry.nativeTurnId ? { nativeTurnId: entry.nativeTurnId } : {}),
+      ...(entry.acceptedTurnId ? { acceptedTurnId: entry.acceptedTurnId } : {}), ...(result ? { result } : {}) });
+    }).catch(() => {});
+  }
+
+  private async performNativeCancellation(operation: NonNullable<RunnerCore["cancellation"]>): Promise<void> {
+    const { entry, target } = operation;
+    if (this.cancellation !== operation || operation.ended) return;
+    if (!this.io.withdrawNativeTurn) { this.finishNativeCancellation("not-supported"); return; }
+    for (;;) {
+      if (this.cancellation !== operation || operation.ended) return;
+      const withdrawal = await this.io.withdrawNativeTurn({ type: "cancel-prepare", runId: entry.frame.runId, requestId: entry.frame.requestId, sequence: entry.frame.sequence });
+      if (this.cancellation !== operation || operation.ended) return;
+      if (!withdrawal) { this.rejectNativeCancellation(entry, "preparation_failed"); return; }
+      if (operation.revision !== this.promptRevision) { this.rejectNativeCancellation(entry, "person_input_after_preparation"); return; }
+      if (!this.nativeTurn || this.nativeTurn.id !== target.nativeTurnId || withdrawal.notThisTurn) { this.finishNativeCancellation("not-this-turn"); return; }
+      if (withdrawal?.confirmed) break;
+      if (!this.ready || this.cancellation !== operation) return;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    if (!this.ready || this.nativeTurn?.id !== target.nativeTurnId) { this.finishNativeCancellation("not-this-turn"); return; }
+    if (!this.nativeTurn.owned || this.managedQuarantined || !this.ownsNativeCancellationQueue()) {
+      this.rejectNativeCancellation(entry, "native_queue_ownership_unknown"); return;
+    }
+    // The state reply is correlated to this captured preparation. E is rechecked again after the await.
+    this.io.sendRpc({ type: "get_state", id: `openrig-cancel-preflight-${entry.frame.requestId}` });
+  }
+
+  private ownsNativeCancellationQueue(pending?: number): boolean {
+    if (this.nativeQueues && (this.nativeQueues.followUp.length > 0 || this.nativeQueues.steering.some(text => this.personSteers.has(text) || !this.epochSteers.has(text)))) return false;
+    if (pending === undefined) return true;
+    if (!Number.isSafeInteger(pending) || pending < 0) return false;
+    return pending === 0 ? !this.nativeQueues || this.nativeQueues.steering.length === 0
+      : !!this.nativeQueues && this.nativeQueues.steering.length === pending;
+  }
+
+  /** Only this local owner can establish that no native cancel was written. */
+  private rejectNativeCancellation(entry: PiManagedEntry, reason: string): void {
+    if (this.cancellation?.entry === entry) {
+      if (this.cancellation.submitted || this.cancellation.ended) return;
+      this.cancellation = null; this.cancellationFence = null;
+    }
+    entry.state = "terminal";
+    this.diag(`Cancellation ${JSON.stringify(entry.frame.requestId)} was not applied (${reason}); withdrawn approvals stay withdrawn. Person input remains available.`);
+    this.reportManaged(entry, "rejected", { kind: "cancel", reason, applied: false });
+    this.pumpPersonPrompts(); this.pumpManaged();
+  }
+
+  private finishNativeCancellation(outcome: "cancelled" | "requested" | "not-this-turn" | "not-supported", detail?: string): void {
+    const operation = this.cancellation; if (!operation) return;
+    const unavailable = operation.entry.state === "unavailable";
+    if (!unavailable) operation.entry.state = "terminal";
+    const words = this.nativeQueues ? [...this.nativeQueues.steering, ...this.nativeQueues.followUp] : [];
+    const inputRequestIds: string[] = []; let unmatchedCount = this.nativeQueues ? 0 : operation.pendingMessages ?? 0;
+    for (const text of words) {
+      const matches = [...this.managed.values()].filter(entry => entry.frame.kind === "input" && entry.nativeTurnId === operation.target.nativeTurnId && entry.frame.payload.text === text);
+      if (matches.length === 1 && matches[0]!.frame.requestId.length > 0 && matches[0]!.frame.requestId.length <= 1024 && inputRequestIds.length < 100 && !inputRequestIds.includes(matches[0]!.frame.requestId)) inputRequestIds.push(matches[0]!.frame.requestId);
+      else unmatchedCount++;
+    }
+    if (!unavailable) this.reportManaged(operation.entry, "result", { kind: "cancel", outcome, confirmed: outcome === "cancelled", operationAccepted: operation.acknowledged, ...(detail ? { detail } : {}),
+      ...(operation.submitted && (words.length || unmatchedCount) ? { continuation: { inputRequestIds, pendingRequestIds: this.managedQueue.map(entry => entry.frame.requestId).filter(id => id.length > 0 && id.length <= 1024).slice(0, 100), unmatchedCount } } : {}) });
+    this.cancellation = null; this.cancellationFence = null;
+    this.pumpPersonPrompts(); this.pumpManaged();
+  }
+
+  private finishEndedNativeCancellation(settled = false): void {
+    const operation = this.cancellation;
+    if (!operation?.ended || !settled) return;
+    if (!operation.submitted) { this.finishNativeCancellation("not-this-turn"); return; }
+    const queueEmpty = operation.pendingMessages === 0 && (!this.nativeQueues
+      || this.nativeQueues.steering.length === 0 && this.nativeQueues.followUp.length === 0);
+    const confirmed = operation.aborted && queueEmpty && operation.revision === this.promptRevision;
+    this.finishNativeCancellation(confirmed ? "cancelled" : "requested", confirmed ? undefined : "native_end_without_cancellation_proof");
+  }
+
+  private pumpManaged(): void {
+    if (!this.ready || this.cancellationFence || this.managedQuarantined || this.managedWake || this.runtime === "pi" && this.pendingManagedStart && !this.streaming) return;
+    const entry = this.managedQueue[0];
+    if (!entry || this.personPreflights.size || [...this.managed.values()].some(prior => prior.state === "accepting" && prior.frame.sequence < entry.frame.sequence)
+      || entry.frame.kind === "wake" && (this.streaming || this.pendingManagedStart)) return;
+    if (entry.frame.kind === "wake" && this.idleRevision !== this.promptRevision) {
+      if (!this.idleQuery) {
+        this.idleQuery = { id: `openrig-native-idle-${this.promptRevision}`, revision: this.promptRevision };
+        this.io.sendRpc({ type: "get_state", id: this.idleQuery.id });
+      }
+      return;
+    }
+    this.promptRevision += 1;
+    this.managedQueue.shift(); entry.state = "writing";
+    if (entry.frame.kind === "wake") { this.managedWake = entry; entry.answer = []; }
+    if (this.runtime === "pi" && !this.streaming) this.pendingManagedStart = true;
+    const id = `openrig-native-${entry.frame.requestId}`;
+    this.managedRpc.set(id, entry);
+    if (this.runtime === "pi" && this.streaming && entry.frame.kind === "input") this.epochSteers.add(entry.frame.payload.text!);
+    this.io.sendRpc({ id, type: "prompt", message: entry.frame.kind === "wake" ? entry.frame.payload.question! : entry.frame.payload.text!, streamingBehavior: "steer" });
+    this.acceptIntoOpenRun();
+    if (this.runtime === "pi") {
+      if (this.nativeTurn) { entry.nativeTurnId = this.nativeTurn.id; entry.acceptedTurnId = String(this.turn); }
+      else this.pendingNativeInputs.add(entry);
+    }
+    // Ordinary busy messages may steer; the next queued wake waits for agent_end, not this RPC response.
+    this.pumpManaged();
+  }
+
+  private finishManagedWake(entry: PiManagedEntry, forced?: "unknown" | "failed"): void {
+    // Pi reports started before agent.prompt, but awaits extension handlers before handled.
+    // Events before that authoritative disposition cannot establish this invocation's ownership.
+    if (!forced && entry.disposition === undefined) return;
+    const ownershipUnknown = !["started", "handled"].includes(entry.disposition ?? "") || entry.preDispositionEvents === true;
+    if (ownershipUnknown) this.managedQuarantined = true;
+    const completion = ownershipUnknown || forced && !entry.nativeAccepted ? "unknown" : forced ?? (entry.contaminated || !entry.wakeOpened ? "unknown"
+      : entry.stopReason === "stop" && entry.answer?.some(text => text.length > 0) ? "completed" : entry.stopReason === "aborted" ? "interrupted" : entry.stopReason === "error" ? "failed" : "unknown");
+    entry.state = "terminal";
+    entry.terminalResult = { kind: "wake", ...(entry.nativeTurnId ? { nativeTurnId: entry.nativeTurnId } : {}),
+      completion, answer: completion === "completed" ? entry.answer?.join("\n") ?? "" : null,
+      ...(ownershipUnknown ? { ownershipUnknown: true } : {}),
+      ...(forced && !entry.nativeAccepted ? { submissionUnknown: true } : {}) };
+    if (entry.nativeAccepted || forced) this.reportManaged(entry, "result", entry.terminalResult);
+    if (this.managedWake === entry) this.managedWake = null;
+  }
+
+  private personPrompt(command: Record<string, unknown>): void {
+    if (this.runtime !== "pi" || !this.io.postRunner) { this.io.sendRpc(command); return; }
+    if (this.cancellation?.submitted || this.cancellation?.ended || command.type === "follow_up" && (this.streaming || this.pendingManagedStart)) {
+      this.heldPersonPrompts.push(command); return;
+    }
+    const id = `openrig-person-${++this.promptRevision}`;
+    this.personPreflights.add(id);
+    if (!this.streaming) this.pendingManagedStart = true;
+    if (this.streaming && typeof command.message === "string") this.personSteers.add(command.message);
+    this.io.sendRpc({ ...command, id });
+    this.acceptIntoOpenRun();
+  }
 
   /** One aggregated paste block from pane stdin. */
   handleUserBlock(block: string): void {
+    if (this.cancellation && !this.cancellation.submitted && !this.cancellation.ended) this.rejectNativeCancellation(this.cancellation.entry, "person_input_after_preparation");
+    const compact = /^\/openrig-compact ([\w-]+)$/.exec(block);
+    if (this.runtime === "pi" && compact) {
+      const attemptId = compact[1]!;
+      if (this.pendingCompactAttemptId || (this.compaction?.startedAt && !this.compaction.endedAt)) {
+        this.diag("[pi-runner] compact already in progress; request not sent");
+        return;
+      }
+      this.pendingCompactAttemptId = attemptId;
+      this.pendingCompaction = { attemptId, requestedAt: this.io.now() };
+      // Persist the request before the RPC leaves: the id survives a daemon
+      // restart, so the newest attempt reads uncertain, never an older result.
+      this.writeSidecar({});
+      this.io.sendRpc({ type: "compact", id: COMPACT_ID + attemptId });
+      return;
+    }
+    if (this.managedWake) this.managedWake.contaminated = true;
     if (block === "/abort") {
       this.io.sendRpc({ type: "abort" });
-      this.io.mirrorLine("[pi-runner] abort sent");
+      this.diag("[pi-runner] abort sent");
       return;
     }
     if (block.startsWith("/followup ")) {
       const message = block.slice("/followup ".length);
-      this.io.sendRpc({ type: "follow_up", message });
-      this.io.mirrorLine(`you (follow-up) ▸ ${message}`);
+      this.personPrompt({ type: "follow_up", message });
+      this.io.mirrorLine(`${this.style.commit("you (follow-up) ▸")} ${message}`);
+      if (this.runtime !== "pi" || !this.io.postRunner) this.acceptIntoOpenRun();
       return;
     }
-    if (this.streaming) {
-      // Mid-stream: steer delivers after the current turn's tool calls,
-      // before the next model call (Pi's documented semantics).
-      this.io.sendRpc({ type: "steer", message: block });
-      this.io.mirrorLine(`you (steer) ▸ ${block}`);
-      return;
-    }
-    this.io.sendRpc({ type: "prompt", message: block });
-    this.io.mirrorLine(`you ▸ ${block}`);
+    // The runtime decides, not the runner: with streamingBehavior "steer", Pi and OMP run the prompt when idle and,
+    // while busy, queue it as a steer, delivered after the current turn's tool calls and before the next model call.
+    // The runner's `streaming` starts only at agent_start, so it can't tell when a turn is about to start (#1932) or
+    // when a prompt was consumed locally and started none. It labels the mirror line only.
+    this.personPrompt({ type: "prompt", message: block, streamingBehavior: "steer" });
+    this.io.mirrorLine(this.streaming ? `${this.style.commit("you (steer) ▸")} ${block}` : `${this.style.commit("you ▸")} ${block}`);
+    if (this.runtime !== "pi" || !this.io.postRunner) this.acceptIntoOpenRun();
+  }
+
+  /** A working beat counts only for the latest accepted turn, and each prompt the runner gives the agent is accepted with
+   *  its own number (contract section 4). One sent while a Pi run is open is posted as it's sent, and the run's end
+   *  closes it. One sent while idle is posted when its run opens (handleEvent), so a prompt Pi handles without a run opens
+   *  no turn. */
+  private acceptIntoOpenRun(): void {
+    if (this.runtime === "omp" || !this.streaming) return;
+    this.turn += 1;
+    if (this.nativeTurn) { this.nativeTurn.accepted.push(String(this.turn)); this.reportNativeTurn("opened"); }
+    this.io.postActivity(this.activityPayload("UserPromptSubmit", "accepted", { turnId: String(this.turn) }));
   }
 
   /** Child process exit — honest, loud, durable. */
   handlePiExit(code: number | null): void {
     this.ready = false;
+    this.paneExited = true;
+    if (this.cancellation) this.finishNativeCancellation(this.cancellation.submitted ? "requested" : "not-this-turn", "native_process_exited");
+    if (this.managedWake) this.finishManagedWake(this.managedWake, "failed");
     this.reportDroppedFrame(this.frameDecoder?.incomplete());
     this.io.mirrorLine(`[${this.runtime}-runner] EXITED ${this.runtime} exited (code ${code ?? "unknown"})`);
     this.writeSidecar({ exited: { code, at: this.io.now() } });
     this.io.postActivity(this.activityPayload("Stop", `${this.runtime}_exited`));
+    this.refreshPaneStatus();
   }
 
   private handleResponse(record: Record<string, unknown>): void {
+    const cancellation = this.cancellation;
+    if (cancellation && !cancellation.submitted && record.id === `openrig-cancel-preflight-${cancellation.entry.frame.requestId}`) {
+      if (cancellation.ended) return;
+      const state = record.data as { isStreaming?: boolean; pendingMessageCount?: number } | undefined;
+      if (!this.ready || this.nativeTurn?.id !== cancellation.target.nativeTurnId || state?.isStreaming === false) {
+        this.finishNativeCancellation("not-this-turn"); return;
+      }
+      if (cancellation.revision !== this.promptRevision) { this.rejectNativeCancellation(cancellation.entry, "person_input_after_preparation"); return; }
+      if (record.success !== true || state?.isStreaming !== true || typeof state.pendingMessageCount !== "number"
+        || !this.nativeTurn.owned || this.managedQuarantined || !this.ownsNativeCancellationQueue(state.pendingMessageCount)) {
+        this.rejectNativeCancellation(cancellation.entry, "native_queue_ownership_unknown"); return;
+      }
+      cancellation.pendingMessages = state.pendingMessageCount;
+      cancellation.submitted = true; cancellation.entry.state = "submitted";
+      this.io.sendRpc({ type: "abort", id: `openrig-cancel-${cancellation.entry.frame.requestId}` });
+      this.reportManaged(cancellation.entry, "submitted", { kind: "cancel", outcome: "requested", confirmed: false, operationAccepted: false });
+      this.diag(`Cancellation ${JSON.stringify(cancellation.entry.frame.requestId)} for ${JSON.stringify(cancellation.target.nativeTurnId)} is requested, not confirmed. Managed inputs ${JSON.stringify(this.managedQueue.map(entry => entry.frame.requestId))} remain recorded for ${this.identity.sessionName}. Inspect rig seat status ${this.identity.sessionName} --json. The named invocation settling releases the cancellation hold; a wake still waits for native idle and an empty queue. Continue with a new plain prompt in this pane, without resending retained words. This is distinct from /abort or stopping the seat; continuation is not cancellation proof and never restores withdrawn approvals. Person's /abort remains available, or explicitly choose rig seat stop ${this.identity.sessionName} --reason <reason>. Nothing restarts or replays automatically.`);
+      return;
+    }
+    if (cancellation && record.id === `openrig-cancel-${cancellation.entry.frame.requestId}`) {
+      if (record.success === true) cancellation.acknowledged = true;
+      return;
+    }
+
+    if (this.idleQuery && record.id === this.idleQuery.id) {
+      const query = this.idleQuery; this.idleQuery = null;
+      const data = record.data as { isStreaming?: boolean; pendingMessageCount?: number } | undefined;
+      if (record.success === true && data?.isStreaming === false && data.pendingMessageCount === 0 && query.revision === this.promptRevision) {
+        this.idleRevision = query.revision; this.pumpManaged();
+      } else if (record.success === true && typeof data?.isStreaming === "boolean" && Number.isSafeInteger(data.pendingMessageCount) && Number(data.pendingMessageCount) >= 0) {
+        setTimeout(() => this.pumpManaged(), 250).unref();
+      } else {
+        const next = this.managedQueue.shift();
+        if (next) { next.state = "terminal"; this.reportManaged(next, "rejected", { kind: next.frame.kind, reason: "native_idle_state_unavailable" }); }
+        this.pumpManaged();
+      }
+      return;
+    }
+    if (typeof record.id === "string" && this.personPreflights.delete(record.id)) {
+      if (record.success !== true || (record.data as { disposition?: string } | undefined)?.disposition === "handled") this.pendingManagedStart = false;
+      this.pumpPersonPrompts(); this.pumpManaged();
+      if (record.success !== false && record.error == null) return;
+    }
+    const managed = typeof record.id === "string" ? this.managedRpc.get(record.id) : undefined;
+    if (managed) {
+      this.managedRpc.delete(String(record.id));
+      if (record.success === true) {
+        managed.nativeAccepted = true; managed.state = "submitted"; this.reportManaged(managed, "submitted");
+        const inputData = record.data as { disposition?: unknown; agentInvoked?: boolean } | undefined;
+        if (managed.frame.kind === "wake") {
+          const disposition = inputData?.disposition;
+          managed.disposition = typeof disposition === "string" ? disposition : "unknown";
+          if (!["started", "handled"].includes(managed.disposition) || managed.preDispositionEvents) this.managedQuarantined = true;
+          if (managed.nativeTerminal || managed.disposition !== "started" && !this.streaming) this.finishManagedWake(managed);
+          else if (managed.terminalResult) this.reportManaged(managed, "result", managed.terminalResult);
+          if (this.managedWake !== managed && !this.streaming) { this.pendingManagedStart = false; this.pumpPersonPrompts(); this.pumpManaged(); }
+        } else if (this.runtime !== "pi") {
+          // Input acceptance needs the correlated RPC response, not an invented native invocation.
+          managed.state = "terminal"; this.reportManaged(managed, "result", { kind: "input", accepted: true });
+        } else {
+          managed.disposition = inputData?.agentInvoked === false ? "handled" : typeof inputData?.disposition === "string" ? inputData.disposition : "unknown";
+          if (managed.disposition === "handled") {
+            this.pendingNativeInputs.delete(managed);
+            delete managed.nativeTurnId; delete managed.acceptedTurnId;
+            if (!this.streaming) this.pendingManagedStart = false;
+          }
+          // A started prompt's acknowledgement precedes agent_start. Wait for that actual scope before
+          // committing its immutable terminal receipt; a handled local command has no native epoch.
+          if (managed.disposition !== "started" || managed.nativeTurnId) {
+            managed.state = "terminal"; this.reportManaged(managed, "result", { kind: "input", accepted: true });
+          }
+          if (managed.disposition === "handled") { this.pumpPersonPrompts(); this.pumpManaged(); }
+        }
+      } else {
+        this.pendingNativeInputs.delete(managed);
+        managed.state = "terminal"; this.pendingManagedStart = false;
+        this.reportManaged(managed, "rejected", { kind: managed.frame.kind, reason: "native_prompt_rejected" });
+        if (this.managedWake === managed) this.managedWake = null;
+        this.pumpPersonPrompts(); this.pumpManaged();
+      }
+      return;
+    }
     if (record.id === NEGOTIATE_ID && this.v2Limit !== null) {
       if (record.success === true) {
         this.frameDecoder = new OmpFrameDecoder(this.v2Limit);
       } else {
         // Advertised but refused: v1 as before, so a reply over 1 MiB still fails, visibly.
         const detail = typeof record.error === "string" ? record.error : "refused";
-        this.io.mirrorLine(`[omp-runner] RPC protocol v2 not negotiated (${detail}); replies over 1 MiB will fail`);
+        this.diag(`[omp-runner] RPC protocol v2 not negotiated (${detail}); replies over 1 MiB will fail`);
       }
+      return;
+    }
+    if (this.runtime === "pi" && record.success === true && record.error == null
+      && typeof record.id === "string" && record.id.startsWith(COMPACT_ID)) {
+      const attemptId = record.id.slice(COMPACT_ID.length);
+      if (this.pendingCompactAttemptId === attemptId) this.pendingCompactAttemptId = null;
+      if (this.pendingCompaction?.attemptId === attemptId) this.pendingCompaction = undefined;
+      this.writeSidecar({});
       return;
     }
     if (record.success === false || record.error != null) {
       const detail = typeof record.error === "string" ? record.error : "request failed";
       const message = detail + (this.runtime === "pi" ? piCredentialHint(detail) : "");
+      const compactId = this.runtime === "pi" && typeof record.id === "string" && record.id.startsWith(COMPACT_ID)
+        ? record.id : null;
+      if (compactId) {
+        const attemptId = compactId.slice(COMPACT_ID.length);
+        const unsupported = /unknown command|unsupported|not supported/i.test(detail);
+        this.io.mirrorLine(`[pi-runner] ERROR rpc compact${unsupported ? " unsupported" : " failed"}: ${message}`);
+        // A failure with no start replaces any older record: this attempt is the answer.
+        const prior = this.compaction?.attemptId === attemptId ? this.compaction : undefined;
+        const wasPending = this.pendingCompactAttemptId === attemptId;
+        if (this.pendingCompactAttemptId === attemptId) this.pendingCompactAttemptId = null;
+        if (this.pendingCompaction?.attemptId === attemptId) this.pendingCompaction = undefined;
+        const failed = { attemptId, reason: prior?.reason ?? "manual",
+          ...(prior?.requestId ? { requestId: prior.requestId } : {}),
+          ...(prior?.startedAt ? { startedAt: prior.startedAt } : {}),
+          endedAt: prior?.endedAt ?? this.io.now(), errorMessage: detail };
+        if (wasPending || !this.compaction?.attemptId || this.compaction.attemptId === attemptId) this.compaction = failed;
+        if (wasPending || !this.requestedCompaction || this.requestedCompaction.attemptId === attemptId) this.requestedCompaction = failed;
+        this.writeSidecar({});
+        return;
+      }
       if (record.id === GET_STATE_ID) {
         this.ready = false;
+        this.paneError = true;
         this.writeSidecar({});
-        this.io.mirrorLine(this.runtime === "omp" ? `[omp-runner] ERROR rpc get_state: ${message}` : `${PI_RUNNER_ERROR_MARKER} rpc: ${message}`);
+        this.diag(this.runtime === "omp" ? `[omp-runner] ERROR rpc get_state: ${message}` : `${PI_RUNNER_ERROR_MARKER} rpc: ${message}`);
+        this.refreshPaneStatus();
         // OMP cannot provide a resume token without get_state; stop it so the
         // launch fails now instead of waiting out readiness.
         if (this.runtime === "omp") this.io.stopChild?.();
         return;
       }
-      this.io.mirrorLine(`[${this.runtime}-runner] ERROR rpc: ${message}`);
+      if (record.id === CATCH_UP_ID && this.runtime === "pi") {
+        // A refused catch-up (a saved cursor this session's history doesn't hold, such as an older runner's UI-event
+        // id) is history sync, not the seat's resume: say so, and take a confirmed cursor from the history's tail.
+        this.diag(`[pi-runner] History catch-up didn't run (${message}). That's history sync, separate from the seat's resume; reading the history cursor again.`);
+        this.io.sendRpc({ type: "get_entries", id: CURSOR_REFRESH_ID });
+        return;
+      }
+      this.diag(`[${this.runtime}-runner] ERROR rpc: ${message}`);
       // Only a rejected input means the seat cannot do the requested work.
       // A mistimed /abort (or any control command) leaves the seat idle.
       if (this.runtime === "omp" && typeof record.command === "string" && Object.hasOwn(INPUT_COMMANDS, record.command)) {
@@ -577,14 +1571,44 @@ export class RunnerCore {
       const sessionId = typeof data.sessionId === "string" ? data.sessionId : undefined;
       this.sessionFile = sessionFile ?? this.sessionFile;
       this.sessionId = sessionId ?? this.sessionId;
+      const wasReady = this.ready;
+      this.nativeQueueStateAvailable = typeof data.isStreaming === "boolean" && Number.isSafeInteger(data.pendingMessageCount) && Number(data.pendingMessageCount) >= 0;
       this.ready = this.runtime === "pi" || !!this.sessionFile;
+      if (this.ready) this.pumpManaged();
       if (!this.ready) {
-        this.io.mirrorLine("[omp-runner] ERROR rpc get_state returned no session file; cannot provide a resume token");
-        this.io.stopChild?.();
+        if (this.runtime === "omp") {
+          this.diag("[omp-runner] ERROR rpc get_state returned no session file; cannot provide a resume token");
+          this.io.stopChild?.();
+          return;
+        }
+        // For custom protocol: pi-rpc community harnesses, reporting no session file
+        // reads as needing attention rather than stopping the child process.
+        this.diag(`[${this.runtime}-runner] ERROR rpc get_state returned no session file; cannot provide a resume token`);
+        this.paneError = true;
+        this.refreshPaneStatus();
+        this.raiseAttention("runtime_error");
         return;
       }
       this.writeSidecar({});
-      this.io.mirrorLine(`${this.runtime === "omp" ? "[omp-runner] READY" : PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
+      if (this.resumedElsewhere()) {
+        // The sidecar names the reported file, so the launch refuses it at once; the identity isn't posted (below), and the
+        // seat asks for attention rather than beating idle on a session nothing records.
+        this.io.mirrorLine(`[${this.runtime}-runner] ERROR resume: get_state reports ${this.sessionFile}, not the requested ${this.opts.requestedSessionFile}; its identity isn't reported`);
+        this.paneError = true;
+        this.refreshPaneStatus();
+        this.raiseAttention("runtime_error");
+        return;
+      }
+      if (!wasReady) {
+        // Only the initial transition to ready announces READY in the pane.
+        // Subsequent get_state evaluations confirm liveness silently to avoid
+        // terminal output spam while preserving state updates.
+        this.io.mirrorLine(`${this.runtime === "omp" ? "[omp-runner] READY" : PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
+        this.paneError = false;
+        this.refreshPaneStatus();
+      }
+      // Re-post session identity on every successful get_state reply so the
+      // daemon can discover replacement runners and keep session records current.
       this.postSessionIdentity();
       return;
     }
@@ -676,31 +1700,172 @@ export class RunnerCore {
     }, () => { /* best-effort: resent on the next refresh */ });
   }
 
-  private raiseAttention(subtype: "runtime_error" | "permission_prompt"): void {
-    // Runtime failures outrank denied approvals. Only emit when the visible
-    // attention changes or intervening activity replaced it.
-    const next = this.attention === "runtime_error" ? this.attention : subtype;
+  private raiseAttention(subtype: "runtime_error" | "permission_prompt" | "transient_turn_error"): void {
+    // Persistent failures and denied approvals outrank transient failures.
+    // Only emit when attention changes or intervening activity replaced it.
+    const next = this.attention === "runtime_error" ? this.attention
+      : this.attention === "permission_prompt" && subtype === "transient_turn_error" ? this.attention : subtype;
     if (this.attention === next && this.attentionIsLatest) return;
     this.attention = next;
     this.attentionIsLatest = true;
-    this.io.postActivity(this.activityPayload("Notification", next));
+    this.io.postActivity(this.activityPayload("Notification", next === "transient_turn_error" ? "runtime_error" : next));
+    this.refreshPaneStatus();
+  }
+
+  /** Idle and streaming heartbeat. A Pi runner only reports at turn and tool boundaries, and the
+   *  daemon reads any hook older than its freshness window as `unknown` (`stale_runtime_hook`): an
+   *  idle seat read `unknown` five minutes after its last turn, and a seat mid-turn read `unknown`
+   *  through a long silent LLM request (the seat-activity oracle stops a bare working hook from
+   *  deciding after 15s, HOOK_AUTHORITY_WINDOW_MS). Beat while ready and not waiting on the
+   *  operator: idle (Stop) when no turn is in flight, and while `streaming` says one is, the
+   *  contract's working beat (`active` / `liveness`, section 4) for the run's accepted turn, each
+   *  at most once per its own interval behind the newest real event. Same honesty
+   *  rule: a runner that dies stops beating and the seat goes back to `unknown` (handlePiExit
+   *  clears `ready`, so no beat outlives the process it vouches for). Pi only; the OMP identity
+   *  handshake has its own retry.
+   *
+   *  Liveness of `streaming` (CodeRabbit 2336): the flag opens on agent_start/turn_start and
+   *  closes only on agent_end — can a turn end without one? Pi's run loop (dist/bundle/chunks,
+   *  runLoop, pi 0.84.4) emits agent_end on every exit: `stopReason === "error" ||
+   *  "aborted"` → finishTurn, turn_end, agent_end, return; decision end → turn_end, agent_end,
+   *  return; loop break → agent_end. That covers /abort (stopReason "aborted"), assistant errors
+   *  and exhausted auto-retries (stopReason "error"), and turns opened by turn_start alone
+   *  (turn_start fires only inside runLoop). A child crash is handlePiExit's honest exit, not a
+   *  silent working state. So a lost agent_end is not a Pi outcome, and no time limit is needed
+   *  on the beat — long silent turns stay covered. */
+  heartbeat(): void {
+    if (this.runtime === "omp" || !this.ready || this.attention) return;
+    const now = Date.parse(this.io.now());
+    if (this.streaming) {
+      if (this.lastActivityPostMs !== null && now - this.lastActivityPostMs < STREAM_HEARTBEAT_MS) return;
+      this.io.postActivity(this.activityPayload("active", "liveness", { turnId: String(this.turn), livenessSeconds: WORK_LIVENESS_SECONDS }));
+      return;
+    }
+    // `streaming` follows only agent_start/agent_end; turn_start, compaction and auto-retry also report the agent
+    // working. Beat only when the last thing posted was a Stop (or nothing yet), so a beat never lands mid-turn.
+    if (this.lastPostedHook !== null && this.lastPostedHook !== "Stop") return;
+    if (this.lastHeartbeatMs !== null && now - this.lastHeartbeatMs < IDLE_HEARTBEAT_MS) return;
+    this.io.postActivity(this.activityPayload("Stop", "idle_heartbeat"));
   }
 
   private clearAttention(): void {
     this.attention = null;
     this.attentionIsLatest = false;
+    this.refreshPaneStatus();
   }
 
+  /** A diagnostic stays in the transcript — the readiness probe and the operator both read
+   *  it there; a pane with a status line pins the latest one as a convenience copy. */
+  private diag(text: string): void {
+    this.io.mirrorLine(text);
+    this.io.diagnostic?.(text);
+  }
+
+  /** The pane's status row: what this seat runs, and the state the runner observed.
+   *  Only what is known is shown — a model or effort the launch did not name is omitted,
+   *  and a seat that is not ready yet, waiting on the operator, or failed never reads as
+   *  idle. Plain text; the pane owns clipping and repainting. */
+  private refreshPaneStatus(): void {
+    if (!this.io.status) return;
+    const parts: string[] = [];
+    // The labels are runner-owned text painted as given: neutralize terminal controls so a
+    // configured value cannot act on the terminal, exactly as diagnostics are treated.
+    if (this.opts.model) parts.push(paneLabel(this.opts.model));
+    if (this.opts.thinking) parts.push(`thinking:${paneLabel(this.opts.thinking)}`);
+    parts.push(this.paneState());
+    this.io.status(parts.join(" \u00b7 "));
+  }
+
+  private paneState(): string {
+    if (this.paneExited) return "exited";
+    if (!this.ready) return this.paneError ? "error" : "starting";
+    if (this.attention === "permission_prompt") return "waiting for input";
+    if (this.attention === "runtime_error") return "error";
+    if (this.attention === "transient_turn_error") return "retrying";
+    // A known failure outranks an open turn, and an observed retry outranks "working".
+    if (this.paneError) return "error";
+    if (this.paneRetrying) return "retrying";
+    if (this.streaming) return "working";
+    return "idle";
+  }
+
+  /** Emphasis for the lines the runner writes itself; model output stays plain. */
+  private get style(): PaneStyle { return this.opts.style ?? STYLE; }
+
   private handleEvent(event: Record<string, unknown>): void {
-    if (this.runtime === "omp" && event.type === "extension_ui_request") {
+    if (this.runtime === "pi" && (event.type === "compaction_start" || event.type === "compaction_end")) {
+      const identity = {
+        ...(typeof event.requestId === "string" ? { requestId: event.requestId } : {}),
+        ...(typeof event.reason === "string" ? { reason: event.reason } : {}),
+      };
+      // The attempt id OpenRig's reserved input named rides the runner's native
+      // compact command and returns here. An automatic run (threshold/overflow)
+      // never takes it, so its result cannot answer a requested attempt.
+      const manualReason = typeof event.reason !== "string" || event.reason === "manual";
+      if (event.type === "compaction_start") {
+        const attemptId = manualReason ? this.pendingCompactAttemptId ?? undefined : undefined;
+        if (attemptId) {
+          this.pendingCompactAttemptId = null;
+          this.pendingCompaction = undefined;
+        }
+        this.compaction = { ...(attemptId ? { attemptId } : {}), ...identity, startedAt: this.io.now() };
+      } else {
+        const result = event.result;
+        const summary = result !== null && typeof result === "object" ? Object.fromEntries(
+          Object.entries(result).filter(([key, value]) =>
+            (["summary", "firstKeptEntryId"].includes(key) && typeof value === "string") ||
+            (["tokensBefore", "estimatedTokensAfter"].includes(key) && typeof value === "number")),
+        ) : undefined;
+        const attemptId = this.compaction?.attemptId
+          ?? (manualReason ? this.pendingCompactAttemptId ?? undefined : undefined);
+        if (attemptId && this.pendingCompactAttemptId === attemptId) this.pendingCompactAttemptId = null;
+        this.compaction = { ...this.compaction, ...(attemptId ? { attemptId } : {}), ...identity, endedAt: this.io.now(),
+          ...(result === null ? { result: null } : summary ? { result: summary } : {}),
+          ...(typeof event.aborted === "boolean" ? { aborted: event.aborted } : {}),
+          ...(typeof event.willRetry === "boolean" ? { willRetry: event.willRetry } : {}),
+          ...(typeof event.errorMessage === "string" ? { errorMessage: event.errorMessage } : {}),
+        };
+        // Keep the attempt-stamped record beside `compaction`: a later automatic
+        // run replaces that field, and this request must still read completed.
+        if (this.compaction.attemptId) this.requestedCompaction = this.compaction;
+      }
+      this.writeSidecar({});
+    }
+    if (event.type === "queue_update") {
+      if (this.cancellation?.submitted && (!Array.isArray(event.steering) || !event.steering.every(text => typeof text === "string") || !Array.isArray(event.followUp) || !event.followUp.every(text => typeof text === "string") || event.steering.length > 0 || event.followUp.length > 0))
+        this.cancellation.pendingMessages = Math.max(1, this.cancellation.pendingMessages ?? 0);
+      this.nativeQueues = Array.isArray(event.steering) && event.steering.every(text => typeof text === "string")
+        && Array.isArray(event.followUp) && event.followUp.every(text => typeof text === "string")
+        ? { steering: event.steering as string[], followUp: event.followUp as string[] } : null;
+    }
+    if (event.type === "agent_settled" && this.cancellation?.ended) {
+      if (typeof event.aborted === "boolean") this.cancellation.aborted = event.aborted;
+      this.finishEndedNativeCancellation(true);
+    }
+    if (this.cancellation && this.nativeTurn?.id === this.cancellation.target.nativeTurnId) {
+      const message = event.message as { role?: string; stopReason?: string } | undefined;
+      if (event.type === "message_end" && message?.role === "assistant" && message.stopReason === "aborted") this.cancellation.aborted = true;
+      if (event.type === "agent_end") this.cancellation.ended = true;
+    }
+
+    if (event.type === "extension_ui_request") {
       const method = event.method;
+      const dialog = method === "select" || method === "confirm" || method === "input" || method === "editor";
+      const detail = [event.title, event.message].filter((text): text is string => typeof text === "string")
+        .map(stripVTControlCharacters).join(" — ").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").slice(0, 400);
+      if (this.runtime !== "omp" && !dialog) {
+        if (method === "notify") this.diag(`[${this.runtime}-runner] ${detail}`);
+        return; // Pi notifications and other fire-and-forget UI requests expect no answer.
+      }
       // RPC does not mount an interactive UI. Reply at once; otherwise the
       // child can wait forever for approval that cannot be given in the pane.
       if (typeof event.id === "string") {
         this.io.sendRpc({ type: "extension_ui_response", id: event.id, cancelled: true });
       }
-      if (method === "select" || method === "confirm" || method === "input" || method === "editor") {
-        this.io.mirrorLine("[omp-runner] Approval/input requested; cancelled because the managed RPC pane cannot answer it. Operator action required: review the denied action and re-send a safe instruction, or change the seat permission policy explicitly.");
+      if (dialog) {
+        this.diag(this.runtime !== "omp"
+          ? `[${this.runtime}-runner] Extension ${method}: ${detail}; cancelled because the managed RPC pane cannot answer it. Operator action required: review the cancelled request and re-send an instruction the extension can complete without a dialog.`
+          : "[omp-runner] Approval/input requested; cancelled because the managed RPC pane cannot answer it. Operator action required: review the denied action and re-send a safe instruction, or change the seat permission policy explicitly.");
         this.raiseAttention("permission_prompt");
       }
       return;
@@ -708,28 +1873,121 @@ export class RunnerCore {
     const message = event.message as Record<string, unknown> | undefined;
     if (event.type === "agent_start" || (event.type === "message_start" && message?.role === "assistant")) {
       this.assistantErrorShown = false;
+      // A new assistant message supersedes the failed one it follows, even in the same turn.
+      if (event.type === "message_start" && this.paneError) {
+        this.paneError = false;
+        this.refreshPaneStatus();
+      }
     }
-    // Durable cursor: any event carrying a session-entry id advances it.
-    const entryId = typeof event.entryId === "string" ? event.entryId : (typeof event.id === "string" ? event.id : undefined);
+    // Durable cursor: any event carrying a session-entry id advances it. A Pi event's own `id` isn't one (Pi's
+    // history ids reach the cursor through get_entries), so on Pi only an explicit `entryId` counts.
+    const entryId = typeof event.entryId === "string" ? event.entryId
+      : (this.runtime === "omp" && typeof event.id === "string" ? event.id : undefined);
     if (entryId) {
       this.lastEntryId = entryId;
       this.writeSidecar({});
     }
 
+    if (event.type === "agent_start") {
+      this.clearAttention();
+      this.io.clearStatus?.();
+      this.paneError = false;
+      this.paneRetrying = false;
+      this.refreshPaneStatus();
+    }
+    // A retry replaces the failed attempt it retries, so the row follows the attempt until
+    // its matching end, exit or a superseding turn.
+    if (event.type === "auto_retry_start") {
+      this.paneError = false;
+      this.paneRetrying = true;
+      this.refreshPaneStatus();
+    }
+    if (event.type === "auto_retry_end") {
+      this.paneRetrying = false;
+      this.refreshPaneStatus();
+    }
+    // A turn's opening supersedes the previous turn's failure — on either runtime, since
+    // both can open a turn with turn_start alone. omp's attention policy is untouched.
+    if (event.type === "turn_start") {
+      this.paneError = false;
+      this.paneRetrying = false;
+      if (this.runtime === "omp" && !this.streaming) {
+        // A turn the runtime opened itself is work in flight; agent_end still closes it.
+        this.streaming = true;
+      }
+      this.refreshPaneStatus();
+    }
     if (this.runtime === "omp") {
-      if (event.type === "agent_start") this.clearAttention();
+      if (event.type === "agent_start" || event.type === "turn_start"
+        || (event.type === "message_start" && message?.role === "assistant")
+        || ((event.type === "message_end" || event.type === "turn_end")
+          && message?.role === "assistant" && message.stopReason !== "error")) this.retryFailure = null;
+      if (event.type === "auto_retry_start") {
+        this.retryAttempt = Number.isInteger(event.attempt) && (event.attempt as number) > 0 ? event.attempt as number : null;
+        this.retryFailure = null;
+      }
       // A successful automatic retry supersedes the failed attempt.
-      if (event.type === "auto_retry_start" && this.attention === "runtime_error") this.clearAttention();
+      if (event.type === "auto_retry_start" && (this.attention === "runtime_error" || this.attention === "transient_turn_error")) this.clearAttention();
       // Some paths omit agent_start; turn_start still opens a new turn.
       if (event.type === "turn_start") this.assistantErrorShown = false;
     }
-    const mapped = mapPiEvent(event, this.runtime);
-    if (mapped.streaming !== undefined) this.streaming = mapped.streaming;
+    const wake = this.managedWake;
+    if (wake && wake.disposition === undefined && ["agent_start", "message_end", "agent_end"].includes(String(event.type))) wake.preDispositionEvents = true;
+    if (event.type === "agent_start" && wake) {
+      if (wake.wakeOpened) wake.contaminated = true;
+      wake.wakeOpened = true;
+    }
+    if (event.type === "message_end" && wake && wake.disposition === "started" && !wake.preDispositionEvents && wake.wakeOpened) {
+      const assistant = event.message as { role?: string; content?: Array<{ type: string; text?: string }>; stopReason?: string } | undefined;
+      if (assistant?.role === "assistant") {
+        wake.answer!.push(...(Array.isArray(assistant.content) ? assistant.content : []).filter(part => part.type === "text" && typeof part.text === "string").map(part => part.text!));
+        wake.stopReason = assistant.stopReason;
+      }
+    }
+    const mapped = mapPiEvent(event, this.runtime, this.style);
+    // A working beat counts only for the latest accepted turn. Pi's runs start from this runner's prompts, so the run
+    // that opens is posted as one, before its first event; a prompt Pi handles without a run opens none. A prompt sent
+    // into an open run is accepted as it's sent (acceptIntoOpenRun).
+    if (this.runtime === "pi" && event.type === "agent_start" && this.nativeTurn) this.managedQuarantined = true;
+    const opening = this.runtime !== "omp" && mapped.streaming === true && !this.streaming;
+    if (mapped.streaming !== undefined) {
+      const changed = this.streaming !== mapped.streaming;
+      this.streaming = mapped.streaming;
+      if (changed) this.refreshPaneStatus();
+    }
+    if (this.cancellation && (this.cancellation.submitted || this.cancellation.ended) && (event.type === "agent_start" || opening))
+      this.finishNativeCancellation(this.cancellation.submitted ? "requested" : "not-this-turn", "native_settlement_superseded");
+    if (opening) {
+      setImmediate(() => this.pumpManaged());
+      this.turn += 1;
+      this.epochSteers.clear(); this.personSteers.clear(); this.nativeQueues = null;
+      this.nativeTurn = { id: `pi-invocation-${++this.nativeEpoch}`, accepted: [String(this.turn)], owned: this.pendingManagedStart };
+      this.reportNativeTurn("opened");
+      for (const entry of this.pendingNativeInputs) {
+        entry.nativeTurnId = this.nativeTurn.id; entry.acceptedTurnId = String(this.turn);
+        if (entry.frame.kind === "input" && entry.nativeAccepted && entry.disposition === "started") {
+          entry.state = "terminal"; this.reportManaged(entry, "result", { kind: "input", accepted: true });
+        }
+      }
+      this.pendingNativeInputs.clear();
+      this.io.postActivity(this.activityPayload("UserPromptSubmit", "accepted", { turnId: String(this.turn) }));
+    }
     // OMP writes its JSONL lazily; re-announce identity after each turn until
     // the daemon confirms the token. Pi's get_state identity is final.
     if (event.type === "agent_end" && this.runtime === "omp") this.postSessionIdentity();
     if (event.type === "agent_end") {
-      // QA RED fold (qitem-20260707020922): live events do not reliably carry
+      // A retry that never reported its end must not outlive the turn it belonged to.
+      if (this.paneRetrying) {
+        this.paneRetrying = false;
+        this.refreshPaneStatus();
+      }
+      this.idleRevision = -1;
+      this.pendingManagedStart = false;
+      this.reportNativeTurn("closed"); this.nativeTurn = null;
+      this.finishEndedNativeCancellation();
+      if (wake) { wake.nativeTerminal = true; this.finishManagedWake(wake); }
+      setImmediate(() => { this.pumpPersonPrompts(); this.pumpManaged(); });
+      // QA RED fold: live events do not reliably carry
       // session-entry ids, so the durable cursor starved (lastEntryId stayed
       // null in real runs). Refresh it from the source of truth after every
       // completed turn — get_entries returns append-order entries with stable
@@ -744,36 +2002,80 @@ export class RunnerCore {
       // the repeat lacks it, then reset at the next assistant message/agent
       // turn, not at agent_end.
       if (event.type === "message_end" || !this.assistantErrorShown) {
-        this.io.mirrorLine(mapped.errorNotice);
+        this.diag(mapped.errorNotice);
       }
       this.assistantErrorShown = true;
-      // OMP still ends the turn normally after a model failure; the operator
-      // has to act, so the seat shows attention rather than idle.
-      if (this.runtime === "omp") this.raiseAttention("runtime_error");
+      // The failure is known: the row says so until a new turn starts, never idle.
+      this.paneError = true;
+      this.refreshPaneStatus();
+      // Only typed, explicitly transient HTTP failures may release the send
+      // guard at agent_end. Unknown/auth/configuration failures stay attention;
+      // diagnostic prose is never used to decide whether a retry is safe.
+      const status = message?.errorStatus;
+      const transient = (event.type === "message_end" || event.type === "turn_end")
+        && message?.role === "assistant" && message.stopReason === "error"
+        && typeof status === "number" && [408, 429, 500, 502, 503, 504, 529].includes(status);
+      if (this.runtime === "omp") {
+        const retrySummary = event.type === "auto_retry_end" && event.success === false
+          && this.retryAttempt !== null && event.attempt === this.retryAttempt
+          && this.retryFailure !== null && event.finalError === this.retryFailure
+          && event.message === undefined && event.error === undefined;
+        if (event.type !== "auto_retry_end") {
+          this.retryFailure = transient && this.retryAttempt !== null && typeof message?.errorMessage === "string"
+            && message.errorMessage.length > 0 ? message.errorMessage : null;
+        } else if (!retrySummary) {
+          this.retryFailure = null;
+        }
+        this.raiseAttention(transient || retrySummary ? "transient_turn_error" : "runtime_error");
+      }
+    }
+    if (this.runtime === "omp" && (event.type === "auto_retry_end" && event.success === true
+      || event.type === "agent_end" && event.isTerminal !== false)) {
+      this.retryAttempt = null;
+      this.retryFailure = null;
     }
     if (!mapped.activity) return;
-    if (mapped.activity.hookEvent === "Stop" && this.attention) {
-      // The turn ended, but the operator still has to act. Drop the Stop; if
-      // later activity replaced the attention, restore it as the final state.
-      if (!this.attentionIsLatest) this.raiseAttention(this.attention);
-    } else {
-      this.attentionIsLatest = false;
-      this.io.postActivity(this.activityPayload(mapped.activity.hookEvent, mapped.activity.subtype));
+    if (event.type === "agent_end" && this.attention === "transient_turn_error") this.clearAttention();
+    const compactionBeat = this.runtime === "pi" && mapped.activity.subtype === "compaction";
+    try {
+      if (mapped.activity.hookEvent === "Stop" && this.attention) {
+        // The turn ended, but the operator still has to act. Drop the Stop; if
+        // later activity replaced the attention, restore it as the final state.
+        if (!this.attentionIsLatest) this.raiseAttention(this.attention);
+      } else {
+        this.attentionIsLatest = false;
+        this.io.postActivity(this.activityPayload(mapped.activity.hookEvent, mapped.activity.subtype,
+          compactionBeat ? { requestId: this.compaction?.requestId, reason: this.compaction?.reason,
+            ...(event.type === "compaction_end" ? { endedAt: this.compaction?.endedAt } : {}) } : {}));
+      }
+    } finally {
+      if (compactionBeat && event.type === "compaction_end") {
+        this.lastPostedHook = null;
+        this.lastHeartbeatMs = null;
+      }
     }
   }
 
-  /** Re-deliver OMP identity until the daemon confirms the resume token.
+  /** Re-deliver OMP or managed run identity until the daemon confirms the resume token.
    *  Called from a timer so a daemon restart during the first turn cannot
    *  leave a seat with history but no restorable token. */
   retrySessionIdentity(): void {
-    if (this.runtime === "omp" && this.ready) this.postSessionIdentity();
+    if ((this.runtime === "omp" || this.identity.runId) && this.ready) this.postSessionIdentity();
+  }
+
+  /** A resume that came up on another session file started a different session: the requested one stays the seat's. */
+  private resumedElsewhere(): boolean {
+    return !!this.opts.requestedSessionFile && !!this.sessionFile && this.sessionFile !== this.opts.requestedSessionFile;
   }
 
   private postSessionIdentity(): void {
+    // Never the identity of a session other than the one this launch resumes: it would replace the seat's resume token.
+    if (this.resumedElsewhere()) return;
     if (this.runtime === "omp" && (!this.sessionFile || !this.io.sessionFileExists?.(this.sessionFile))) return;
-    if (this.runtime === "omp" && (this.identityPersisted || this.identityInFlight)) return;
+    if ((this.runtime === "omp" || this.identity.runId) && (this.identityPersisted || this.identityInFlight)) return;
     const result = this.io.postActivity({
       eventFamily: "session_identity",
+      ...(this.identity.runId ? { runId: this.identity.runId } : {}),
       sessionName: this.identity.sessionName,
       nodeId: this.identity.nodeId ?? null,
       runtime: this.runtime,
@@ -783,7 +2085,7 @@ export class RunnerCore {
       sessionFile: this.sessionFile ?? null,
       occurredAt: this.io.now(),
     });
-    if (this.runtime !== "omp" || !result) return;
+    if ((this.runtime !== "omp" && !this.identity.runId) || !result) return;
     this.identityInFlight = true;
     void result.then(
       (body) => { if (body?.tokenPersisted === true) this.identityPersisted = true; },
@@ -791,14 +2093,26 @@ export class RunnerCore {
     ).finally(() => { this.identityInFlight = false; });
   }
 
-  private activityPayload(hookEvent: string, subtype: string | null): Record<string, unknown> {
+  /** Each activity post's place in this runner's event order: posts aren't awaited, so they can arrive out of order. */
+  private activitySequence = 0;
+
+  private activityPayload(hookEvent: string, subtype: string | null, extra: Record<string, unknown> = {}): Record<string, unknown> {
+    this.lastPostedHook = hookEvent;
+    this.lastActivityPostMs = Date.parse(this.io.now());
+    // Any posted Stop is an idle report, so the next beat is due a full interval after it, not just after a beat.
+    if (hookEvent === "Stop") this.lastHeartbeatMs = Date.parse(this.io.now());
     return {
+      sequence: ++this.activitySequence,
+      ...(this.identity.runId ? { runId: this.identity.runId } : {}),
       sessionName: this.identity.sessionName,
       nodeId: this.identity.nodeId ?? null,
       generation: this.identity.generation ?? null,
       runtime: this.runtime,
       hookEvent,
       subtype,
+      // A Pi-protocol runner's idle report holds only while it keeps beating; the daemon expires it after two missed beats.
+      ...(this.runtime !== "omp" && hookEvent === "Stop" && subtype !== `${this.runtime}_exited` ? { livenessSeconds: IDLE_HEARTBEAT_MS / 1000 } : {}),
+      ...extra,
       occurredAt: this.io.now(),
     };
   }
@@ -812,6 +2126,11 @@ export class RunnerCore {
       sessionFile: this.sessionFile,
       sessionId: this.sessionId,
       lastEntryId: this.lastEntryId,
+      ...(this.runtime === "pi" ? {
+        compaction: this.compaction,
+        requestedCompaction: this.requestedCompaction,
+        pendingCompaction: this.pendingCompaction,
+      } : {}),
       updatedAt: this.io.now(),
       ...patch,
     });
@@ -821,45 +2140,61 @@ export class RunnerCore {
 // ── CLI entry ────────────────────────────────────────────────────────────────
 
 interface RunnerArgs {
-  runtime?: RunnerRuntime;
+  accountHome?: string;
+  runtime?: RunnerRuntime | string;
+  command?: string;
   sessionName: string;
   stateRoot: string;
   cwd: string;
   launchId: string;
   model?: string;
+  thinking?: string;
   trust: "approve" | "no-approve";
   sessionFile?: string;
   forkRef?: string;
   /** OPR.0.7.0.2: report usage facts from persisted entries (the daemon passes it when usage.pi_cost_facts is on). */
   usageFacts?: boolean;
   openRouterCharge?: boolean;
+  /** Pi only: resolved launch_wrapper argv (wrapper[0] must be an absolute path). */
+  launchWrapper?: string[];
 }
 
 export function parseRunnerArgs(argv: string[]): RunnerArgs {
   const args: Partial<RunnerArgs> & { trust?: "approve" | "no-approve" } = {};
+  // The tokens read as flags; a value, such as a --thinking of "--approval-mode", never counts as one.
+  const flags = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]!;
+    flags.add(flag);
     const next = () => {
       const value = argv[++i];
       if (value === undefined) throw new Error(`${flag} requires a value`);
       return value;
     };
     switch (flag) {
+      case "--command": args.command = next(); break;
       case "--session-name": args.sessionName = next(); break;
       case "--runtime": {
         const runtime = next();
-        if (runtime !== "pi" && runtime !== "omp") throw new Error(`unsupported runtime: ${runtime}`);
+        if (!runtime) throw new Error("runtime must not be empty");
         args.runtime = runtime;
         break;
       }
+      case "--account-home": args.accountHome = next(); break;
       case "--state-root": args.stateRoot = next(); break;
       case "--cwd": args.cwd = next(); break;
       case "--launch-id": args.launchId = next(); break;
       case "--model": args.model = next(); break;
+      case "--thinking": args.thinking = next(); break;
       case "--session": args.sessionFile = next(); break;
       case "--fork": args.forkRef = next(); break;
       case "--usage-facts": args.usageFacts = true; break;
       case "--openrouter-charge": args.openRouterCharge = true; break;
+      case "--launch-wrapper-arg": {
+        const arg = next();
+        (args.launchWrapper ??= []).push(arg);
+        break;
+      }
       case "--approve": args.trust = "approve"; break;
       case "--no-approve": args.trust = "no-approve"; break;
       case "--approval-mode": {
@@ -876,13 +2211,26 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
   if (!args.cwd) throw new Error("--cwd is required");
   if (!args.launchId) throw new Error("--launch-id is required (launch-attempt scoping)");
   if (args.runtime === "omp") {
-    if (!argv.includes("--approval-mode") || argv.some((flag) => flag === "--approve" || flag === "--no-approve")) {
+    if (!flags.has("--approval-mode") || flags.has("--approve") || flags.has("--no-approve")) {
       throw new Error("OMP requires --approval-mode yolo or always-ask, not Pi trust flags");
     }
-  } else if (!args.trust || argv.includes("--approval-mode")) {
+  } else if (!args.trust || flags.has("--approval-mode")) {
     throw new Error("an explicit trust flag is required: --approve or --no-approve");
   }
   if (args.sessionFile && args.forkRef) throw new Error("--session and --fork are mutually exclusive");
+  if (args.accountHome !== undefined && ((args.runtime ?? "pi") !== "pi" || !nodePath.isAbsolute(args.accountHome) || /[\0\r\n]/.test(args.accountHome))) {
+    throw new Error("--account-home requires an absolute Pi account directory");
+  }
+  if (args.launchWrapper) {
+    if (args.runtime === "omp") {
+      throw new Error("--launch-wrapper-arg is only supported for the Pi runtime");
+    }
+    const validated = validateLaunchWrapper(args.launchWrapper);
+    if (!validated[0] || !nodePath.isAbsolute(validated[0])) {
+      throw new Error(`launch_wrapper[0]: runner requires an absolute executable path (got ${JSON.stringify(validated[0] ?? "")})`);
+    }
+    args.launchWrapper = validated;
+  }
   return args as RunnerArgs;
 }
 
@@ -907,7 +2255,7 @@ function resolveActivityEndpoint(env: NodeJS.ProcessEnv): { baseUrl: string; tok
 }
 
 /** The runner-side sidecar handshake, extracted for hermetic testing (guard
- *  re-verdict, qitem-20260707013815): read the PRIOR record's durable cursor
+ *  re-verdict): read the PRIOR record's durable cursor
  *  FIRST, then stamp the launch-scoped pending record — the write carries the
  *  cursor forward so no reset in the chain can erase it. `catchUpSince` is
  *  only surfaced when resuming: a fresh/fork session has no prior projection
@@ -929,8 +2277,40 @@ export function prepareRunnerSidecar(
   return { catchUpSince: resuming ? prior?.lastEntryId : undefined };
 }
 
+/** Wraps an async send so calls run one after another in call order; a send that rejects doesn't hold up the ones behind it. */
+export function inOrder<A, R>(send: (arg: A) => Promise<R>): (arg: A) => Promise<R> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return (arg) => {
+    const result = tail.then(() => send(arg));
+    tail = result.catch(() => undefined);
+    return result;
+  };
+}
+
 /** How often an OMP runner re-delivers an unconfirmed session identity. */
 const IDENTITY_RETRY_MS = 30_000;
+/** Below the daemon's 5 minute hook freshness window (AGENT_ACTIVITY_FRESHNESS_MS). */
+const IDLE_HEARTBEAT_MS = 3 * 60_000;
+/** One 5s scheduler tick drives both beats. CodeRabbit 2336: the first cut ticked every 15s, so a
+ *  streaming beat could land ~15s (+ delivery) behind a real event — the edge of
+ *  HOOK_AUTHORITY_WINDOW_MS, with a worst case near 25s. A 5s tick with a 5s minimum age posts a
+ *  streaming beat 5–10s after the newest event or beat: inside the window with headroom. The idle
+ *  beat's own 3-minute age gate makes the extra ticks free. */
+const PI_HEARTBEAT_TICK_MS = 5_000;
+/** Minimum age of the newest activity post before the streaming beat may re-assert it. */
+const STREAM_HEARTBEAT_MS = 5_000;
+/** How long one working beat counts (contract section 4). Beats land 5–10 s apart, well inside half of it. */
+const WORK_LIVENESS_SECONDS = 30;
+
+/** The Pi heartbeat scheduler — one 5s tick drives both beats (see PI_HEARTBEAT_TICK_MS).
+ *  Exported so tests drive the real interval with fake timers instead of calling heartbeat()
+ *  by hand, which is exactly the gap that hid the 15s-tick latency in the first cut. */
+export function startHeartbeatTimer(core: { heartbeat(): void }, runtime: RunnerRuntime | string): { stop(): void } {
+  if (runtime === "omp") return { stop() {} };
+  const timer = setInterval(() => core.heartbeat(), PI_HEARTBEAT_TICK_MS);
+  timer.unref();
+  return { stop: () => clearInterval(timer) };
+}
 
 export interface ExecutableResolverOps {
   isExecutable(path: string): boolean;
@@ -961,6 +2341,16 @@ export function resolveRuntimeExecutable(
   env: NodeJS.ProcessEnv,
   ops: ExecutableResolverOps = nodeResolverOps,
 ): { ok: true; path: string } | { ok: false; error: string } {
+  if (nodePath.isAbsolute(name)) {
+    if (ops.isExecutable(name)) {
+      try {
+        return { ok: true, path: ops.realpath(name) };
+      } catch (err) {
+        return { ok: false, error: `could not resolve ${name}: ${(err as Error).message}` };
+      }
+    }
+    return { ok: false, error: `'${name}' is not executable` };
+  }
   const onPath = (env.PATH ?? "").split(nodePath.delimiter)
     .filter((dir) => nodePath.isAbsolute(dir))
     .map((dir) => nodePath.join(dir, name))
@@ -1008,6 +2398,96 @@ export function piLaunchCapabilityError(
   return `Pi invoked as ${command} (${version}; exact executable path unknown) rejects the managed --name/--${trust} flags. Install the current @earendil-works/pi-coding-agent (npm install -g @earendil-works/pi-coding-agent) and check 'command -v pi' in this pane; an older Pi installation may be shadowing it.`;
 }
 
+function isPermanentPiRunRefusal(status: number, code?: string): boolean {
+  if (![401, 403, 404, 409, 410].includes(status) || ["runner_hello_required", "runner_grant_pending", "runner_grant_unverified"].includes(code ?? "")) return false;
+  return status === 401 || status === 403 || ["runner_grant_required", "runner_grant_revoked", "runner_grant_stale"].includes(code ?? "");
+}
+
+function runnerFrameBound(buffer: string): { limit: number; chars?: number } {
+  const overhead = 64 * 1024;
+  const fallback = { limit: 6 * 1024 * 1024 + overhead };
+  if (!buffer.startsWith(": runner-frame-chars=") || !buffer.includes("\n")) return fallback;
+  const header = /^: runner-frame-chars=([0-9]+)\n/.exec(buffer);
+  const chars = header ? Number(header[1]) : NaN;
+  if (!Number.isSafeInteger(chars) || chars < 1 || chars > Number.MAX_SAFE_INTEGER - overhead)
+    throw new Error("Invalid channel frame size");
+  return { limit: chars + overhead, chars };
+}
+
+/** Pi's HTTP/SSE wire loop; it owns no native executor or durable receiver journal. */
+export async function connectPiRunnerChannel(core: RunnerCore, endpoint: { baseUrl: string; token: string }, runId: string, signal: AbortSignal): Promise<void> {
+  let retained = false, cursor = 0;
+  while (!signal.aborted) {
+    try {
+      if (!core.isReady()) { await new Promise(resolve => setTimeout(resolve, 100)); continue; }
+      const hello = await fetch(new URL("/api/activity/runner-channel", endpoint.baseUrl), { method: "POST", signal: AbortSignal.any([signal, AbortSignal.timeout(3000)]),
+        headers: { authorization: `Bearer ${endpoint.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ type: "hello", version: 1, runId, retained, capabilities: core.nativeChannelCapabilities() }) });
+      if (!hello.ok) {
+        const failure = await hello.json().catch(() => null) as { code?: string } | null;
+        if (isPermanentPiRunRefusal(hello.status, failure?.code)) { core.quarantineManagedChannel(); return; }
+        throw new Error("Channel handshake unavailable");
+      }
+      retained = true;
+      const response = await fetch(new URL("/api/activity/runner-channel", endpoint.baseUrl), { signal,
+        headers: { authorization: `Bearer ${endpoint.token}`, "Last-Event-ID": String(cursor) } });
+      if (!response.ok) {
+        const failure = await response.json().catch(() => null) as { code?: string } | null;
+        if (isPermanentPiRunRefusal(response.status, failure?.code)) { core.quarantineManagedChannel(); return; }
+        throw new Error("Channel subscription unavailable");
+      }
+      if (!response.body) throw new Error("Channel subscription unavailable");
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buffer = "";
+      try {
+        for (;;) {
+          const chunk = await reader.read(); if (chunk.done) break;
+          buffer += chunk.value.replace(/\r/g, "");
+          let end: number;
+          while ((end = buffer.indexOf("\n\n")) >= 0) {
+            const bound = runnerFrameBound(buffer);
+            if (end > bound.limit) throw new Error("Channel frame too large");
+            const block = buffer.slice(0, end); buffer = buffer.slice(end + 2);
+            const data = block.split("\n").filter(line => line.startsWith("data: ")).map(line => line.slice(6)).join("\n");
+            if (bound.chars !== undefined && data.length !== bound.chars) throw new Error("Channel frame size mismatch");
+            if (!data) continue;
+            const frame = JSON.parse(data) as PiManagedRequest;
+            if (frame.runId !== runId || !Number.isSafeInteger(frame.sequence) || frame.sequence < 1) throw new Error("Invalid channel frame");
+            cursor = Math.max(cursor, frame.sequence);
+            // Do not block reconnection on an ack whose response was lost; the core retains its acceptance promise.
+            void core.acceptRunnerRequest(frame).catch(() => {});
+          }
+          if (buffer.length > runnerFrameBound(buffer).limit) throw new Error("Channel frame too large");
+        }
+      } finally { await reader.cancel().catch(() => {}); }
+    } catch { /* Same live process/map reconnects; native writes never replay here. */ }
+    if (!signal.aborted) await new Promise(resolve => setTimeout(resolve, 250));
+  }
+}
+
+async function postPiRunnerChannel(endpoint: { baseUrl: string; token: string }, body: Record<string, unknown>, signal: AbortSignal, onPermanentRunRefusal: () => void, onContinuation?: (line: string) => void): Promise<boolean> {
+  while (!signal.aborted) {
+    try {
+      const response = await fetch(new URL("/api/activity/runner-channel", endpoint.baseUrl), { method: "POST",
+        signal: AbortSignal.any([signal, AbortSignal.timeout(3000)]), headers: { authorization: `Bearer ${endpoint.token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+      if (response.ok) {
+        if ((body.result as Record<string, unknown> | undefined)?.continuation) {
+          const reply = await response.json().catch(() => null) as { continuation?: Record<string, unknown> } | null;
+          if (reply?.continuation) onContinuation?.(`Native continuation: ${JSON.stringify(reply.continuation)}`);
+        }
+        return true;
+      }
+      const failure = await response.json().catch(() => null) as { code?: string } | null;
+      if ([401, 403, 404, 409, 410].includes(response.status) && !["runner_hello_required", "runner_grant_pending", "runner_grant_unverified"].includes(failure?.code ?? "")) {
+        if (isPermanentPiRunRefusal(response.status, failure?.code)) onPermanentRunRefusal();
+        return false;
+      }
+    } catch { /* A lost response retries the saved receipt, never the native operation. */ }
+    if (!signal.aborted) await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return false;
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   let args: RunnerArgs;
   try {
@@ -1022,6 +2502,18 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const paths = piSeatPaths(args.stateRoot, args.sessionName);
   fs.mkdirSync(paths.agentDir, { recursive: true });
   fs.mkdirSync(paths.sessionsDir, { recursive: true });
+  if (runtime === "pi") {
+    try { preparePiAccount(paths.agentDir, args.accountHome); }
+    catch (err) {
+      // Say what actually failed: a login that isn't a managed link, a missing or unreadable file, or an I/O error.
+      // Name the seat's own login file, and the declared account file when there is one.
+      const seatAuth = JSON.stringify(nodePath.join(paths.agentDir, "auth.json"));
+      const accountAuth = args.accountHome ? JSON.stringify(nodePath.join(args.accountHome, "auth.json")) : null;
+      console.error(`${PI_RUNNER_ERROR_MARKER} Pi account preparation failed (seat login file ${seatAuth}${accountAuth && accountAuth !== seatAuth ? `, account file ${accountAuth}` : ""}): ${(err as Error).message}. Resolve that, then retry the account operation.`);
+      process.exitCode = 2;
+      return;
+    }
+  }
 
   const { catchUpSince } = prepareRunnerSidecar(
     {
@@ -1036,6 +2528,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   );
 
   const endpoint = resolveActivityEndpoint(process.env);
+  // A legacy install-token launch does not acquire run authority from inherited environment.
+  // Preserve a bound credential's supplied claim so Core can refuse a stale or mismatched report.
+  const runId = endpoint?.token.startsWith("oag_") ? process.env.OPENRIG_RUN_ID : undefined;
   const childEnv = buildPiChildEnv(process.env as Record<string, string | undefined>, {
     agentDir: paths.agentDir,
     sessionsDir: paths.sessionsDir,
@@ -1046,10 +2541,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     openrigHome: process.env.OPENRIG_HOME,
     openrigUrl: endpoint?.baseUrl ?? process.env.OPENRIG_URL,
   });
+  if (runtime === "pi" && args.accountHome && fs.lstatSync(nodePath.join(paths.agentDir, "auth.json"), { throwIfNoEntry: false })?.isSymbolicLink()) {
+    // Only selected accounts load the Node compatibility shim; unrelated launches are unchanged.
+    childEnv.NODE_OPTIONS = `--require=${JSON.stringify(nodePath.resolve(import.meta.dirname, "../../assets/pi-account-lock.cjs"))}`;
+  }
   const childArgs = buildPiChildArgs({
     sessionsDir: paths.sessionsDir,
     sessionName: args.sessionName,
     model: args.model,
+    thinking: args.thinking,
     trust: args.trust,
     sessionFile: args.sessionFile,
     forkRef: args.forkRef,
@@ -1068,21 +2568,23 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   console.log(`[${runtime}-runner] starting ${runtime} --mode rpc (seat ${args.sessionName})`);
   console.log(`[${runtime}-runner] send text normally; prefixes: "/followup <text>" queues after the turn, "/abort" cancels`);
 
-  // OMP runs under a per-seat HOME. A HOME-dependent launcher on PATH (a mise
-  // shim) cannot find its target there, so resolve the real binary first,
-  // with the runner's own environment.
-  let command: string = runtime;
-  if (runtime === "omp") {
-    const resolved = resolveRuntimeExecutable("omp", process.env);
+  // OMP runs under a per-seat HOME, wrapped Pi launches hand the resolved
+  // Pi binary to the wrapper, and a pi-rpc fork names its own executable
+  // (--command), so a HOME-dependent launcher on PATH (a mise shim) is
+  // resolved first with the runner's own environment. Unwrapped Pi stays
+  // bare "pi".
+  let command: string = args.command ?? runtime;
+  if (args.command || runtime === "omp" || args.launchWrapper?.length) {
+    const resolved = resolveRuntimeExecutable(args.command ?? runtime, process.env);
     if (!resolved.ok) {
-      console.error(`[omp-runner] ERROR launch: ${resolved.error}`);
+      console.error(`[${runtime}-runner] ERROR launch: ${resolved.error}`);
       // Record the exit for this launch so the adapter fails it now instead
       // of waiting out its readiness timeout. The durable cursor survives.
       const at = new Date().toISOString();
       try {
         const pending = parsePiRunnerState(fs.readFileSync(paths.runnerStatePath, "utf8"));
         const exitedState: PiRunnerState = { ready: false, launchId: args.launchId, lastEntryId: pending?.lastEntryId, updatedAt: at, exited: { code: 127, at } };
-        fs.writeFileSync(paths.runnerStatePath, JSON.stringify(exitedState));
+        writePiRunnerSidecar(paths.runnerStatePath, exitedState);
       } catch { /* the pane ERROR marker still fails readiness */ }
       process.exitCode = 127;
       return;
@@ -1111,7 +2613,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // (or was added after it, and is then seen by the next one).
   const launchCredentialEvidence = args.openRouterCharge === true && runtime === "pi" ? credentialEvidence() : undefined;
 
-  const child = spawn(command, childArgs, {
+  const spawnFile = args.launchWrapper?.length ? args.launchWrapper[0]! : command;
+  const spawnArgs = args.launchWrapper?.length ? [...args.launchWrapper.slice(1), command, ...childArgs] : childArgs;
+  const child = spawn(spawnFile, spawnArgs, {
     cwd: args.cwd,
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
@@ -1119,6 +2623,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   // The child may close its pipe before the first RPC write completes.
   child.stdin.on("error", () => { /* spawn/exit handlers own the diagnosis */ });
+
+  const pane = createPaneCompositor(process.stdout);
+  // Diagnostics stay in the transcript — the pane's readiness probe greps it, and people
+  // and agents read the history there; the status line only pins the latest copy.
+  const paneDiag = (text: string) => {
+    pane.line(text);
+    pane.diagnostic(text);
+  };
 
   const chargeLookup = new OpenRouterChargeLookup({
     fetchGeneration: openRouterGenerationFetcher(() => childEnv["OPENROUTER_API_KEY"]),
@@ -1138,39 +2650,61 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       }, () => false as const).finally(() => clearTimeout(timeout));
     },
     schedule: (fn, ms) => { setTimeout(fn, ms).unref(); },
-    notice: (line) => { process.stdout.write(`${line}\n`); },
+    notice: (line) => { paneDiag(line); },
   });
 
+  // One activity post at a time: the daemon reads its newest record by arrival, so a beat still in flight when a turn
+  // starts must not land after the turn's first post. Each post's own 1.5 s timeout bounds the wait behind it.
+  const postInOrder = inOrder((payload: Record<string, unknown>): Promise<Record<string, unknown> | null> => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+    return fetch(new URL("/api/activity/hooks", endpoint!.baseUrl).toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${endpoint!.token}` },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+      .then(async (response) => response.ok && (runtime === "omp" || runId) ? await response.json() as Record<string, unknown> : null)
+      .catch(() => null)
+      .finally(() => clearTimeout(timeout));
+  });
+
+  const nativePosts = new AbortController(), nativeStream = new AbortController();
+  child.once("exit", () => { nativeStream.abort(); setTimeout(() => nativePosts.abort(), 2000).unref(); });
+  child.once("error", () => { nativeStream.abort(); nativePosts.abort(); });
   const io: RunnerIo = {
+    ...(endpoint && runId ? { postRunner: (body: Record<string, unknown>) => postPiRunnerChannel(endpoint, body, nativePosts.signal, () => core.quarantineManagedChannel(), paneDiag) } : {}),
+    ...(runtime === "pi" && endpoint && runId ? { withdrawNativeTurn: async (body: Record<string, unknown>) => {
+        try {
+          const response = await fetch(`${endpoint.baseUrl}/api/activity/runner-channel`, { method: "POST", signal: AbortSignal.timeout(3000),
+            headers: { authorization: `Bearer ${endpoint.token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+          if (!response.ok) {
+            const failure = await response.json().catch(() => null) as { code?: string } | null;
+            if (isPermanentPiRunRefusal(response.status, failure?.code)) core.quarantineManagedChannel();
+            return null;
+          }
+          return (await response.json() as { withdrawal?: { confirmed: boolean; notThisTurn?: boolean } }).withdrawal ?? null;
+        } catch { return null; }
+      } } : {}),
+
     sendRpc: (cmd) => {
       try { child.stdin.write(`${JSON.stringify(cmd)}\n`); } catch { /* exit handler reports */ }
     },
-    mirrorLine: (line) => process.stdout.write(`${line}\n`),
-    mirrorAppend: (text) => process.stdout.write(text),
+    mirrorLine: (line) => pane.line(line),
+    mirrorAppend: (text) => pane.transcript(text),
+    diagnostic: (text) => pane.diagnostic(text),
+    status: (text) => pane.status(text),
+    clearStatus: () => pane.clearStatus(),
     postActivity: (payload) => {
       if (!endpoint || typeof fetch !== "function") return;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 1500);
-      const request = fetch(new URL("/api/activity/hooks", endpoint.baseUrl).toString(), {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${endpoint.token}` },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      if (runtime !== "omp") {
-        request.catch(() => { /* best-effort — never blocks the loop */ }).finally(() => clearTimeout(timeout));
-        return;
-      }
-      // OMP reads the acknowledgement so identity delivery can retry; null
+      const result = postInOrder(payload).catch(() => null);
+      // Managed runs and OMP read the acknowledgement so identity delivery can retry; null
       // (transport failure or a non-OK reply) means "not yet persisted".
-      return request
-        .then(async (response) => response.ok ? await response.json() as Record<string, unknown> : null)
-        .catch(() => null)
-        .finally(() => clearTimeout(timeout));
+      if (runtime === "omp" || runId) return result;
     },
     writeSidecar: (state) => {
       try {
-        fs.writeFileSync(paths.runnerStatePath, JSON.stringify(state));
+        writePiRunnerSidecar(paths.runnerStatePath, state);
       } catch { /* best-effort; adapter falls back to pane markers */ }
     },
     now: () => new Date().toISOString(),
@@ -1215,9 +2749,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     sessionName: args.sessionName, nodeId: process.env.OPENRIG_NODE_ID, launchId: args.launchId,
     // Carry the emitting tenure; never infer it from a later daemon read or Pi event.
     generation: process.env.OPENRIG_OCCUPANT_GENERATION,
-  }, { catchUpSince, runtime, usageFacts: args.usageFacts === true, openRouterCharge: args.openRouterCharge === true, launchCredentialEvidence });
+    runId: runId,
+  }, { catchUpSince, runtime, usageFacts: args.usageFacts === true, openRouterCharge: args.openRouterCharge === true, launchCredentialEvidence,
+    requestedSessionFile: args.sessionFile, model: args.model, thinking: args.thinking });
 
-  let transportUp = runtime === "pi";
+  if (endpoint && runId)
+    void connectPiRunnerChannel(core, endpoint, runId, nativeStream.signal);
+
+  let transportUp = runtime !== "omp";
   readline.createInterface({ input: child.stdout }).on("line", (line) => {
     if (runtime === "omp" && !core.isReady()) {
       try {
@@ -1230,20 +2769,22 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     }
     core.handlePiLine(line);
   });
-  // Re-deliver OMP identity until the daemon confirms the resume token.
-  const identityRetry = runtime === "omp" ? setInterval(() => core.retrySessionIdentity(), IDENTITY_RETRY_MS) : undefined;
+  // Re-deliver managed run identity after pending activation/cutover, and legacy OMP identity as before.
+  const identityRetry = runtime === "omp" || runId ? setInterval(() => core.retrySessionIdentity(), IDENTITY_RETRY_MS) : undefined;
   identityRetry?.unref();
+  const heartbeatTimer = startHeartbeatTimer(core, runtime);
   // The last few stderr lines, so an OMP that exits during startup is
   // reported with its own words in the error, not only above it.
   const stderrTail: string[] = [];
   let reportedPiCapability = false;
   readline.createInterface({ input: child.stderr }).on("line", (line) => {
     if (!line.trim()) return;
-    process.stdout.write(`[${runtime}:err] ${line}\n`);
+    paneDiag(`[${runtime}:err] ${line}`);
     stderrTail.push(line.length > OMP_STDERR_TAIL_CHARS ? `${line.slice(0, OMP_STDERR_TAIL_CHARS)}...` : line);
     if (stderrTail.length > OMP_STDERR_TAIL_LINES) stderrTail.shift();
     if (runtime === "pi" && !core.isReady() && !reportedPiCapability) {
       const detail = piLaunchCapabilityError(command, args.trust, line, () => {
+        if (args.launchWrapper?.length) return "";
         const version = spawnSync(command, ["--version"], { cwd: args.cwd, env: childEnv, encoding: "utf8",
           timeout: 3000, killSignal: "SIGKILL", maxBuffer: 4096, stdio: ["ignore", "pipe", "pipe"] });
         if (version.error || version.status !== 0) return "";
@@ -1252,15 +2793,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       });
       if (detail) {
         reportedPiCapability = true;
-        process.stdout.write(`[pi-runner] ${detail}\n`);
+        paneDiag(`[pi-runner] ${detail}`);
       }
     }
   });
-  const input = createRunnerInput(process.stdin, process.stdout, (block) => core.handleUserBlock(block));
+  const input = createRunnerInput(process.stdin, process.stdout, (block) => core.handleUserBlock(block), pane);
 
-  if (runtime === "pi") {
+  if (runtime !== "omp") {
     child.on("error", (err) => {
-      console.error(`${PI_RUNNER_ERROR_MARKER} failed to spawn pi: ${err.message}`);
+      paneDiag(`${PI_RUNNER_ERROR_MARKER} failed to spawn ${args.launchWrapper?.length ? `launch_wrapper (${spawnFile})` : (args.command ?? "pi")}: ${err.message}`);
       const code = (err as NodeJS.ErrnoException).code === "ENOENT" ? 127 : 1;
       core.handlePiExit(code);
       input.close();
@@ -1283,10 +2824,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (exited) return;
     exited = true;
     clearInterval(identityRetry);
+    heartbeatTimer.stop();
     if (!core.isReady()) {
       const how = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
       const output = stderrTail.length > 0 ? ` Its last output: ${stderrTail.join(" | ")}` : " It printed nothing on stderr.";
-      console.error(transportUp
+      paneDiag(transportUp
         ? "[omp-runner] ERROR OMP did not establish a resumable RPC session. Authenticate this isolated seat using HOME=<seat-root> PI_CODING_AGENT_DIR=<seat-root>/agent omp and /login, or provide its declared model provider key in the OpenRig daemon environment. Default OMP credentials are not shared."
         : `[omp-runner] ERROR OMP exited during startup, before its RPC transport started (${command}, ${how}).${output}`);
     }
@@ -1295,7 +2837,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     process.exitCode = code ?? 1;
   };
   child.on("error", (err) => {
-    console.error(`[omp-runner] ERROR failed to spawn omp: ${err.message}`);
+    paneDiag(`[omp-runner] ERROR failed to spawn omp: ${err.message}`);
     recordExit(null);
   });
   // "close" fires once OMP's stdio is drained, so its stderr is in the tail

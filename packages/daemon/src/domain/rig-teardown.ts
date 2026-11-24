@@ -1,16 +1,22 @@
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
-import type { TmuxAdapter } from "../adapters/tmux.js";
+import { probeShowsNoServer, type TmuxAdapter, type SessionProbe } from "../adapters/tmux.js";
 import type { SnapshotCapture } from "./snapshot-capture.js";
 import type { EventBus } from "./event-bus.js";
 import { RigNotFoundError } from "./errors.js";
 import type { ResumeMetadataRefresher } from "./resume-metadata-refresher.js";
 import fs from "node:fs";
 import nodePath from "node:path";
-import { removeManagedBlocksFromFile, DEFAULT_CLAUDE_MANAGED_BLOCK_FILE } from "./managed-blocks.js";
+import { removeManagedBlocksFromFile } from "./managed-blocks.js";
+import { recordedGuidanceFile, seatGuidanceFile } from "./restore-guidance.js";
+import { cleanupOwnedClaudeCwd } from "./claude-owned-settings.js";
 import { stopTranscriptRotation } from "./transcript-rotation.js";
 import { findOtherSessionOwner } from "./session-owner.js";
+import { communityHarnessOf } from "./built-in-runtimes.js";
+import { SEAT_SKILLS_BOOTSTRAP_BLOCK_ID, SEAT_SKILLS_BOOTSTRAP_LINE, cleanSeatSkills, seatSkillPaths } from "./seat-skill-storage.js";
+import { settleAutomaticRestore } from "./existing-rig-restore.js";
+import { resolveSeatKind, seatProcessOwner } from "./seat-kinds.js";
 
 export interface TeardownResult {
   rigId: string;
@@ -20,6 +26,29 @@ export interface TeardownResult {
   deleteBlocked: boolean;
   alreadyStopped: boolean;
   errors: string[];
+  /** OPR.0.7.0.13: team skill files left in seats' own storage because they were edited, or were never recorded as
+   *  OpenRig's. Present only when something was kept. */
+  keptSkills?: string[];
+  /** Managed guidance blocks left in a guidance file because a person edited them, as `<file>: <block id>`. Present
+   *  only when something was kept. */
+  keptGuidance?: string[];
+  /** #875: files in a Claude seat's cwd that still hold OpenRig's additions because down couldn't safely change them
+   *  (settings that don't parse, a collector that isn't the shipped one), as `<file>: <why>`. Present only when
+   *  something was kept. */
+  keptFiles?: string[];
+  /** Claude seats whose latest launch recorded no folder (one started before launches recorded it), as
+   *  `<session>: <saved folder>`: down can't tell whether it ran somewhere else. Present only when there was one. */
+  launchFolderUnrecorded?: string[];
+  /** Sessions of seats joined with `rig attach` as an external CLI, which down doesn't stop or check. Without --delete
+   *  each keeps its claim as it was, whether or not the app still runs. Present only when there was one. */
+  leftRunning?: string[];
+  /** Sessions of community-harness seats whose pane was stopped. OpenRig stops only the pane; the harness's own
+   *  processes (a gateway, say) may keep running, as its preset's limits say. Present only when there was one. */
+  paneOnly?: string[];
+  /** Sessions OpenRig didn't launch (joined with `rig attach --self`, adopted, bound or reconciled): down released each
+   *  seat, as `rig unclaim` does, and left the session running as its owner's. A later down names a released session
+   *  here too while it keeps the seat's skills for it. Present only when there was one. */
+  released?: string[];
 }
 
 interface TeardownOptions {
@@ -39,6 +68,11 @@ interface TeardownDeps {
   eventBus: EventBus;
   resumeMetadataRefresher?: ResumeMetadataRefresher;
   serviceOrchestrator?: import("./service-orchestrator.js").ServiceOrchestrator;
+  /** The shipped Claude context collector. A cwd's copy is removed only while its bytes match this file. */
+  claudeCollectorAssetPath?: string;
+  /** Releases a claimed session's seat without stopping the session: `rig unclaim`'s own path. Absent: such a session
+   *  goes through the marker-checked stop, as before. */
+  releaseClaimedSession?: (sessionId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
 }
 
 interface LatestNodeSession {
@@ -50,6 +84,15 @@ interface LatestNodeSession {
   resumeType: string | null;
   resumeToken: string | null;
   cwd: string | null;
+  communityHarness?: string | null;
+  origin?: string | null;
+}
+
+/** Only a reported missing server permits a bootstrap; other unreadable/permission results do not. */
+function isMissingTmuxServer(probe: SessionProbe): boolean {
+  if (probe.state !== "transport_unavailable" || /permission denied|operation not permitted|EACCES|EPERM/i.test(probe.cause)) return false;
+  return /no server running/i.test(probe.cause)
+    || /(?:error connecting to|tmux-\d+)[^\n]*(?:No such file or directory|Connection refused)/i.test(probe.cause);
 }
 
 /**
@@ -77,12 +120,20 @@ export class RigTeardownOrchestrator {
 
     const guard = this.deps.tmuxAdapter.deliveryGuard;
     const ids = rig.nodes.map(node => node.id);
+    // Daemon start may be restoring this rig (a kernel a reboot left down). A stop made meanwhile
+    // waits, holding no lease, for that restore to return and then stops what it left, so the stop
+    // wins either way; taking the leases first would bind to seats that restore then replaces.
+    if (!guard || !ids.some(id => guard.ownsLifecycle(id))) await settleAutomaticRestore(this.db, rigId);
     if (guard && ids.some(id => !guard.ownsLifecycle(id))) return guard.lifecycle(ids, () => this.teardown(rigId, opts));
     const result: TeardownResult = {
       rigId, sessionsKilled: 0, snapshotId: null,
       deleted: false, deleteBlocked: false, alreadyStopped: false, errors: [],
     };
     const archived = this.db.prepare("SELECT archived_at FROM rigs WHERE id = ?").get(rigId) as { archived_at: string | null };
+    // OPR.0.7.0.13: read the seats' storage keys now; a delete removes the node rows. Only a seat whose consumer is
+    // confirmed gone has its skills cleaned (settledSkillSeats); the rest keep theirs.
+    const skillSeats = rig.nodes.filter((node) => node.runtime === "claude-code" || node.runtime === "codex")
+      .map((node) => ({ id: node.id, logicalId: node.logicalId, runtime: node.runtime as string }));
     // A live seat can create its guidance while teardown awaits tmux. Resolve
     // file identities only after those waits, immediately before each cleanup.
     const currentLiveGuidanceTargets = () => this.liveGuidanceTargets(rigId);
@@ -94,7 +145,8 @@ export class RigTeardownOrchestrator {
     if (liveSessions.length === 0) {
       // Additional intent is best-effort; keep down's existing result if it cannot be recorded.
       await this.recordAlreadyStoppedIntent(rigId).catch(() => {});
-      this.cleanupManagedGuidanceFiles(rigId, currentLiveGuidanceTargets());
+      this.cleanupManagedGuidanceFiles(rigId, currentLiveGuidanceTargets(), result);
+      this.cleanupClaudeCwds(rigId, result);
       result.alreadyStopped = true;
       // Still tear down services even if no agent sessions are running
       if (this.deps.serviceOrchestrator) {
@@ -106,6 +158,8 @@ export class RigTeardownOrchestrator {
           result.errors.push(`Service teardown warning: ${(err as Error).message}`);
         }
       }
+      // Read which seats are settled before a delete removes their session rows.
+      const skillState = this.settledSkillSeats(skillSeats);
       // Skip to delete if requested
       if (opts?.delete) {
         this.atomicDelete(rigId);
@@ -113,6 +167,7 @@ export class RigTeardownOrchestrator {
       } else {
         this.deps.eventBus.emit({ type: "rig.stopped", rigId });
       }
+      this.cleanupSeatSkills(rigId, skillSeats, skillState, result);
       return result;
     }
 
@@ -141,27 +196,47 @@ export class RigTeardownOrchestrator {
 
     // 5. Kill each live session
     let killFailures = 0;
+    const external = new Set<string>();
+    const toRelease: LatestNodeSession[] = [];
     for (const session of liveSessions) {
+      // OpenRig neither launches nor stops a seat joined with `rig attach` as an external CLI, and it has no tmux session:
+      // a missing one isn't a stop. Keep its claim, as the historical path below does for non-tmux bindings.
+      if (seatProcessOwner(resolveSeatKind(this.deps.sessionRegistry.getBindingForNode(session.nodeId)?.attachmentType)) === "external") {
+        external.add(session.nodeId);
+        (result.leftRunning ??= []).push(session.sessionName);
+        continue;
+      }
       // An archived rig may retain a stale row for a name now owned by a live rig.
       // That name cannot identify the archived rig's tmux session for a kill.
       const ownedByAnotherRig = archived.archived_at !== null && findOtherSessionOwner(
         this.db, session.sessionName, session.nodeId, { ignoreArchived: true },
       ) !== null;
+      // A session OpenRig didn't launch (origin claimed: joined with rig attach --self, adopted, bound or reconciled) is
+      // its owner's, whatever marker it carries, so down never stops it. Unless it's positively gone, down releases the
+      // seat as rig unclaim does, after the file cleanups below have counted the seat as still in use.
+      const release = session.origin === "claimed" && this.deps.releaseClaimedSession !== undefined;
       let absent = ownedByAnotherRig;
       if (!absent && this.deps.tmuxAdapter.probeSession) {
         try {
           const probe = await this.deps.tmuxAdapter.probeSession(session.sessionName);
-          absent = probe.state === "absent";
-          if (probe.state !== "present" && !absent) {
+          // This is the daemon's own tmux namespace, as in the import guard; a missing socket file is not enough.
+          absent = probe.state === "absent" || probeShowsNoServer(probe);
+          if (probe.state !== "present" && !absent && !release) {
             result.errors.push(`Could not confirm session '${session.sessionName}' is absent: ${probe.state === "transport_unavailable" ? probe.cause : probe.state}`);
             killFailures++;
             continue;
           }
         } catch (err) {
-          result.errors.push(`Could not check session '${session.sessionName}': ${(err as Error).message}`);
-          killFailures++;
-          continue;
+          if (!release) {
+            result.errors.push(`Could not check session '${session.sessionName}': ${(err as Error).message}`);
+            killFailures++;
+            continue;
+          }
         }
+      }
+      if (release && !absent) {
+        toRelease.push(session);
+        continue;
       }
       const killResult = absent ? { ok: false, code: "session_not_found" } :
         await this.deps.tmuxAdapter.killSession(session.sessionName);
@@ -175,8 +250,9 @@ export class RigTeardownOrchestrator {
         if (!ownedByAnotherRig) stopTranscriptRotation(session.sessionName);
         // Success or already gone — update DB atomically
         this.atomicNodeCleanup(session);
-        this.cleanupManagedGuidanceFileForNode(rigId, session.runtime, session.cwd, currentLiveGuidanceTargets());
+        this.cleanupManagedGuidanceFileForNode(rigId, session.runtime, session.cwd, currentLiveGuidanceTargets(), result, session.nodeId);
         if (killResult.ok) result.sessionsKilled++;
+        if (killResult.ok && communityHarnessOf(session.communityHarness, session.runtime)) (result.paneOnly ??= []).push(session.sessionName);
       } else {
         // Real kill failure — don't update this node
         result.errors.push(`Kill failed for session '${session.sessionName}': ${(killResult as { message?: string }).message ?? "unknown"}`);
@@ -185,7 +261,8 @@ export class RigTeardownOrchestrator {
     }
     // Stop live sessions before probing historical rows; bookkeeping must not fail down.
     await this.recordAlreadyStoppedIntent(rigId).catch(() => {});
-    this.cleanupManagedGuidanceFiles(rigId, currentLiveGuidanceTargets());
+    this.cleanupManagedGuidanceFiles(rigId, currentLiveGuidanceTargets(), result);
+    this.cleanupClaudeCwds(rigId, result);
 
     // 5b. Tear down services if they exist
     if (this.deps.serviceOrchestrator) {
@@ -199,6 +276,19 @@ export class RigTeardownOrchestrator {
       }
     }
 
+    for (const session of toRelease) {
+      const released = await this.deps.releaseClaimedSession!(session.sessionId);
+      if (released.ok) {
+        external.add(session.nodeId);
+        (result.released ??= []).push(session.sessionName);
+      } else {
+        result.errors.push(`Release failed for session '${session.sessionName}': ${released.error}`);
+        killFailures++;
+      }
+    }
+
+    // Read which seats are settled before a delete removes their session rows.
+    const skillState = this.settledSkillSeats(skillSeats);
     // 6. Delete if requested (blocked by kill failures)
     if (opts?.delete) {
       if (killFailures > 0) {
@@ -219,11 +309,73 @@ export class RigTeardownOrchestrator {
       this.deps.eventBus.emit({ type: "rig.stopped", rigId });
     }
 
+    this.cleanupSeatSkills(rigId, skillSeats, skillState, result, external);
     return result;
   }
 
+  /**
+   * OPR.0.7.0.13: the seats whose consumer is confirmed gone: its latest session was confirmed stopped (this down killed
+   * it or found it absent, or an earlier down did; both record the stop), or it never had a session. A running,
+   * exited or detached row whose absence wasn't confirmed (a session still present, a probe unavailable or failing, no
+   * probe at all) leaves the seat unsettled: a detached row doesn't prove the process is gone. So does any released
+   * session (claimed, then detached) whose stop isn't recorded, latest or not: it may still run and hold the seat's
+   * skill catalog. A seat held only by such sessions (its latest is recorded stopped or is one of them) maps to their
+   * names in `heldByReleased`.
+   */
+  private settledSkillSeats(seats: ReadonlyArray<{ id: string }>): { settled: Set<string>; heldByReleased: Map<string, string[]> } {
+    const settled = new Set<string>();
+    const heldByReleased = new Map<string, string[]>();
+    const latest = this.db.prepare(`SELECT id, intentionally_stopped AS stopped FROM sessions WHERE node_id = ?
+      ORDER BY created_at DESC, id DESC LIMIT 1`);
+    const released = this.db.prepare(`SELECT id, session_name AS name FROM sessions WHERE node_id = ? AND origin = 'claimed'
+      AND status = 'detached' AND intentionally_stopped = 0 ORDER BY created_at, id`);
+    for (const seat of seats) {
+      try {
+        const row = latest.get(seat.id) as { id: string; stopped: number } | undefined;
+        const held = released.all(seat.id) as Array<{ id: string; name: string }>;
+        const latestSettled = !row || row.stopped === 1;
+        if (held.length === 0) {
+          if (latestSettled) settled.add(seat.id);
+        } else if (latestSettled || held.some((session) => session.id === row?.id)) {
+          heldByReleased.set(seat.id, held.map((session) => session.name));
+        }
+      } catch {}
+    }
+    return { settled, heldByReleased };
+  }
+
+  /** OPR.0.7.0.13: once a seat's consumer is confirmed gone, remove the unchanged skill files OpenRig wrote into its
+   *  own storage and report what was kept. The records go only with the rig itself, so a restore can rebuild them. */
+  private cleanupSeatSkills(rigId: string, seats: ReadonlyArray<{ id: string; logicalId: string; runtime: string }>, { settled, heldByReleased }: { settled: ReadonlySet<string>; heldByReleased: ReadonlyMap<string, string[]> }, result: TeardownResult, external: ReadonlySet<string> = new Set()): void {
+    const kept: string[] = [];
+    for (const seat of seats) {
+      // An external seat left running keeps its skills; leftRunning already says so.
+      if (external.has(seat.id)) continue;
+      if (!settled.has(seat.id)) {
+        const paths = seatSkillPaths({ rigId, logicalId: seat.logicalId, runtime: seat.runtime });
+        if (!fs.existsSync(paths.root)) continue;
+        const held = heldByReleased.get(seat.id);
+        if (!held) {
+          result.errors.push(`Seat skills for ${seat.logicalId} kept: its consumer isn't confirmed stopped`);
+          continue;
+        }
+        // Only released sessions hold it: each is its owner's, so its skills are kept and released names it, as the
+        // down that released it did.
+        for (const name of held) if (!result.released?.includes(name)) (result.released ??= []).push(name);
+        continue;
+      }
+      try {
+        const cleaned = cleanSeatSkills(seatSkillPaths({ rigId, logicalId: seat.logicalId, runtime: seat.runtime }), { dropRecords: result.deleted });
+        kept.push(...cleaned.kept, ...cleaned.refused);
+      } catch (err) {
+        result.errors.push(`Seat skill cleanup for ${seat.logicalId}: ${(err as Error).message}`);
+      }
+    }
+    if (kept.length > 0) result.keptSkills = kept;
+  }
+
   /** Atomically record the supported stop and clear its binding. */
-  private atomicNodeCleanup(session: LatestNodeSession): void {
+  private atomicNodeCleanup(session: Pick<LatestNodeSession, "sessionId" | "nodeId">): void {
     const tx = this.db.transaction(() => {
       this.deps.sessionRegistry.markIntentionallyStopped(session.sessionId);
       this.deps.sessionRegistry.clearBinding(session.nodeId);
@@ -231,34 +383,68 @@ export class RigTeardownOrchestrator {
     tx();
   }
 
-  /** An explicit down also covers already-detached seats, but neither a stale
-   * row nor an unavailable probe proves that its session is absent. */
+  /** An explicit down also covers already-detached seats, and a failed start's rolled-back (superseded) session,
+   * but neither a stale row nor an unavailable probe proves that its session is absent. */
   private async recordAlreadyStoppedIntent(rigId: string): Promise<void> {
     const probe = this.deps.tmuxAdapter.probeSession;
     if (!probe) return;
     const eligible = this.db.prepare(`
-      SELECT s.id, s.node_id, s.session_name FROM sessions s JOIN nodes n ON n.id = s.node_id
-      WHERE n.rig_id = ? AND s.status IN ('exited', 'detached')
+      SELECT s.id, s.node_id, s.session_name, s.status FROM sessions s JOIN nodes n ON n.id = s.node_id
+      WHERE n.rig_id = ? AND s.status IN ('exited', 'detached', 'superseded')
         AND s.intentionally_stopped = 0
         AND s.id = (SELECT latest.id FROM sessions latest WHERE latest.node_id = n.id
           ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
     `);
-    for (const row of eligible.all(rigId) as Array<{ id: string; node_id: string; session_name: string }>) {
+    for (const row of eligible.all(rigId) as Array<{ id: string; node_id: string; session_name: string; status: string }>) {
       const binding = this.deps.sessionRegistry.getBindingForNode(row.node_id);
       if (binding && (binding.attachmentType !== "tmux" || binding.tmuxSession !== row.session_name)) continue;
+      const stillEligible = () => (eligible.all(rigId) as Array<{ id: string }>).some(current => current.id === row.id)
+        && JSON.stringify(this.deps.sessionRegistry.getBindingForNode(row.node_id)) === JSON.stringify(binding);
       try {
-        if ((await probe.call(this.deps.tmuxAdapter, row.session_name)).state !== "absent") continue;
+        let observed = await probe.call(this.deps.tmuxAdapter, row.session_name);
+        if (!stillEligible()) continue;
+        if (isMissingTmuxServer(observed)) {
+          // A reboot may have removed tmux's server/socket. Start only an empty server, then
+          // demand positive session absence; transport_unavailable itself proves nothing.
+          const started = await this.deps.tmuxAdapter.startServer();
+          if (!stillEligible() || !started.ok) continue;
+          observed = await probe.call(this.deps.tmuxAdapter, row.session_name);
+          if (!stillEligible()) continue;
+        }
+        if (observed.state !== "absent") continue;
       } catch {
         continue;
       }
       this.db.transaction(() => {
-        // A launch may have rebound the node while the absence probe awaited.
-        if ((eligible.all(rigId) as Array<{ id: string }>).some(current => current.id === row.id)
-          && JSON.stringify(this.deps.sessionRegistry.getBindingForNode(row.node_id)) === JSON.stringify(binding)) {
-          this.deps.sessionRegistry.markIntentionallyStopped(row.id);
+        // Every await above can admit a new binding or latest session. Check again at the write.
+        if (stillEligible()) {
+          // A superseded row stays superseded: restore skips it and keeps reading the seat's own history.
+          if (row.status === "superseded") this.deps.sessionRegistry.recordStopIntent(row.id);
+          else this.deps.sessionRegistry.markIntentionallyStopped(row.id);
           this.deps.sessionRegistry.clearBinding(row.node_id);
         }
       })();
+    }
+    // A released session that's no longer its seat's latest (the seat bound or launched another since) stays its
+    // owner's until tmux reports it absent; then its stop is recorded. The seat's binding belongs to its latest
+    // session, so it's left alone, and the row keeps its status.
+    const earlier = this.db.prepare(`
+      SELECT s.id, s.session_name FROM sessions s JOIN nodes n ON n.id = s.node_id
+      WHERE n.rig_id = ? AND s.origin = 'claimed' AND s.status = 'detached' AND s.intentionally_stopped = 0
+        AND s.id <> (SELECT latest.id FROM sessions latest WHERE latest.node_id = n.id
+          ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
+    `).all(rigId) as Array<{ id: string; session_name: string }>;
+    for (const row of earlier) {
+      try {
+        let observed = await probe.call(this.deps.tmuxAdapter, row.session_name);
+        if (isMissingTmuxServer(observed)) {
+          if (!(await this.deps.tmuxAdapter.startServer()).ok) continue;
+          observed = await probe.call(this.deps.tmuxAdapter, row.session_name);
+        }
+        if (observed.state === "absent") this.deps.sessionRegistry.recordStopIntent(row.id);
+      } catch {
+        // Unknown: the session stays in use.
+      }
     }
   }
 
@@ -285,47 +471,156 @@ export class RigTeardownOrchestrator {
     return this.deps.sessionRegistry.getLatestLiveSessions(rigId);
   }
 
+  /** This rig's seats whose files may still be in use: each live session, each released one, and each seat whose latest
+   *  session reads detached without a recorded stop. A released session (claimed, then detached by rig unclaim or down)
+   *  is its owner's and may still be running, whether or not it's still its seat's latest. A detached latest session may
+   *  still be running too (this server didn't show it), as settledSkillSeats also holds. Either's folders stay in use
+   *  until recordAlreadyStoppedIntent sees tmux report it absent and records the stop. */
+  private seatsInUse(rigId: string): Array<Pick<LatestNodeSession, "nodeId" | "runtime" | "cwd"> & { launchedCwd: string | null }> {
+    const released = this.db.prepare(`
+      SELECT n.id AS nodeId, n.runtime, n.cwd, s.id AS sessionId FROM nodes n JOIN sessions s ON s.node_id = n.id
+      WHERE n.rig_id = ? AND s.status = 'detached' AND s.intentionally_stopped = 0
+        AND (s.origin = 'claimed' OR s.id = (SELECT latest.id FROM sessions latest WHERE latest.node_id = n.id
+          ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1))
+    `).all(rigId) as Array<Pick<LatestNodeSession, "nodeId" | "runtime" | "cwd" | "sessionId">>;
+    return [...this.getLatestLiveSessions(rigId), ...released]
+      .map((session) => ({ ...session, launchedCwd: this.launchedCwdOf(session.sessionId) }));
+  }
+
+  /** The folder a session was launched in, as its launch recorded it; null when none was (a database from before the
+   *  record, or a session OpenRig didn't launch). */
+  private launchedCwdOf(sessionId: string): string | null {
+    try {
+      return (this.db.prepare("SELECT launched_cwd FROM sessions WHERE id = ?").get(sessionId) as { launched_cwd: string | null } | undefined)?.launched_cwd ?? null;
+    } catch { return null; }
+  }
+
   private liveGuidanceTargets(rigId: string): Set<string> {
     const rows = this.db.prepare(`
-      SELECT n.rig_id, n.runtime, n.cwd FROM nodes n
+      SELECT n.id, n.rig_id, n.runtime, n.cwd FROM nodes n
       JOIN rigs r ON r.id = n.rig_id
       WHERE r.archived_at IS NULL AND r.id <> ? AND n.cwd IS NOT NULL
-    `).all(rigId) as Array<{ rig_id: string; runtime: string | null; cwd: string }>;
+    `).all(rigId) as Array<{ id: string; rig_id: string; runtime: string | null; cwd: string }>;
     const targets = new Set<string>();
     for (const row of rows) {
-      const target = this.guidanceTargetPath(row.rig_id, row.runtime, row.cwd);
+      const target = this.guidanceTargetPath(row.rig_id, row.runtime, row.cwd, row.id);
       if (target) targets.add(this.guidancePathKey(target));
     }
-    // A failed kill or inconclusive probe leaves this rig's session live.
+    // A failed kill or inconclusive probe leaves this rig's session live, and a released one stays its owner's.
     // Its file may also be shared with a sibling that stopped successfully.
-    for (const session of this.getLatestLiveSessions(rigId)) {
-      const target = this.guidanceTargetPath(rigId, session.runtime, session.cwd);
+    for (const session of this.seatsInUse(rigId)) {
+      const target = this.guidanceTargetPath(rigId, session.runtime, session.cwd, session.nodeId);
       if (target) targets.add(this.guidancePathKey(target));
     }
     return targets;
   }
 
-  private cleanupManagedGuidanceFiles(rigId: string, liveGuidanceTargets: ReadonlySet<string>): void {
+  private cleanupManagedGuidanceFiles(rigId: string, liveGuidanceTargets: ReadonlySet<string>, result: TeardownResult): void {
     const rows = this.db.prepare(`
-      SELECT DISTINCT runtime, cwd
+      SELECT id, runtime, cwd
       FROM nodes
       WHERE rig_id = ?
-    `).all(rigId) as Array<{ runtime: string | null; cwd: string | null }>;
+    `).all(rigId) as Array<{ id: string; runtime: string | null; cwd: string | null }>;
     for (const row of rows) {
-      this.cleanupManagedGuidanceFileForNode(rigId, row.runtime, row.cwd, liveGuidanceTargets);
+      this.cleanupManagedGuidanceFileForNode(rigId, row.runtime, row.cwd, liveGuidanceTargets, result, row.id);
     }
   }
 
-  private guidanceTargetPath(rigId: string, runtime: string | null, cwd: string | null): string | null {
+  /** #875: take OpenRig's Claude collector, status line and relay hooks back out of each of this rig's Claude cwds that
+   *  no seat still uses, and report what had to be kept. */
+  private cleanupClaudeCwds(rigId: string, result: TeardownResult): void {
+    const rows = this.db.prepare(`
+      SELECT DISTINCT cwd FROM nodes WHERE rig_id = ? AND runtime = 'claude-code' AND cwd IS NOT NULL
+    `).all(rigId) as Array<{ cwd: string }>;
+    // Each saved folder, and each folder a launch of this rig's Claude seats recorded: a run's own `--cwd` (#3347) too.
+    const cwds = [...rows.map((row) => row.cwd), ...this.launchedClaudeCwds(rigId)];
+    this.reportUnrecordedLaunchFolders(rigId, result);
+    if (cwds.length === 0) return;
+    const inUse = this.claudeTargetsInUse(rigId);
+    const done = new Set<string>();
+    for (const cwd of cwds) {
+      const key = this.guidancePathKey(cwd);
+      if (inUse.has(key) || done.has(key)) continue;
+      done.add(key); // one cleanup per directory, however many of this rig's seats name it
+      try {
+        const isShared = (path: string) => inUse.has(this.guidancePathKey(path));
+        for (const entry of cleanupOwnedClaudeCwd(cwd, this.deps.claudeCollectorAssetPath, isShared)) {
+          if (!result.keptFiles?.includes(entry)) (result.keptFiles ??= []).push(entry);
+        }
+      } catch (err) {
+        result.errors.push(`Claude settings cleanup in ${cwd}: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  /** The folders this rig's Claude sessions recorded as launched in. A database from before the record has none. */
+  private launchedClaudeCwds(rigId: string): string[] {
+    try {
+      return (this.db.prepare(`
+        SELECT DISTINCT s.launched_cwd AS cwd FROM sessions s JOIN nodes n ON n.id = s.node_id
+        WHERE n.rig_id = ? AND n.runtime = 'claude-code' AND s.launched_cwd IS NOT NULL
+      `).all(rigId) as Array<{ cwd: string }>).map((row) => row.cwd);
+    } catch { return []; }
+  }
+
+  /** A Claude seat whose latest session OpenRig launched without recording its folder (before the record) may have run
+   *  elsewhere than its saved folder; down names it rather than guess. A database from before the record names none. */
+  private reportUnrecordedLaunchFolders(rigId: string, result: TeardownResult): void {
+    let rows: Array<{ sessionName: string; cwd: string | null }>;
+    try {
+      rows = this.db.prepare(`
+        SELECT s.session_name AS sessionName, n.cwd FROM nodes n JOIN sessions s ON s.node_id = n.id
+        WHERE n.rig_id = ? AND n.runtime = 'claude-code' AND s.launched_cwd IS NULL AND COALESCE(s.origin, '') <> 'claimed'
+          AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
+      `).all(rigId) as Array<{ sessionName: string; cwd: string | null }>;
+    } catch { return; }
+    for (const row of rows) {
+      const entry = `${row.sessionName}: ${row.cwd ?? "no saved folder"}`;
+      if (!result.launchFolderUnrecorded?.includes(entry)) (result.launchFolderUnrecorded ??= []).push(entry);
+    }
+  }
+
+  /** What a Claude seat may still use, by the same rule as guidance files: the cwd of a Claude seat of any other rig that
+   *  isn't archived, or of one of this rig's Claude seats still live (a failed stop, an inconclusive probe, an attached
+   *  CLI) or released and not seen gone. Each cwd's settings file, collector, `.claude` and `.openrig` are keyed by
+   *  their own identity too, so a target another directory reaches through a symlink or a hardlink counts as in use. */
+  private claudeTargetsInUse(rigId: string): Set<string> {
+    const rows = this.db.prepare(`
+      SELECT n.cwd FROM nodes n
+      JOIN rigs r ON r.id = n.rig_id
+      WHERE r.archived_at IS NULL AND r.id <> ? AND n.runtime = 'claude-code' AND n.cwd IS NOT NULL
+    `).all(rigId) as Array<{ cwd: string }>;
+    const cwds = rows.map((row) => row.cwd);
+    // Where another rig's Claude seat last launched, and where this rig's still-live seats were launched: a run's own
+    // `--cwd` counts as theirs, like a saved folder.
+    try {
+      cwds.push(...(this.db.prepare(`
+        SELECT s.launched_cwd AS cwd FROM nodes n JOIN rigs r ON r.id = n.rig_id JOIN sessions s ON s.node_id = n.id
+        WHERE r.archived_at IS NULL AND r.id <> ? AND n.runtime = 'claude-code' AND s.launched_cwd IS NOT NULL
+          AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
+      `).all(rigId) as Array<{ cwd: string }>).map((row) => row.cwd));
+    } catch { /* a database from before the record */ }
+    for (const session of this.seatsInUse(rigId)) {
+      if (session.runtime !== "claude-code") continue;
+      if (session.cwd) cwds.push(session.cwd);
+      if (session.launchedCwd) cwds.push(session.launchedCwd);
+    }
+    const keys = new Set<string>();
+    for (const cwd of cwds) {
+      for (const target of [".", ".claude", nodePath.join(".claude", "settings.local.json"), ".openrig", nodePath.join(".openrig", "context-collector.cjs")]) {
+        keys.add(this.guidancePathKey(nodePath.join(cwd, target)));
+      }
+    }
+    return keys;
+  }
+
+  /** The file a seat reads its managed guidance from: the one its last launch recorded (#875), else the rule's. */
+  private guidanceTargetPath(rigId: string, runtime: string | null, cwd: string | null, nodeId?: string | null): string | null {
     if (!runtime || !cwd) {
       return null;
     }
     // #25: clean only the rig's selected Claude file; the other file is never touched.
-    return runtime === "claude-code"
-      ? nodePath.join(cwd, this.deps.rigRepo.getRigClaudeManagedBlockFile(rigId) ?? DEFAULT_CLAUDE_MANAGED_BLOCK_FILE)
-      : runtime === "codex"
-        ? nodePath.join(cwd, "AGENTS.md")
-        : null;
+    return seatGuidanceFile(runtime, cwd, this.deps.rigRepo.getRigClaudeManagedBlockFile(rigId), recordedGuidanceFile(this.db, nodeId));
   }
 
   private guidancePathKey(path: string): string {
@@ -343,17 +638,27 @@ export class RigTeardownOrchestrator {
     }
   }
 
-  private cleanupManagedGuidanceFileForNode(rigId: string, runtime: string | null, cwd: string | null, liveGuidanceTargets: ReadonlySet<string>): void {
-    const targetPath = this.guidanceTargetPath(rigId, runtime, cwd);
-    if (!targetPath) {
-      return;
+  /** Takes OpenRig's unedited blocks out of the file the seat's launch recorded and out of the rule's file, where an
+   *  older launch of the same seat wrote them (#875): a recorded file never leaves blocks behind in the repository. */
+  private cleanupManagedGuidanceFileForNode(rigId: string, runtime: string | null, cwd: string | null, liveGuidanceTargets: ReadonlySet<string>, result: TeardownResult, nodeId?: string | null): void {
+    const targets = new Set([this.guidanceTargetPath(rigId, runtime, cwd, nodeId), this.guidanceTargetPath(rigId, runtime, cwd)]);
+    for (const targetPath of targets) {
+      if (targetPath) this.cleanupManagedGuidanceFile(targetPath, liveGuidanceTargets, result);
     }
+  }
+
+  private cleanupManagedGuidanceFile(targetPath: string, liveGuidanceTargets: ReadonlySet<string>, result: TeardownResult): void {
     if (liveGuidanceTargets.has(this.guidancePathKey(targetPath))) return;
-    removeManagedBlocksFromFile({
+    // The seat-skills line's block is removed only while it still holds the line; a person's edit is kept and reported.
+    const { keptEdited } = removeManagedBlocksFromFile({
       exists: (path) => fs.existsSync(path),
       readFile: (path) => fs.readFileSync(path, "utf-8"),
       writeFile: (path, content) => fs.writeFileSync(path, content, "utf-8"),
       deleteFile: (path) => fs.unlinkSync(path),
-    }, targetPath);
+    }, targetPath, { [SEAT_SKILLS_BOOTSTRAP_BLOCK_ID]: SEAT_SKILLS_BOOTSTRAP_LINE });
+    for (const id of keptEdited) {
+      const entry = `${targetPath}: ${id}`;
+      if (!result.keptGuidance?.includes(entry)) (result.keptGuidance ??= []).push(entry);
+    }
   }
 }

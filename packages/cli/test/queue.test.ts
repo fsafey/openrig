@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { CommanderError } from "commander";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { PassThrough } from "node:stream";
 import type { QueueDeps } from "../src/commands/queue.js";
-import { resolveQueueBody, previewBody, waitForDeliveryOutcome } from "../src/commands/queue.js";
+import { resolveQueueBody, previewBody, previewCutMarker, waitForDeliveryOutcome } from "../src/commands/queue.js";
 import { createProgram } from "../src/index.js";
 
 /**
@@ -30,6 +31,8 @@ interface StubResponse {
   data: unknown;
 }
 
+const STUB_SENDER = "stub@rig";
+
 function makeDeps(opts?: {
   routes?: Record<string, StubResponse | StubResponse[]>;
 }): { deps: QueueDeps; calls: Array<{ method: string; path: string; body?: unknown }> } {
@@ -40,10 +43,37 @@ function makeDeps(opts?: {
     deps: {
       lifecycleDeps: {} as QueueDeps["lifecycleDeps"],
       clientFactory: () => ({
+        // The sender this stub stamps; the transitions it synthesizes record it as their actor, as the daemon does.
+        senderIdentity: async () => ({ session: STUB_SENDER, originUnknown: false }),
         get: vi.fn(async (path: string) => {
           calls.push({ method: "GET", path });
           const route = routes[`GET ${path}`];
-          return (Array.isArray(route) ? route.shift() : route) ?? { status: 200, data: {} };
+          if (route) return Array.isArray(route) ? route.shift() : route;
+          const transitionMatch = /^\/api\/queue\/([^/]+)\/transitions$/.exec(path);
+          if (transitionMatch) {
+            const qitemId = decodeURIComponent(transitionMatch[1]!);
+            const update = [...calls].reverse().find((call) => call.method === "POST"
+              && call.path === `/api/queue/${encodeURIComponent(qitemId)}/update`);
+            const transitionNote = update?.body && typeof update.body === "object"
+              ? (update.body as { transitionNote?: unknown }).transitionNote
+              : undefined;
+            return { status: 200, data: [
+              { transitionId: 1, transitionNote: null, actorSession: STUB_SENDER },
+              ...(typeof transitionNote === "string" ? [{ transitionId: 2, transitionNote, actorSession: STUB_SENDER }] : []),
+            ] };
+          }
+          const match = /^\/api\/queue\/([^/]+)$/.exec(path);
+          if (match) {
+            const qitemId = decodeURIComponent(match[1]!);
+            const update = [...calls].reverse().find((call) => call.method === "POST"
+              && call.path === `/api/queue/${encodeURIComponent(qitemId)}/update`);
+            if (update?.body && typeof update.body === "object") {
+              const body = Object.fromEntries(Object.entries(update.body as Record<string, unknown>)
+                .filter(([key, value]) => value !== undefined && !["transitionNote", "actorSession", "reopen"].includes(key)));
+              return { status: 200, data: { qitemId, ...body } };
+            }
+          }
+          return { status: 200, data: {} };
         }),
         getText: vi.fn(async (path: string) => {
           calls.push({ method: "GET", path });
@@ -82,6 +112,7 @@ describe("rig queue CLI", () => {
     // AMBIENT OPENRIG_SESSION_NAME (which masked the env-less break in a managed runner). Per-test stubs
     // that need a specific seat override this.
     vi.stubEnv("OPENRIG_SESSION_NAME", "seat@rig");
+    vi.stubEnv("TMUX_PANE", "");
     logs = [];
     errors = [];
     vi.spyOn(console, "log").mockImplementation((...args) => logs.push(args.join(" ")));
@@ -164,6 +195,24 @@ describe("rig queue CLI", () => {
     expect(process.exitCode).toBe(1);
     expect(calls).toEqual([]);
     expect(errors.join("\n")).toContain("--source is required");
+  });
+
+  it("verbs whose actor is the seat's identity name OPENRIG_SESSION_NAME outside a managed seat, never their ignored flag", async () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "");
+    vi.stubEnv("RIGGED_SESSION_NAME", "");
+    for (const [flag, argv] of [["actor", ["update", "q1", "--note", "x", "--actor", "me@rig"]], ["from", ["handoff", "q1", "--to", "bob@rig", "--body", "next"]],
+      ["destination", ["claim", "q1"]]] as const) {
+      errors.length = 0;
+      process.exitCode = undefined;
+      const { deps, calls } = makeDeps();
+      await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", ...argv]);
+      expect(process.exitCode, argv[0]).toBe(1);
+      expect(calls, argv[0]).toEqual([]);
+      const text = errors.join("\n");
+      expect(text, argv[0]).toContain("OPENRIG_SESSION_NAME is not set");
+      expect(text, argv[0]).toContain(`--${flag} is ignored`);
+      expect(text, argv[0]).not.toContain("is required when OPENRIG_SESSION_NAME is not set");
+    }
   });
 
   it("create preserves the legacy managed source env without forwarding an explicit body claim", async () => {
@@ -419,6 +468,32 @@ describe("rig queue CLI", () => {
     expect(result.detail).toContain("HTTP 503");
   });
 
+  // An ask placed on Steering without an alert owes no Slack post: verification says so at once, never "still pending".
+  it("create --alert sends humanAlert; delivery verification reports an unalerted ask at once, without waiting for a post", async () => {
+    const { deps, calls } = makeDeps();
+    await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Approve the rollback now?", "--alert", "--json"]);
+    expect(calls.find((c) => c.path === "/api/queue/create")?.body).toMatchObject({ humanAlert: true });
+    const quiet = makeDeps();
+    await createProgram({ queueDeps: quiet.deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Which name?", "--json"]);
+    expect(quiet.calls.find((c) => c.path === "/api/queue/create")?.body).not.toHaveProperty("humanAlert");
+    const handoff = makeDeps();
+    await createProgram({ queueDeps: handoff.deps }).parseAsync(["node", "rig", "queue", "handoff", "qitem-src", "--to", "human-founder@external", "--body", "Approve now?", "--alert", "--json"]);
+    expect(handoff.calls.find((c) => c.path === "/api/queue/qitem-src/handoff")?.body).toMatchObject({ humanAlert: true });
+    const complete = makeDeps();
+    await createProgram({ queueDeps: complete.deps }).parseAsync(["node", "rig", "queue", "handoff-and-complete", "qitem-src", "--to", "human-founder@external", "--body", "Approve now?", "--alert", "--json"]);
+    expect(complete.calls.find((c) => c.path === "/api/queue/qitem-src/handoff-and-complete")?.body).toMatchObject({ humanAlert: true });
+    let reads = 0;
+    const result = await waitForDeliveryOutcome(
+      { get: async <T>() => { reads += 1; return { status: 200, data: { destinationSession: "human-founder@external", lastNudgeResult: "gateway-owned:slack", ownerNotificationLevel: "RECORD", deliveryOutcome: null } as T }; } },
+      "qitem-steering",
+      { timeoutMs: 60_000, sleep: async () => { throw new Error("waited for a post that isn't owed"); } },
+      { destinationSession: "human-founder@external" },
+    );
+    expect(result).toMatchObject({ receiptSource: "gateway", outcome: "not-alerted", connectorAccepted: null, nextAction: null });
+    expect(result.detail).toMatch(/^created without --alert, and the person's Slack subscription is urgent-only/);
+    expect(reads).toBe(1);
+  });
+
   it("delivery verification reports an unreadable receipt as indeterminate, not rejected", async () => {
     const result = await waitForDeliveryOutcome(
       { get: async () => { throw new Error("daemon read timed out"); } } as never,
@@ -526,6 +601,16 @@ describe("rig queue CLI", () => {
       expect(result).toMatchObject({ outcome: "failed", wakeResult });
       expect(result.detail).toMatch(/^The qitem is saved\. The wake failed/);
       expect(result.detail).not.toContain("not a failed handoff");
+      expect(reads).toBe(1);
+    });
+
+    it("a hosted member's waiting work keeps the failed outcome, and its receipt says no wake is sent", async () => {
+      const wakeResult = "awaiting-pickup: 'helper@hub' is a hosted member with no wake trigger, so no wake is sent.";
+      const { result, reads } = await verify([{ lastNudgeResult: wakeResult }]);
+      expect(result).toMatchObject({ outcome: "failed", wakeResult });
+      expect(result.detail).toMatch(/^The qitem is saved\. No wake is sent \(awaiting-pickup: /);
+      expect(result.detail).toContain("): the work waits in the member's queue until it reads it.");
+      expect(result.detail).not.toContain("The wake failed");
       expect(reads).toBe(1);
     });
 
@@ -1117,8 +1202,8 @@ describe("rig queue CLI", () => {
           status: 400,
           data: {
             error: "missing_closure_reason",
-            message: "state=done requires closure_reason; valid values: handed_off_to, blocked_on, denied, canceled, no-follow-on, escalation",
-            validReasons: ["handed_off_to", "blocked_on", "denied", "canceled", "no-follow-on", "escalation"],
+            message: "state=done requires closure_reason; valid values: handed_off_to, denied, canceled, no-follow-on, escalation, superseded",
+            validReasons: ["handed_off_to", "denied", "canceled", "no-follow-on", "escalation", "superseded"],
           },
         },
       },
@@ -1158,6 +1243,48 @@ describe("rig queue CLI", () => {
       evidenceRef: undefined,
       transitionNote: "audit bytes",
     });
+    expect(calls.some((c) => c.method === "GET" && c.path === "/api/queue/qitem-note")).toBe(true);
+  });
+
+  it("update reports success only after canonical read-back matches the requested state", async () => {
+    const row = { qitemId: "qitem-verified", state: "in-progress", summary: "working" };
+    const { deps, calls } = makeDeps({ routes: {
+      "POST /api/queue/qitem-verified/update": { status: 200, data: { qitemId: "qitem-verified", state: "in-progress" } },
+      "GET /api/queue/qitem-verified": { status: 200, data: row },
+    } });
+    await createProgram({ queueDeps: deps }).parseAsync([
+      "node", "rig", "queue", "update", "qitem-verified", "--state", "in-progress", "--summary", "working", "--json",
+    ]);
+    expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual([
+      "POST /api/queue/qitem-verified/update",
+      "GET /api/queue/qitem-verified",
+    ]);
+    expect(JSON.parse(logs.at(-1)!)).toMatchObject(row);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("update fails closed when canonical read-back does not contain the requested state", async () => {
+    const { deps } = makeDeps({ routes: {
+      "POST /api/queue/qitem-mismatch/update": { status: 200, data: { qitemId: "qitem-mismatch", state: "in-progress" } },
+      "GET /api/queue/qitem-mismatch": { status: 200, data: { qitemId: "qitem-mismatch", state: "pending" } },
+    } });
+    await createProgram({ queueDeps: deps }).parseAsync([
+      "node", "rig", "queue", "update", "qitem-mismatch", "--state", "in-progress", "--json",
+    ]);
+    expect(process.exitCode).toBe(1);
+    expect(JSON.parse(errors.at(-1)!)).toMatchObject({ error: "queue_update_readback_failed" });
+    expect(logs).toEqual([]);
+  });
+
+  it("update forwards an explicitly accepted closure deadline without a state change", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync(["node", "rig", "queue", "update", "qitem-estimate", "--closure-required-at", "2026-11-04T10:00:00.000Z", "--note", "Coordinator accepted the revised estimate", "--json"]);
+    expect(calls.find(c => c.path === "/api/queue/qitem-estimate/update")?.body).toMatchObject({
+      closureRequiredAt: "2026-11-04T10:00:00.000Z", transitionNote: "Coordinator accepted the revised estimate",
+    });
+    expect(calls.find(c => c.path === "/api/queue/qitem-estimate/update")?.body).toHaveProperty("state", undefined);
   });
 
   it("update forwards explicit reopen acknowledgment", async () => {
@@ -1195,6 +1322,30 @@ describe("rig queue CLI", () => {
       state: "blocked",
       blockedOn: "external:cooldown",
       transitionNote: "continuation: resume after the cooldown",
+      wakeAfterSeconds: 90,
+    });
+  });
+
+  it.each([
+    { label: "note only", flags: ["--note", "checked the source"], expected: "checked the source" },
+    { label: "note and continuation", flags: ["--note", "checked the source", "--continuation", "resume the review"], expected: "continuation: resume the review\n\nchecked the source" },
+    { label: "multiline note and continuation", flags: ["--note", "checked the source\nkept the evidence", "--continuation", "resume the review"], expected: "continuation: resume the review\n\nchecked the source\nkept the evidence" },
+    { label: "empty continuation", flags: ["--note", "checked the source", "--continuation", ""], expected: "checked the source" },
+    { label: "whitespace-only continuation with note", flags: ["--note", "checked the source", "--continuation", " \t\n "], expected: "checked the source" },
+    { label: "whitespace-only continuation without note", flags: ["--continuation", " \t\n "], expected: "parked on external:cooldown" },
+    { label: "neither flag", flags: [], expected: "parked on external:cooldown" },
+  ])("block preserves the audit note: $label", async ({ flags, expected }) => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "block", "qitem-park",
+      "--on", "external:cooldown", "--wake-after", "90s", ...flags, "--json",
+    ]);
+    expect(calls.find((c) => c.path === "/api/queue/qitem-park/update")?.body).toMatchObject({
+      state: "blocked",
+      blockedOn: "external:cooldown",
+      transitionNote: expected,
       wakeAfterSeconds: 90,
     });
   });
@@ -1277,6 +1428,42 @@ describe("rig queue CLI", () => {
     expect(call).toBeDefined();
     expect(call!.path).toContain("session=bob%40rig");
     expect(call!.path).toContain("recentLimit=10");
+  });
+
+  it("plain whoami ends with one line per candidate to choose from; --json adds nothing", async () => {
+    const data = {
+      session: "bob@rig",
+      currentWork: null,
+      currentWorkBasis: "2 distinct typed work nodes — refusing to guess",
+      currentWorkChoice: {
+        instruction: "OpenRig did not choose your current work. Choose the candidate your actual work belongs to.",
+        candidates: [
+          { qitemId: "q-1", projects: ["alpha"], mission: "release", slice: "01-work", workNodePath: "/m/release/slices/01-work", unresolved: null },
+          { qitemId: "q-2", projects: [], mission: "missing", slice: "01-work", workNodePath: null, unresolved: "mission missing resolves to 0 directories on this host" },
+        ],
+        unknown: [{ qitemId: "q-3", summary: null, reason: "no mission tag and no handoff ancestry" }],
+      },
+    };
+    const run = async (json: boolean) => {
+      const { deps } = makeDeps({ routes: { "GET /api/queue/whoami?session=bob%40rig&recentLimit=25": { status: 200, data } } });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      logs.length = 0; errors.length = 0;
+      await program.parseAsync(["node", "rig", "queue", "whoami", "--session", "bob@rig", ...(json ? ["--json"] : [])]);
+      return [...logs];
+    };
+    // #1806: plain stdout is the answer alone and parses as JSON; the choice lines are on stderr.
+    const plain = await run(false);
+    expect(JSON.parse(plain.join("\n"))).toEqual(data);
+    expect(errors.slice(-4)).toEqual([
+      "OpenRig did not choose your current work. Choose the candidate your actual work belongs to.",
+      "  1. project alpha · mission release · slice 01-work · /m/release/slices/01-work · from row q-1",
+      "  2. no project tag · mission missing · slice 01-work · no folder found (mission missing resolves to 0 directories on this host) · from row q-2",
+      "  - row q-3: work not named (no mission tag and no handoff ancestry)",
+    ]);
+    const json = await run(true);
+    expect(json).toHaveLength(1);
+    expect(JSON.parse(json[0]!)).toEqual(data);
   });
 
   it("whoami defaults the session from OPENRIG_SESSION_NAME when --session is omitted", async () => {
@@ -1528,6 +1715,118 @@ describe("rig queue CLI", () => {
     expect(call!.path).not.toContain("rig=");
   });
 
+  it("issue2728 list sends repeated exact tags and canonical mission/slice aliases once", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node", "rig", "queue", "list", "--all", "--all-rigs",
+      "--tag", "review", "--tag", "publish", "--tag", "mission:launch",
+      "--mission", "launch", "--slice", "docs", "--tag", "comma,separated", "--json",
+    ]);
+    const call = calls.find((candidate) => candidate.method === "GET" && candidate.path.startsWith("/api/queue/list"));
+    expect(call).toBeDefined();
+    const params = new URLSearchParams(call!.path.split("?")[1]);
+    expect(params.getAll("tag")).toEqual(["review", "publish", "mission:launch", "slice:docs", "comma,separated"]);
+    expect(params.get("limit")).toBe("100");
+  });
+
+  it("issue2728 refuses a blank tag before contacting the daemon", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync(["node", "rig", "queue", "list", "--tag", " ", "--json"]);
+    expect(calls).toHaveLength(0);
+    expect(process.exitCode).toBe(1);
+    expect(logs.join("\n")).toContain('"error":"tag_invalid"');
+    expect(logs.join("\n")).toContain("tag filters cannot be blank");
+  });
+
+  it("issue2728 clears captured list tags after blank refusal when reusing the same command", async () => {
+    const { deps, calls } = makeDeps({
+      routes: {
+        "GET /api/queue/list?tag=fresh&limit=100": { status: 200, data: [] },
+      },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+
+    await program.parseAsync([
+      "node", "rig", "queue", "list", "--all", "--all-rigs", "--full", "--tag", "stale", "--tag", " ", "--json",
+    ]);
+    expect(calls).toHaveLength(0);
+    expect(process.exitCode).toBe(1);
+
+    process.exitCode = undefined;
+    await program.parseAsync([
+      "node", "rig", "queue", "list", "--all", "--all-rigs", "--full", "--tag", "fresh", "--json",
+    ]);
+
+    const call = calls.find((candidate) => candidate.method === "GET" && candidate.path.startsWith("/api/queue/list"));
+    expect(call).toBeDefined();
+    const params = new URLSearchParams(call!.path.split("?")[1]);
+    expect(params.getAll("tag")).toEqual(["fresh"]);
+  });
+
+  it.each([
+    {
+      after: "an invalid option argument",
+      abortedArgs: ["node", "rig", "queue", "list", "--tag", "stale", "--limit", "0"],
+      exitCode: "commander.invalidArgument",
+      nextArgs: ["node", "rig", "queue", "list", "--all", "--all-rigs", "--json"],
+      expectedTags: [],
+    },
+    {
+      after: "help following tag and mission collection",
+      abortedArgs: ["node", "rig", "queue", "list", "--tag", "stale", "--mission", "old", "--help"],
+      exitCode: "commander.helpDisplayed",
+      nextArgs: ["node", "rig", "queue", "list", "--all", "--all-rigs", "--slice", "fresh", "--json"],
+      expectedTags: ["slice:fresh"],
+    },
+  ])("issue2728 clears list tags after $after when reusing the same command", async ({ abortedArgs, exitCode, nextArgs, expectedTags }) => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    program.commands.find((command) => command.name() === "queue")!.commands.find((command) => command.name() === "list")!.exitOverride();
+    program.configureOutput({ writeOut: () => {}, writeErr: () => {} });
+
+    let abortedWith: unknown;
+    try {
+      await program.parseAsync(abortedArgs);
+    } catch (error) {
+      abortedWith = error;
+    }
+    expect(abortedWith).toBeInstanceOf(CommanderError);
+    expect((abortedWith as CommanderError).code).toBe(exitCode);
+    expect(calls).toHaveLength(0);
+
+    await program.parseAsync(nextArgs);
+
+    const call = calls.find((candidate) => candidate.method === "GET" && candidate.path.startsWith("/api/queue/list"));
+    expect(call).toBeDefined();
+    const params = new URLSearchParams(call!.path.split("?")[1]);
+    expect(params.getAll("tag")).toEqual(expectedTags);
+    expect(params.has("tag")).toBe(expectedTags.length > 0);
+  });
+
+  it("issue2728 does not print rows when a daemon returns a row missing a requested tag", async () => {
+    const { deps, calls } = makeDeps({
+      routes: {
+        "GET /api/queue/list?tag=review&limit=100": {
+          status: 200,
+          data: [{ qitemId: "qitem-unfiltered", tags: ["other"] }],
+        },
+      },
+    });
+    const program = createProgram({ queueDeps: deps });
+    program.exitOverride();
+    await program.parseAsync(["node", "rig", "queue", "list", "--all", "--all-rigs", "--full", "--tag", "review", "--json"]);
+    expect(calls).toHaveLength(1);
+    expect(process.exitCode).toBe(1);
+    expect(logs.join("\n")).toContain("filter_unsupported");
+    expect(logs.join("\n")).not.toContain("qitem-unfiltered");
+  });
+
   it("list -a includes history (no activeOnly param)", async () => {
     const saved = process.env.OPENRIG_SESSION_NAME;
     process.env.OPENRIG_SESSION_NAME = "dev1@my-rig";
@@ -1769,11 +2068,13 @@ describe("rig queue CLI", () => {
       const printed = JSON.parse(logs[0]);
       expect(printed.bodyTruncated).toBe(true);
       expect(printed.bodyBytes).toBe(1000);
-      expect(Array.from(printed.body).length).toBe(512);
-      // marker line on its OWN line, with the honest total byte size
-      expect(logs.join("\n")).toContain("bounded preview — complete body is 1000 bytes; full record");
-      expect(logs.join("\n")).toContain("rig queue show 'qitem-1' --full --json");
-      expect(logs.join("\n")).not.toMatch(/\btruncated\b/i);
+      // Keep the first 512 code points, then mark the cut inside the body.
+      expect(printed.body).toBe(`${"A".repeat(512)}…[cut at 512 of 1000 chars; rig queue show 'qitem-1' --full]`);
+      // #1806: stdout is the record alone and parses as JSON; the marker line, with the honest total byte size, is on stderr
+      expect(JSON.parse(logs.join("\n"))).toMatchObject({ qitemId: "qitem-1", bodyTruncated: true });
+      expect(errors.join("\n")).toContain("bounded preview — complete body is 1000 bytes; full record");
+      expect(errors.join("\n")).toContain("rig queue show 'qitem-1' --full --json");
+      expect(errors.join("\n")).not.toMatch(/\btruncated\b/i);
     });
 
     it("show default: small body → full body, NO marker, bodyTruncated=false", async () => {
@@ -1811,7 +2112,24 @@ describe("rig queue CLI", () => {
       const printed = JSON.parse(logs[0]);
       expect(printed.bodyTruncated).toBe(true);
       expect(printed.bodyBytes).toBe(1000);
-      expect(Array.from(printed.body).length).toBe(PREVIEW_MAX_CODEPOINTS);
+      const marker = "…[cut at 512 of 1000 chars; rig queue show 'qitem-1' --full]";
+      expect(printed.body.endsWith(marker)).toBe(true);
+      expect(Array.from(printed.body.slice(0, -marker.length)).length).toBe(PREVIEW_MAX_CODEPOINTS);
+    });
+
+    it("show default: a multibyte body's marker counts code points, not bytes", async () => {
+      const full = "😀".repeat(600); // 600 code points, 2400 bytes
+      const { deps } = showRoute({ qitemId: "qitem-1", body: full });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "show", "qitem-1", "--json"]);
+      const printed = JSON.parse(logs[0]);
+      expect(printed.bodyBytes).toBe(2400);
+      expect(printed.body).toBe(`${"😀".repeat(512)}…[cut at 512 of 600 chars; rig queue show 'qitem-1' --full]`);
+    });
+
+    it("previewCutMarker quotes the row id for the shell", () => {
+      expect(previewCutMarker("qitem-it's", 512, 3983)).toBe(`…[cut at 512 of 3983 chars; rig queue show 'qitem-it'\\''s' --full]`);
     });
 
     it("show --full --json: byte-identical COMPLETE item body (compatibility contract — no preview fields)", async () => {
@@ -1893,6 +2211,14 @@ describe("rig queue CLI", () => {
       expect(help).toContain("--resolution <text>");
       expect(help).not.toContain("resolution_not_admitted");
       expect(help).not.toContain("resolution_already_closed");
+    });
+
+    it("update --help says how to cancel a row: --state done --closure-reason canceled", async () => {
+      const { deps } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      const help = program.commands.find((c) => c.name() === "queue")!.commands.find((c) => c.name() === "update")!.helpInformation().replace(/\s+/g, " ");
+      expect(help).toContain("To cancel a row: --state done --closure-reason canceled");
+      expect(help).toContain("--state canceled takes no reason, except 'superseded'");
     });
 
     it("update without --resolution sends no resolution", async () => {

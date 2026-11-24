@@ -11,8 +11,10 @@ import {
 import { normalizeWorkflowScope, WorkflowScopeError, type WorkflowScope } from "../domain/workflow-scope.js";
 import { ProjectReadError } from "../domain/workspace/project-catalog.js";
 import { declaredProject } from "../domain/workspace/project-read.js";
-import { WorkflowSpecError } from "../domain/workflow-spec-cache.js";
+import { WorkflowSpecError, type WorkflowSpecCache } from "../domain/workflow-spec-cache.js";
+import { unregisterWorkflowSpecs, WorkflowSpecUnregisterError } from "../domain/workflow-spec-unregister.js";
 import { WorkflowHumanDestinationError } from "../domain/workflow-human-destination.js";
+import { requireSenderIdentity, resolveRecordedProvenance } from "./require-sender-identity.js";
 
 /**
  * Workflow runtime HTTP routes (PL-004 Phase D). Backs `rig workflow` CLI.
@@ -48,6 +50,9 @@ export function workflowRoutes(): Hono {
     if (err instanceof WorkflowScopeError) {
       return c.json({ error: err.code, message: err.message }, 400);
     }
+    if (err instanceof WorkflowSpecUnregisterError) {
+      return c.json({ error: err.code, message: err.message }, err.code === "spec_not_found" ? 404 : 400);
+    }
     if (err instanceof WorkflowHumanDestinationError) {
       return c.json({ error: err.code, message: err.message, ...err.details }, 409);
     }
@@ -77,7 +82,7 @@ export function workflowRoutes(): Hono {
     }
     if (err instanceof WorkflowProjectorError) {
       const status =
-        err.code === "instance_not_active" || err.code === "packet_not_on_frontier" ? 409
+        err.code === "instance_not_active" || err.code === "packet_not_on_frontier" || err.code === "packet_already_closed" ? 409
         : err.code === "frontier_packet_required" || err.code === "frontier_binding_indeterminate" ? 409
         : err.code === "failure_occurrence_required" || err.code === "failure_occurrence_not_unresolved" || err.code === "failure_occurrence_replay_indeterminate" || err.code === "failure_occurrence_replay_conflict" ? 409
         : err.code === "instance_not_abortable" || err.code === "instance_not_resumable" ? 409
@@ -114,7 +119,7 @@ export function workflowRoutes(): Hono {
         // instantiate (spec/rig mismatch → 400); bound_rig_not_found = a
         // persisted bound rig vanished mid-run (live state-vs-instance
         // conflict → 409, the harness_pin/instance_version_conflict class).
-        : err.code === "bound_rig_unknown" || err.code === "bound_rig_role_uncovered" ? 400
+        : err.code === "bound_rig_unknown" || err.code === "bound_rig_role_uncovered" || err.code === "bound_pod_unknown" || err.code === "bound_pod_invalid" ? 400
         : err.code === "bound_rig_not_found" ? 409
         : err.code === "packet_not_found" ? 404
         : 500;
@@ -122,7 +127,7 @@ export function workflowRoutes(): Hono {
     }
     if (err instanceof QueueRepositoryError) {
       const status =
-        err.code === "unknown_destination_rig" ? 400
+        err.code === "unknown_destination_rig" || err.code === "unbound_destination_pod" ? 400
         : err.code === "qitem_not_found" ? 404
         : err.code === "workflow_frontier_packet" ? 400
         : 500;
@@ -195,7 +200,7 @@ export function workflowRoutes(): Hono {
 
   app.post("/:instance_id/revision", async (c) => {
     const body = await c.req.json<Parameters<WorkflowRuntime["reviseGraph"]>[0]>().catch(() => ({} as never));
-    try { return c.json(getRuntime(c).reviseGraph({ ...body, instanceId: c.req.param("instance_id") })); }
+    try { return c.json(await getRuntime(c).reviseGraph({ ...body, instanceId: c.req.param("instance_id") })); }
     catch (err) { return errorResponse(c, err); }
   });
 
@@ -208,6 +213,7 @@ export function workflowRoutes(): Hono {
         entryOwnerSession?: string;
         /** OPR.0.4.6.FAC1: overrides the spec's target.rig default. */
         targetRig?: string;
+        targetPod?: string;
         /** Scope stamped on every packet the instance creates (migration 110). One that cannot be applied is
          *  ignored with an advisory; bare project/mission/slice/tags fields keep their old meaning: ignored. */
         scope?: { project?: unknown; mission?: unknown; slice?: unknown; tags?: unknown };
@@ -216,6 +222,7 @@ export function workflowRoutes(): Hono {
     if (!body.specPath) return c.json({ error: "specPath is required" }, 400);
     if (!body.rootObjective) return c.json({ error: "rootObjective is required" }, 400);
     if (!body.createdBySession) return c.json({ error: "createdBySession is required" }, 400);
+    if (body.targetPod !== undefined && typeof body.targetPod !== "string") return c.json({ error: "targetPod must be a string" }, 400);
     try {
       // A request can carry scope the route cannot apply: main accepted every such request, ignoring the key and
       // creating one unscoped instance, so this route does too. The instance is created unscoped, nothing the scope
@@ -247,6 +254,7 @@ export function workflowRoutes(): Hono {
         createdBySession: body.createdBySession,
         entryOwnerSession: body.entryOwnerSession,
         targetRig: body.targetRig,
+        targetPod: body.targetPod,
         ...(scope ? { scope } : {}),
       });
       const notes: string[] = [];
@@ -285,7 +293,10 @@ export function workflowRoutes(): Hono {
     if (!body.instanceId) return c.json({ error: "instanceId is required" }, 400);
     if (!body.currentPacketId) return c.json({ error: "currentPacketId is required" }, 400);
     if (!body.exit) return c.json({ error: "exit is required" }, 400);
-    if (!body.actorSession) return c.json({ error: "actorSession is required" }, 400);
+    // The agent that projected the step is the caller: its transport identity supersedes a declared actorSession, which is
+    // used, labelled claimed, only when the caller has none.
+    const actor = requireSenderIdentity(c, { verb: "workflow project", bodyClaim: body.actorSession });
+    if (!actor.ok) return actor.response;
     try {
       const result = await getRuntime(c).project({
         instanceId: body.instanceId,
@@ -294,7 +305,8 @@ export function workflowRoutes(): Hono {
         resultNote: body.resultNote,
         blockedOn: body.blockedOn,
         closureEvidence: body.closureEvidence,
-        actorSession: body.actorSession,
+        actorSession: actor.session,
+        identityProvenance: resolveRecordedProvenance(c, actor),
         nextOwnerSession: body.nextOwnerSession,
       });
       return c.json(result);
@@ -303,7 +315,7 @@ export function workflowRoutes(): Hono {
     }
   });
 
-  // OPR.0.4.6.WF1 FR-2 COMPLETION FIXBACK (qitem-20260706211220-279039f5):
+  // OPR.0.4.6.WF1 FR-2 COMPLETION FIXBACK:
   // list/show/trace carry the derived deadline verdict — the ratified
   // FR-2 queryability clause ("queryable via list/show/trace … with
   // the evidence (step, owner, deadline, age)"). Additive field,
@@ -312,10 +324,20 @@ export function workflowRoutes(): Hono {
   // runtime.continue()'s enriched instance.
   app.get("/list", (c) => {
     const status = c.req.query("status");
-    if (status === "active" || status === "waiting" || status === "completed" || status === "failed" || status === "aborted") {
-      return c.json(getRuntime(c).listInstancesWithDeadline(status));
+    const parsedStatus = status === "active" || status === "waiting" || status === "completed" || status === "failed" || status === "aborted" ? status : undefined;
+    const rawLimit = c.req.query("limit");
+    if (rawLimit !== undefined && (!/^[1-9]\d*$/.test(rawLimit) || Number(rawLimit) > 10000)) return c.json({ error: "limit_invalid", message: "limit must be an integer from 1 to 10000" }, 400);
+    const fields = ["project", "mission", "slice", "rig", "name"] as const;
+    const filters: { project?: string; mission?: string; slice?: string; rig?: string; name?: string; tags?: string[]; limit?: number } = {};
+    for (const field of fields) {
+      const value = c.req.query(field);
+      if (value !== undefined) { if (!value.trim()) return c.json({ error: "filter_invalid", message: `${field} must not be empty` }, 400); filters[field] = value; }
     }
-    return c.json(getRuntime(c).listInstancesWithDeadline());
+    const tags = c.req.queries("tag");
+    if (tags?.some((tag) => !tag.trim())) return c.json({ error: "filter_invalid", message: "tag must not be empty" }, 400);
+    if (tags?.length) filters.tags = tags;
+    if (rawLimit !== undefined) filters.limit = Number(rawLimit);
+    return c.json(getRuntime(c).listInstancesWithDeadline(parsedStatus, Object.keys(filters).length ? filters : undefined));
   });
 
   // Lists every cached workflow_spec with an `isBuiltIn` flag computed
@@ -338,6 +360,26 @@ export function workflowRoutes(): Hono {
       isBuiltIn: builtinDirAbs ? isUnderDir(row.sourcePath, builtinDirAbs) : false,
     }));
     return c.json({ specs: payload });
+  });
+
+  // #2635: take a spec out of the registry by name[@version], or every version whose source
+  // file is gone (pruneMissing). Pinned versions and files still in a scanned folder are kept and
+  // named in `kept`. Mounted before /:instance_id like /specs.
+  app.post("/specs/unregister", async (c) => {
+    const body = await c.req.json<{ name?: string; version?: string; pruneMissing?: boolean }>().catch(() => ({} as never));
+    const runtime = getRuntime(c);
+    try {
+      return c.json(unregisterWorkflowSpecs({
+        cache: (c.get("workflowSpecCache" as never) as WorkflowSpecCache | undefined) ?? runtime.specCache,
+        eventBus: getEventBus(c),
+        name: body.name,
+        version: body.version,
+        pruneMissing: body.pruneMissing === true,
+        scannedDirs: [c.get("workflowsFolderDir" as never) as string | undefined, c.get("workflowBuiltinSpecsDir" as never) as string | undefined],
+      }));
+    } catch (err) {
+      return errorResponse(c, err);
+    }
   });
 
   // SSE for workflow.* events. MUST precede /:instance_id (Phase A R1 lesson).
@@ -379,13 +421,15 @@ export function workflowRoutes(): Hono {
       .json<{ packetId?: string; toSession?: string; actorSession?: string; reason?: string }>()
       .catch(() => ({}) as never);
     if (!body.toSession) return c.json({ error: "toSession is required" }, 400);
-    if (!body.actorSession) return c.json({ error: "actorSession is required" }, 400);
+    const actor = requireSenderIdentity(c, { verb: "workflow route", bodyClaim: body.actorSession });
+    if (!actor.ok) return actor.response;
     try {
       const result = await getRuntime(c).route({
         instanceId,
         packetId: body.packetId,
         toSession: body.toSession,
-        actorSession: body.actorSession,
+        actorSession: actor.session,
+        identityProvenance: resolveRecordedProvenance(c, actor),
         reason: body.reason,
       });
       return c.json(result);
@@ -397,15 +441,22 @@ export function workflowRoutes(): Hono {
   app.post("/:instance_id/resume", async (c) => {
     const instanceId = c.req.param("instance_id");
     const body = await c.req
-      .json<{ occurrenceId?: string; decision?: string; actorSession?: string }>()
+      .json<{ occurrenceId?: string; decision?: string; ownerSession?: string; actorSession?: string }>()
       .catch(() => ({}) as never);
-    if (!body.actorSession) return c.json({ error: "actorSession is required" }, 400);
+    // An empty ownerSession is not refused: the runtime resolves the owner and says why in ownerNote.
+    if (body.ownerSession !== undefined && typeof body.ownerSession !== "string") {
+      return c.json({ error: "ownerSession must be a string when given" }, 400);
+    }
+    const actor = requireSenderIdentity(c, { verb: "workflow resume", bodyClaim: body.actorSession });
+    if (!actor.ok) return actor.response;
     try {
       const result = await getRuntime(c).resume({
         instanceId,
         occurrenceId: body.occurrenceId,
         decision: body.decision,
-        actorSession: body.actorSession,
+        ownerSession: body.ownerSession,
+        actorSession: actor.session,
+        identityProvenance: resolveRecordedProvenance(c, actor),
       });
       return c.json(result);
     } catch (err) {
@@ -417,9 +468,11 @@ export function workflowRoutes(): Hono {
     const instanceId = c.req.param("instance_id");
     const body = await c.req.json<{ reason?: string; actorSession?: string }>().catch(() => ({} as never));
     if (!body.reason) return c.json({ error: "reason is required" }, 400);
-    if (!body.actorSession) return c.json({ error: "actorSession is required" }, 400);
+    const actor = requireSenderIdentity(c, { verb: "workflow abort", bodyClaim: body.actorSession });
+    if (!actor.ok) return actor.response;
     try {
-      return c.json(await getRuntime(c).abort({ instanceId, reason: body.reason, actorSession: body.actorSession }));
+      return c.json(await getRuntime(c).abort({ instanceId, reason: body.reason, actorSession: actor.session,
+        identityProvenance: resolveRecordedProvenance(c, actor) }));
     } catch (err) {
       return errorResponse(c, err);
     }
@@ -428,7 +481,7 @@ export function workflowRoutes(): Hono {
   app.get("/:instance_id/trace", (c) => {
     const instanceId = c.req.param("instance_id");
     try {
-      const result = getRuntime(c).continue(instanceId);
+      const result = getRuntime(c).continue(instanceId, { fullHistory: c.req.query("full") === "true" });
       return c.json(result);
     } catch (err) {
       return errorResponse(c, err);

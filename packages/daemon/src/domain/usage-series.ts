@@ -16,6 +16,7 @@ import type { Database } from "better-sqlite3";
 import { hasClientCostColumns } from "./usage-samples-store.js";
 import { hasPiUsageChargesTable, hasPiUsageEntriesTable } from "./pi-usage-entries-store.js";
 import { openRouterChargeTarget } from "./openrouter-charge.js";
+import { sameReset } from "./provider/usage-windows.js";
 
 export interface UsageSeriesQuery {
   seatSession?: string;
@@ -117,9 +118,11 @@ export interface TopBurnQuery {
 
 export interface WindowVelocity {
   window: string;
+  /** the burn span's first reading, which may belong to an earlier window than the rate */
   usedPercentFirst: number | null;
   usedPercentLast: number | null;
-  /** percent-points per hour over the actual sample span; null when unmeasurable */
+  /** percent-points per hour within the latest reading's window (readings sharing its resets_at);
+   *  null when that window has fewer than two readings or is otherwise unmeasurable */
   percentPerHour: number | null;
   resetsAt: string | null;
 }
@@ -219,14 +222,20 @@ export function computeTopBurn(db: Database, q: TopBurnQuery): TopBurnResult {
       if (rows.length === 0) continue;
       const first = rows[0]!;
       const last = rows[rows.length - 1]!;
-      const wSpan = hoursBetween(first.capturedAt, last.capturedAt);
+      // Rate only the window the latest reading belongs to: readings across a reset describe
+      // different windows. Within it, a falling percentage still means an unseen reset (or
+      // readings without resets_at), so like a token reset it yields no velocity, never a negative one.
+      const current = rows.filter((r) => sameReset(r.resetsAt, last.resetsAt));
+      const windowFirst = current[0]!;
+      const wSpan = hoursBetween(windowFirst.capturedAt, last.capturedAt);
       const measurable =
-        rows.length >= 2 && wSpan > 0 && first.windowUsedPercent !== null && last.windowUsedPercent !== null;
+        current.length >= 2 && wSpan > 0 && windowFirst.windowUsedPercent !== null && last.windowUsedPercent !== null
+        && last.windowUsedPercent >= windowFirst.windowUsedPercent;
       windows.push({
         window: w,
         usedPercentFirst: first.windowUsedPercent,
         usedPercentLast: last.windowUsedPercent,
-        percentPerHour: measurable ? (last.windowUsedPercent! - first.windowUsedPercent!) / wSpan : null,
+        percentPerHour: measurable ? (last.windowUsedPercent! - windowFirst.windowUsedPercent!) / wSpan : null,
         resetsAt: last.resetsAt,
       });
     }
@@ -376,7 +385,11 @@ export function computeCostView(db: Database, q: { nowIso: string; seatSession?:
       ORDER BY seat_session ASC, id ASC`,
   ).all(...(q.seatSession ? [q.seatSession] : [])) as CostRow[];
   const bySeat = new Map<string, CostRow[]>();
-  for (const row of rows) bySeat.set(row.seat_session, [...(bySeat.get(row.seat_session) ?? []), row]);
+  for (const row of rows) {
+    let history = bySeat.get(row.seat_session);
+    if (!history) bySeat.set(row.seat_session, history = []);
+    history.push(row);
+  }
   const now = Date.parse(q.nowIso);
   const staleAfter = q.staleAfterMs ?? COST_STALE_AFTER_MS;
   const seats: SeatCost[] = [];
@@ -426,9 +439,24 @@ export function computeCostView(db: Database, q: { nowIso: string; seatSession?:
   }
   for (const pi of piSeatCosts(db, q.seatSession)) {
     const at = seats.findIndex((seat) => seat.seatSession === pi.seatSession);
-    if (at >= 0) seats[at] = pi; else seats.push(pi);
+    if (at < 0) { seats.push(pi); continue; }
+    // A seat name that once ran Pi and now runs Claude or Codex keeps its current harness's figure: its Pi session
+    // is history once a Claude or Codex sample is newer than that session's latest entry.
+    if (seats[at]!.runtime !== null && piSessionLatestMs(db, pi) < sampleMs(bySeat.get(pi.seatSession)!.at(-1)!)) continue;
+    seats[at] = pi;
   }
   return { seats, note };
+}
+
+function sampleMs(row: CostRow): number {
+  return Date.parse(row.sampled_at ?? row.captured_at);
+}
+
+/** When this Pi session's latest stored entry was written, of any origin; NaN when unknown, which keeps the Pi figure. */
+function piSessionLatestMs(db: Database, pi: PiSeatCost): number {
+  const row = db.prepare("SELECT MAX(entry_timestamp) AS at FROM pi_usage_entries WHERE seat_session = ? AND pi_session_id = ?")
+    .get(pi.seatSession, pi.window.piSessionId) as { at: string | null } | undefined;
+  return Date.parse(row?.at ?? "");
 }
 
 function hasChargeOutcome(db: Database, piSession: string): boolean {

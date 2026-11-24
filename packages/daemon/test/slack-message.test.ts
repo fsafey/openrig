@@ -1,5 +1,22 @@
 import { describe, it, expect } from "vitest";
-import { buildOutboundMessage, buildImageBlocks, containsSecret, redactSecrets, SLACK_SECTION_CAP, SLACK_TEXT_CAP } from "../src/domain/gateway/slack/message.js";
+import { buildOutboundMessage, buildImageBlocks, containsSecret, redactSecrets, SLACK_SECTION_CAP, SLACK_TEXT_CAP, type QitemLike } from "../src/domain/gateway/slack/message.js";
+
+describe("person-facing question labels", () => {
+  it.each(["Ship", "Ship (recommended)", "Ship (Recommended)"])("marks %s as recommended once in the accessible text and option history", (label) => {
+    const modes: Partial<QitemLike>[] = [{}, { sharedChannel: true }, { ownerNotificationKind: "human-decision-resolved" }];
+    for (const mode of modes) {
+      const message = buildOutboundMessage({ qitemId: "q-label", summary: "Choose", body: "Pick one.", ...mode,
+        humanQuestions: [{ id: "ship", question: "Ship now?", options: [
+          { id: "yes", label, recommended: true }, { id: "hold", label: "Hold" },
+        ] }],
+      }, { sourceLabel: "test" });
+      expect(message.text.match(/\(recommended\)/gi)).toHaveLength(1);
+      const sections = message.blocks.filter((b) => (b as { type?: string }).type === "section");
+      expect(JSON.stringify(sections).match(/\(recommended\)/gi)?.length ?? 0).toBe(mode.sharedChannel || mode.ownerNotificationKind ? 1 : 0);
+      expect(message.text.split("\n")).toContain("• Hold");
+    }
+  });
+});
 
 describe("Slice-11 outbound message — content hygiene (item 7)", () => {
   const opts = { sourceLabel: "vm-openrig-build" };
@@ -115,7 +132,7 @@ describe("#47 evidence link boundaries", () => {
     expect(message.text.length).toBe(SLACK_TEXT_CAP);
     expect(message.text).toContain("Evidence: " + evidenceLink.replaceAll("&", "&amp;"));
     expect(message.text).toContain("Image: Screenshot &amp; evidence");
-    expect(message.text).toContain("from dev@rig@host");
+    expect(message.text).toContain("From dev@rig@host");
     expect(message.text).toContain("<@U-EVIDENCE>");
     expect(message.text.endsWith(fullOpts.reconcileMarker)).toBe(true);
     expect(() => buildOutboundMessage({ ...brief, body: body + "b" }, fullOpts)).toThrow(/complete fallback.*maximum 3900/);
@@ -260,7 +277,7 @@ describe("#1013 — a workflow gate parked on a human seat renders the question,
     // Each value keeps 32 characters, an ellipsis, its last 33 and a 12-hex digest, cut before escaping, so no escape or emoji is split.
     expect(m.text).toMatch(new RegExp(`Workflow w{32}…w{33} #[0-9a-f]{12} · instance (&lt;){32}…(&lt;){33} #[0-9a-f]{12} · step (\u{1F600}){32}…(\u{1F600}){33} #[0-9a-f]{12}`, "u"));
     expect(m.text).not.toContain("w".repeat(34));
-    const context = m.blocks[1] as { type: string; elements: Array<{ text: string }> };
+    const context = m.blocks[2] as { type: string; elements: Array<{ text: string }> }; // after the sender and the ask
     expect(context.type).toBe("context");
     expect(m.text).toContain(context.elements[0]!.text);
     expect(m.text.length).toBeLessThanOrEqual(SLACK_TEXT_CAP);
@@ -339,5 +356,18 @@ describe("#1013 — a workflow gate parked on a human seat renders the question,
     const m = buildOutboundMessage(gateRow, opts);
     expect(m.text).toContain("Workflow tianqi-mission · instance 01M4EXAMPLEINSTANCE");
     expect(m.text).not.toContain("step ");
+  });
+});
+
+
+describe("question and conversation cues", () => {
+  it("marks a human-required question as answerable without labelling an ordinary update an answer", () => {
+    const question = { qitemId: "q", ownerNotificationKind: "human-required", summary: "Which branch?", body: "Choose a branch." };
+    const shown = buildOutboundMessage(question, { sourceLabel: "fixture" });
+    expect(shown.text).toContain("Reply in this thread after this question to answer it.");
+    expect(JSON.stringify(shown.blocks)).toContain("Earlier and extra messages still reach the agent as conversation.");
+    const update = buildOutboundMessage({ ...question, ownerNotificationKind: "human-update" }, { sourceLabel: "fixture" });
+    expect(update.text).not.toContain("to answer it");
+    expect(JSON.stringify(update.blocks)).not.toContain("to answer it");
   });
 });

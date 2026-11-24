@@ -144,7 +144,7 @@ test("keeps added header-shaped text as source content inside a hunk", () => {
 });
 
 
-test("native Git reports UTF-8 and spaced names independently of quotePath configuration", async () => {
+test("native Git reports UTF-8 and spaced names independently of quotePath and diff-prefix configuration", async () => {
   const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
@@ -156,7 +156,8 @@ test("native Git reports UTF-8 and spaced names independently of quotePath confi
     execFileSync("git", ["init", "--quiet", repo]);
     for (const name of names) writeFileSync(join(repo, name), "see /Users/alice/project\n");
     execFileSync("git", ["-C", repo, "add", "--", ...names]);
-    for (const quotePath of ["true", "false"]) {
+    for (const [quotePath, mnemonicPrefix] of [["true", "true"], ["false", "true"], ["true", "false"], ["false", "false"]]) {
+      execFileSync("git", ["-C", repo, "config", "diff.mnemonicPrefix", mnemonicPrefix]);
       execFileSync("git", ["-C", repo, "config", "core.quotePath", quotePath]);
       const report = execFileSync(process.execPath, [fileURLToPath(new URL("./portability-report.mjs", import.meta.url)), "--repo", repo, "--staged", "--locations-only"], { encoding: "utf8" });
       for (const name of names) assert.ok(report.includes(`\`${name}:1\``), report);
@@ -171,4 +172,33 @@ test("strips Git's separator tab and leaves C-quoted filenames quoted", () => {
     assert.deepEqual(addedLines(diff), [{ file: header, line: 1, text: "see /Users/alice/project" }]);
   }
   assert.deepEqual(addedLines("+++ b/ordinary name.md\t\n@@ -0,0 +1 @@\n+see /Users/alice/project\n"), [{ file: "ordinary name.md", line: 1, text: "see /Users/alice/project" }]);
+});
+
+test("--strict exits 1 on findings, keeps the advisory default at 0, and exits 0 on a clean stage", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const { execFileSync, spawnSync } = await import("node:child_process");
+  const repo = mkdtempSync(join(tmpdir(), "openrig-portability-strict-"));
+  const script = fileURLToPath(new URL("./portability-report.mjs", import.meta.url));
+  try {
+    execFileSync("git", ["init", "--quiet", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.com"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "t"]);
+    writeFileSync(join(repo, "a.md"), "see /Users/alice/work\n");
+    execFileSync("git", ["-C", repo, "add", "--", "a.md"]);
+
+    const strictWithFindings = spawnSync(process.execPath, [script, "--repo", repo, "--staged", "--strict"], { encoding: "utf8" });
+    assert.equal(strictWithFindings.status, 1, strictWithFindings.stdout + strictWithFindings.stderr);
+
+    const advisoryWithFindings = spawnSync(process.execPath, [script, "--repo", repo, "--staged"], { encoding: "utf8" });
+    assert.equal(advisoryWithFindings.status, 0, advisoryWithFindings.stdout + advisoryWithFindings.stderr);
+
+    execFileSync("git", ["-C", repo, "commit", "--quiet", "-m", "seed"]);
+    writeFileSync(join(repo, "b.md"), "Nothing machine-specific here.\n");
+    execFileSync("git", ["-C", repo, "add", "--", "b.md"]);
+    const strictClean = spawnSync(process.execPath, [script, "--repo", repo, "--staged", "--strict"], { encoding: "utf8" });
+    assert.equal(strictClean.status, 0, strictClean.stdout + strictClean.stderr);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
 });

@@ -1,3 +1,5 @@
+import stringWidth from "string-width";
+
 /**
  * One place for the composer/prompt glyphs and the shapes built from them.
  *
@@ -86,6 +88,17 @@ export function stripComposerPromptGlyph(line: string, promptClass: string = COM
   return line.replace(promptPattern(promptClass, ""), "");
 }
 
+/** Read the prompt once for both advisory draft recognition and cursor-bound
+ * input checks. Keep the one prompt-space separate from authored whitespace.
+ */
+export function readComposerPromptLine(line: string, promptClass: string = COMPOSER_PROMPT_CLASS) {
+  const trimmed = line.trimStart();
+  const body = stripComposerPromptGlyph(trimmed, promptClass);
+  if (body === trimmed || (body !== "" && !/^\s/.test(body))) return null;
+  const indent = line.slice(0, line.length - trimmed.length);
+  return { indent, glyph: trimmed[0]!, text: body.slice(1), prefix: indent.length + 2 };
+}
+
 /**
  * Distinct prompt glyphs in the capture up to and including `inputIndex`.
  * The walk does not stop at a blank line or a rule: a multi-line draft can
@@ -110,4 +123,115 @@ export function composerGlyphKindsInBlock(lines: string[], inputIndex: number): 
 export function composerPromptIsAmbiguous(lines: string[], inputIndex: number, promptClass: string = COMPOSER_PROMPT_CLASS): boolean {
   if (promptClass !== COMPOSER_PROMPT_CLASS) return false;
   return composerGlyphKindsInBlock(lines, inputIndex).size > 1;
+}
+
+export interface ComposerSnapshot {
+  screen: string;
+  cursor: { x: number; y: number; width: number; height: number };
+  inMode: boolean;
+}
+
+export interface ComposerOwnership { text: string; frame: string }
+
+export interface ComposerInput {
+  state: "empty" | "text" | "unknown";
+  rows: string[];
+  columns: number;
+  /** How many columns short of `columns` the harness may wrap its text: a row boundary at a width in that range is a wrap. */
+  wrapSlack?: number;
+  /** Conservative visible capacity of the recognized Codex fullscreen composer. */
+  pasteViewport?: { columns: number; rows: number };
+  cursor?: ComposerSnapshot["cursor"];
+  unknownReason?: string;
+  suggestionRows?: string[];
+  frame?: string;
+  pasteMatchesExpected?: boolean;
+  cursorAtEnd: boolean;
+  collapsedPaste: string | null;
+  /** A proven display-only suffix, so readiness can reuse the same input read. */
+  ghost?: { line: number; offset: number; continuationRows: number };
+}
+
+// Claude Code adds the line count only when the paste has line breaks: a single line over its collapse threshold
+// (800 characters in 2.1.326) shows as `[Pasted text #N]` (#2429).
+export const COMPOSER_COLLAPSED_PASTE_PATTERN = /^\[Pasted text #\d+(?: \+(\d+) lines)?\]$/;
+
+/** Preserve characters and spaces within rows. Only a real line break, a full
+ * terminal row, or a word that cannot fit may explain a rendered row boundary.
+ */
+export function composerContainsOwnedText(input: ComposerInput, expected: string): boolean {
+  if (input.state !== "text" || !input.cursorAtEnd || input.collapsedPaste || !input.rows.length) return false;
+  const text = expected.replace(/\r\n/g, "\n");
+  const narrowest = input.columns - (input.wrapSlack ?? 0);
+  let offsets = new Set([0]);
+  for (let index = 0; index < input.rows.length; index++) {
+    const row = input.rows[index]!;
+    const next = new Set<number>();
+    for (const offset of offsets) {
+      if (!text.startsWith(row, offset)) continue;
+      const end = offset + row.length;
+      if (index === input.rows.length - 1) { if (end === text.length) return true; continue; }
+      if (text[end] === "\n") next.add(end + 1);
+      if (stringWidth(row) >= narrowest) next.add(end);
+      if (text[end] === " ") {
+        const word = /^\S+/.exec(text.slice(end + 1))?.[0] ?? "";
+        if (word && stringWidth(row + " " + word) > narrowest) next.add(end + 1);
+      }
+    }
+    offsets = next;
+    if (!offsets.size) return false;
+  }
+  return false;
+}
+
+/** Conservative uncertainty before a protected Codex paste, never Enter authority.
+ * Codex 0.164 collapses >1000 code points to [Pasted Content N chars], which
+ * the current ownership reader cannot own. Only a strictly shorter logical
+ * line has an exact one-row charge. Wrapped lines use a conservative pair bound
+ * over all native semantic breaks, plus an insertion row; this can retain prose
+ * that fits natively, without recreating UAX#14 or weakening Enter ownership.
+ */
+export function composerPasteUncertainty(input: ComposerInput, text: string): "controls" | "long" | "viewport" | null {
+  const viewport = input.pasteViewport;
+  if (!viewport) return null;
+  const normalized = text.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  if (lines.some(line => /[\x00-\x1f\x7f-\x9f]/.test(line))) return "controls";
+  // rust-v0.164.0 chat_composer/paste_input.rs:184-192 (Unicode scalar count).
+  if ([...normalized].length > 1000) return "long";
+  if (viewport.columns < 1 || viewport.rows < 1) return "viewport";
+  let rows = 0;
+  for (const line of lines) {
+    const cells = [...line].reduce((sum, ch) => sum + (ch >= " " && ch <= "~" ? 1 : 2), 0);
+    // A native semantic fragment may move whole, even across an apparent space.
+    // Bound the entire line rather than assuming character or ASCII-space breaks.
+    // Equality is not the one-row fast path: a full line needs an insertion row.
+    rows += cells < viewport.columns ? 1 : Math.ceil(2 * cells / viewport.columns) + 1;
+    if (rows > viewport.rows) return "viewport";
+  }
+  return null;
+}
+
+/** Recognize this lease's paste immediately after pasting or before its Enter
+ * in the original composer. A later lease cannot acquire ownership from a label.
+ */
+export function ownCollapsedPaste(input: ComposerInput, expected: string): string | null {
+  if (input.collapsedPaste && input.cursorAtEnd && input.pasteMatchesExpected && !foreignCountlessLabel(input.collapsedPaste, expected)) return input.collapsedPaste;
+  const match = input.collapsedPaste && input.cursorAtEnd ? COMPOSER_COLLAPSED_PASTE_PATTERN.exec(input.collapsedPaste) : null;
+  return match && Number(match[1] ?? 0) === expected.split("\n").length - 1 ? input.collapsedPaste : null;
+}
+
+/** A label without a line count (`[Pasted text #K]`) beside other text is a person's single-line paste: ours collapses
+ * to the bare label, which `ownCollapsedPaste` reads on its own, and an inline paste draws none, so matching our head
+ * beside it proves nothing (#2429). Beside other text, only a label our own text spells out, as many times as it does,
+ * is ours; whitespace is ignored, since a wrap may split the label. */
+function foreignCountlessLabel(drawn: string, expected: string): boolean {
+  const labels = (text: string): string[] => text.replace(/\s+/g, "").match(/\[Pastedtext#\d+\]/g) ?? [];
+  const ours = labels(expected);
+  return labels(drawn).some(label => {
+    const at = ours.indexOf(label);
+    if (at < 0) return true;
+    ours.splice(at, 1);
+    return false;
+  });
 }

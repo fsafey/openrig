@@ -1,10 +1,11 @@
+import { ActivityGrantStore } from "./activity-grants.js";
 import type Database from "better-sqlite3";
 import { monotonicFactory } from "ulid";
 import { randomUUID } from "node:crypto";
 
 const ulid = monotonicFactory();
 import type { Session, Binding } from "./types.js";
-import { validateSessionName } from "./session-name.js";
+import { boundSessionNameProblem, validateSessionName } from "./session-name.js";
 import { formatWatchdogRegistrationError } from "./watchdog-auto-registration.js";
 import type { ClaudeLaunchedProcess, ClaudeResumeRotation } from "./native-process-lineage.js";
 
@@ -104,6 +105,10 @@ export interface LatestLiveSession {
   resumeType: string | null;
   resumeToken: string | null;
   cwd: string | null;
+  /** The community harness this session was launched for, when it was. */
+  communityHarness?: string | null;
+  /** `claimed` for a session OpenRig didn't launch (adopted, bound, or joined with `rig attach --self`). */
+  origin?: string | null;
 }
 
 export interface WatchdogRegistrationObserver {
@@ -113,12 +118,170 @@ export interface WatchdogRegistrationObserver {
   reconcileHandover?(nodeId: string, sessionName: string): unknown;
 }
 
+export interface CurrentSessionAddress {
+  nodeId: string; sessionId: string; sessionName: string; senderAddress: string;
+  logicalId: string; rigName: string;
+}
+
+/** Explicit node/binding join: never reverse-parse a flattened team address.
+ * Physical names win over derived names. Archived/historical bindings cannot
+ * advertise a new alias, and two current matches never pick an arbitrary seat. */
+export function resolveCurrentSessionAddress(db: Database.Database, address: string): CurrentSessionAddress | null {
+  const current = `SELECT r.name, r.archived_at, n.id AS nodeId, n.logical_id AS logicalId,
+      s.id AS sessionId, s.session_name AS sessionName, s.status,
+      replace(n.logical_id, '.', '-') || '@' || r.name AS senderAddress
+    FROM nodes n JOIN rigs r ON r.id=n.rig_id
+    JOIN bindings b ON b.node_id=n.id AND b.tmux_session IS NOT NULL
+    CROSS JOIN sessions s ON s.node_id=n.id AND s.session_name=b.tmux_session
+      AND s.id=(SELECT id FROM sessions WHERE node_id=n.id ORDER BY id DESC LIMIT 1)`;
+  // Inventory passes physical names for every seat. The OR with a derived alias
+  // made each lookup walk all nodes (or all historical sessions). Seek the exact
+  // name first; only an absent active exact match needs the alias walk. Keep this
+  // in one statement so both alternatives observe the same database snapshot.
+  const rows = db.prepare(`WITH exact AS MATERIALIZED (
+      ${current} WHERE b.tmux_session=? AND r.archived_at IS NULL
+        AND COALESCE(s.status, '') NOT IN ('superseded', 'detached', 'exited')
+    ) SELECT * FROM exact
+    UNION ALL
+    ${current}
+    WHERE replace(n.logical_id, '.', '-') || '@' || r.name=?
+      AND NOT EXISTS (SELECT 1 FROM exact)`)
+    .all(address, address) as Array<CurrentSessionAddress & { name: string; archived_at?: string | null; status: string }>;
+  const active = rows.filter(row => row.archived_at == null && !['superseded', 'detached', 'exited'].includes(row.status));
+  const exact = active.filter(row => row.sessionName === address);
+  // A derived address cannot take another seat's saved spelling. The same seat
+  // can continue after the old rig generation stopped or was archived by replacement.
+  const pool = exact.length ? exact : active.filter(row => !hasOtherSeatHistory(db, address, row.nodeId));
+  if (pool.length !== 1) return null;
+  const row = pool[0]!;
+  return { nodeId: row.nodeId, sessionId: row.sessionId, sessionName: row.sessionName,
+    senderAddress: row.senderAddress, logicalId: row.logicalId, rigName: row.name };
+}
+
+/** Resolve live routing to the current physical tmux session. Historical readers
+ * use savedSessionName instead so reconnecting does not redirect saved context. */
+export function physicalSessionName(db: Database.Database, address: string): string {
+  if (!address.includes("@")) return address;
+  // A curated/legacy read model with no binding table has no aliases to resolve.
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bindings'").get()) return address;
+  return resolveCurrentSessionAddress(db, address)?.sessionName ?? address;
+}
+
+/** Only this predecessor may be omitted when selecting a same-seat successor.
+ * Unknown state and another logical seat remain competing owners. */
+export function isStoppedSeatPredecessor(
+  previous: { rigName: string; logicalId: string; archivedAt?: string | null; latestStatus?: string | null },
+  current: { rigName: string; logicalId: string },
+): boolean {
+  return previous.rigName === current.rigName && previous.logicalId === current.logicalId
+    && (previous.archivedAt != null || ["exited", "detached", "superseded"].includes(previous.latestStatus ?? ""));
+}
+
+/** Stopped/archived generations of the same rig/logical seat are its own history;
+ * every other saved owner still reserves the spelling, including archived ones. */
+export function hasOtherSeatHistory(db: Database.Database, address: string, nodeId: string): boolean {
+  const owners = db.prepare(`SELECT r.*, n.logical_id AS logicalId,
+      target.logical_id AS targetLogicalId, target_rig.name AS targetRigName,
+      (SELECT status FROM sessions WHERE node_id=n.id ORDER BY id DESC LIMIT 1) AS latestStatus
+    FROM sessions s JOIN nodes n ON n.id=s.node_id JOIN rigs r ON r.id=n.rig_id
+    JOIN nodes target ON target.id=? JOIN rigs target_rig ON target_rig.id=target.rig_id
+    WHERE s.session_name=? AND s.node_id<>?`)
+    .all(nodeId, address, nodeId) as Array<{ name: string; archived_at?: string | null; logicalId: string; targetLogicalId: string; targetRigName: string; latestStatus: string }>;
+  return owners.some(owner => !isStoppedSeatPredecessor(
+    { rigName: owner.name, logicalId: owner.logicalId, archivedAt: owner.archived_at, latestStatus: owner.latestStatus },
+    { rigName: owner.targetRigName, logicalId: owner.targetLogicalId }));
+}
+
+/** Saved transcript/native context keeps an exact session spelling, even when
+ * the same node now advertises that spelling from a different physical session. */
+export function savedSessionName(db: Database.Database, address: string): string {
+  if (db.prepare("SELECT 1 FROM sessions WHERE session_name=? LIMIT 1").get(address)) return address;
+  return physicalSessionName(db, address);
+}
+
+export class SessionAddressConflict extends Error {
+  readonly code = "address_conflict";
+  constructor(address: string) { super(`Team address '${address}' conflicts with another member. Choose another member name.`); }
+}
+
 export class SessionRegistry {
   readonly db: Database.Database;
   private watchdogRegistrationObserver?: WatchdogRegistrationObserver;
   constructor(db: Database.Database, watchdogRegistrationObserver?: WatchdogRegistrationObserver) {
     this.db = db;
     this.watchdogRegistrationObserver = watchdogRegistrationObserver;
+  }
+
+  resolveAddress(address: string): CurrentSessionAddress | null {
+    return resolveCurrentSessionAddress(this.db, address);
+  }
+
+  /** #2895 (a): whether `rig send <sender>` can find this sender, by the transport's own resolution (a current
+   *  address, or a session row on a node of a rig). A three-part `member@rig@host` label is a cross-host origin that
+   *  `rig send` forwards, so it counts. A stopped seat still has its rows, so it counts too. Any lookup error ⇒ true,
+   *  which keeps today's reply line. */
+  senderIsSendable(sender: string): boolean {
+    if (sender.split("@").length === 3) return true;
+    try {
+      if (this.resolveAddress(sender)) return true;
+      return this.db.prepare(`SELECT 1 FROM sessions s JOIN nodes n ON n.id = s.node_id JOIN rigs r ON r.id = n.rig_id
+        WHERE s.session_name = ? LIMIT 1`).get(sender) !== undefined;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Current queue equivalence, not a rewrite of recorded identity. A raw name
+   * reused by another node has ambiguous history: do not newly attribute its
+   * old rows through the logical spelling. Exact raw access stays unchanged. */
+  sessionAddresses(address: string): string[] {
+    const target = this.resolveAddress(address);
+    if (!target) return [address];
+    const names = new Set([address, target.senderAddress]);
+    const history = this.db.prepare("SELECT DISTINCT node_id FROM sessions WHERE session_name=?").all(target.sessionName) as Array<{ node_id: string }>;
+    if (address === target.sessionName || history.every(row => row.node_id === target.nodeId)) names.add(target.sessionName);
+    return [...names].filter(name => name === address || this.resolveAddress(name)?.nodeId === target.nodeId);
+  }
+
+  /** Run before effects as well as at registration. Declared logical collisions
+   * cannot race two launches into advertising the same address. Reconnecting
+   * this same node is not a clash. No binding or record is renamed here. */
+  assertAddressAvailable(nodeId: string, sessionName: string, tmux = true): void {
+    const node = this.db.prepare(`SELECT n.logical_id, r.name FROM nodes n JOIN rigs r ON r.id=n.rig_id WHERE n.id=?`)
+      .get(nodeId) as { logical_id: string; name: string } | undefined;
+    if (!node) return; // the existing FK/registration error owns an unknown node
+    const logical = `${node.logical_id.replace(/\./g, '-')}@${node.name}`;
+    const continuing = this.db.prepare("SELECT 1 FROM sessions WHERE node_id=? LIMIT 1").get(nodeId) !== undefined;
+    // An established exact/raw session can reconnect as before. A newly advertised
+    // logical name cannot take another seat's saved spelling, even after unbind/archive.
+    if (tmux && !(continuing && sessionName === logical)
+      && hasOtherSeatHistory(this.db, logical, nodeId)) {
+      throw new SessionAddressConflict(logical);
+    }
+    const proposed = tmux ? [sessionName, logical] : [sessionName];
+    // b.* keeps registration valid before the optional external-CLI binding columns exist.
+    const other = this.db.prepare(`SELECT r.*, n.id AS nodeId, n.logical_id AS logicalId,
+        replace(n.logical_id, '.', '-') || '@' || r.name AS logicalAddress,
+        b.*,
+        (SELECT session_name FROM sessions WHERE node_id=n.id ORDER BY id DESC LIMIT 1) AS latestName,
+        (SELECT status FROM sessions WHERE node_id=n.id ORDER BY id DESC LIMIT 1) AS latestStatus
+      FROM nodes n JOIN rigs r ON r.id=n.rig_id LEFT JOIN bindings b ON b.node_id=n.id WHERE n.id<>?`)
+      .all(nodeId) as Array<{ nodeId: string; name: string; logicalId: string; latestStatus: string | null; archived_at?: string | null; logicalAddress: string; tmux_session: string | null; external_session_name?: string | null; latestName: string | null }>;
+    for (const row of other) {
+      if (row.archived_at != null) continue;
+      // The supported no-probe replacement also keeps a stopped same-seat generation.
+      if (isStoppedSeatPredecessor(
+        { rigName: row.name, logicalId: row.logicalId, archivedAt: row.archived_at, latestStatus: row.latestStatus },
+        { rigName: node.name, logicalId: node.logical_id })) continue;
+      const physical = row.tmux_session ?? row.external_session_name;
+      for (const address of proposed) {
+        const currentOther = physical && (!row.latestName || row.latestName === physical);
+        if ((address === row.logicalAddress && !(continuing && address === logical && !currentOther))
+          || (currentOther && address === physical)) {
+          throw new SessionAddressConflict(address);
+        }
+      }
+    }
   }
 
   setWatchdogRegistrationObserver(observer: WatchdogRegistrationObserver): void {
@@ -130,24 +293,35 @@ export class SessionRegistry {
     sessionName: string,
     kind: OccupantKind = "initial",
     reservedGeneration?: string | null,
+    /** The launch keeps the name the seat was bound to (an adopted seat's own name): accepted when boundSessionNameProblem finds none.
+     *  launchedCwd: the folder this launch starts the seat in, which rig down also cleans. */
+    opts?: { keptBoundName?: boolean; launchedCwd?: string },
   ): Session {
-    if (!validateSessionName(sessionName)) {
+    if (!validateSessionName(sessionName) && !(opts?.keptBoundName === true && boundSessionNameProblem(sessionName) === null)) {
       throw new Error(
         `Invalid session name "${sessionName}": must match legacy r{NN}-{suffix} or canonical {pod}-{member}@{rig} format with allowed characters (a-z, A-Z, 0-9, -, _, ., @)`
       );
     }
 
+    this.assertAddressAvailable(nodeId, sessionName);
     const id = ulid();
     this.db
       .prepare(
         "INSERT INTO sessions (id, node_id, session_name) VALUES (?, ?, ?)"
       )
       .run(id, nodeId, sessionName);
+    this.recordLaunchedCwd(id, opts?.launchedCwd);
     this.mintOccupantTenureBestEffort(nodeId, kind, reservedGeneration); // atom-B: mint this occupant generation
     this.observeWatchdogRegistration(nodeId, sessionName, kind);
     return this.rowToSession(
       this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as SessionRow
     );
+  }
+
+  /** The folder a launch started this session in, which rig down also cleans. A database without the column records none. */
+  recordLaunchedCwd(sessionId: string, cwd: string | null | undefined): void {
+    if (!cwd) return;
+    try { this.db.prepare("UPDATE sessions SET launched_cwd = ? WHERE id = ?").run(cwd, sessionId); } catch { /* no column */ }
   }
 
   /** Register a claimed session — skips naming validation, sets origin='claimed', startup_status='ready'. */
@@ -157,6 +331,7 @@ export class SessionRegistry {
     kind: OccupantKind = "adopt",
     reservedGeneration?: string | null,
   ): Session {
+    this.assertAddressAvailable(nodeId, sessionName, this.getBindingForNode(nodeId)?.attachmentType !== "external_cli");
     const id = ulid();
     this.db
       .prepare(
@@ -165,6 +340,8 @@ export class SessionRegistry {
       .run(id, nodeId, sessionName);
     this.mintOccupantTenureBestEffort(nodeId, kind, reservedGeneration); // atom-B: mint this occupant generation
     this.observeWatchdogRegistration(nodeId, sessionName, kind);
+    try { new ActivityGrantStore(this.db).reconcileBinding(nodeId); }
+    catch { /* Optional run attribution must not fail an already registered claimed session. */ }
 
     return this.rowToSession(
       this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as SessionRow
@@ -262,6 +439,18 @@ export class SessionRegistry {
     ).get(nodeId, generationUuid));
   }
 
+  /** True when this generation is registered for this node and only no-launch adoptions ('adopt': reconcile, bind,
+   * self-attach) were registered after it. Adoption registers the same live process again without replacing it, so
+   * that occupant is still the seat's; a launch kind after it (initial, fresh, handover) replaced it. Throws on ledger
+   * faults, like isOccupantGenerationRegistered. */
+  isOccupantContinuedByAdoption(nodeId: string, generationUuid: string): boolean {
+    return Boolean(this.db.prepare(
+      `SELECT 1 FROM occupant_tenures e WHERE e.node_id = ? AND e.generation_uuid = ? AND NOT EXISTS (
+         SELECT 1 FROM occupant_tenures l WHERE l.node_id = e.node_id AND l.generation_ordinal > e.generation_ordinal
+           AND l.kind <> 'adopt') LIMIT 1`,
+    ).get(nodeId, generationUuid));
+  }
+
   mintOccupantTenure(
     nodeId: string,
     kind: OccupantKind,
@@ -307,6 +496,7 @@ export class SessionRegistry {
    *  enforcer's gen-scoped stage gate consumes. Never throws (a bad lookup returns null). */
   currentOccupantGenerationForSession(sessionName: string): string | null {
     try {
+      sessionName = physicalSessionName(this.db, sessionName);
       const row = this.db
         .prepare("SELECT node_id FROM sessions WHERE session_name = ? ORDER BY id DESC LIMIT 1")
         .get(sessionName) as { node_id: string } | undefined;
@@ -315,6 +505,15 @@ export class SessionRegistry {
     } catch {
       return null; // UNKNOWN on any lookup failure (e.g. a db without the tenure ledger)
     }
+  }
+
+  /** Name existence is independent of best-effort tenure recording. */
+  carriesSessionName(sessionName: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM nodes n JOIN rigs r ON r.id = n.rig_id
+      WHERE r.archived_at IS NULL AND (
+        EXISTS (SELECT 1 FROM sessions s WHERE s.node_id = n.id AND s.session_name = ?)
+        OR EXISTS (SELECT 1 FROM bindings b WHERE b.node_id = n.id AND (b.tmux_session = ? OR b.external_session_name = ?))
+      ) LIMIT 1`).get(sessionName, sessionName, sessionName);
   }
 
   private rowToTenure(row: OccupantTenureRow): OccupantTenure {
@@ -330,6 +529,7 @@ export class SessionRegistry {
   }
 
   updateStatus(sessionId: string, status: string): void {
+    if (["exited", "detached", "superseded"].includes(status)) new ActivityGrantStore(this.db).revokeForSession(sessionId, status);
     this.db
       .prepare("UPDATE sessions SET status = ?, intentionally_stopped = 0, last_seen_at = datetime('now') WHERE id = ?")
       .run(status, sessionId);
@@ -338,9 +538,16 @@ export class SessionRegistry {
   /** A supported stop is distinct from an observed exit. Any later status write
    * clears the intent, including a resume of this same session row. */
   markIntentionallyStopped(sessionId: string): void {
+    new ActivityGrantStore(this.db).revokeForSession(sessionId, "stopped");
     this.db.prepare(
       "UPDATE sessions SET status = 'exited', intentionally_stopped = 1, last_seen_at = datetime('now') WHERE id = ?",
     ).run(sessionId);
+  }
+
+  /** Record a supported stop on a row that keeps its status: a rolled-back launch's superseded session is
+   * occupant history, and turning it into an exit would make it a restore candidate. */
+  recordStopIntent(sessionId: string): void {
+    this.db.prepare("UPDATE sessions SET intentionally_stopped = 1 WHERE id = ?").run(sessionId);
   }
 
   updateStartupStatus(sessionId: string, status: "pending" | "ready" | "attention_required" | "failed", completedAt?: string): void {
@@ -370,6 +577,19 @@ export class SessionRegistry {
   // empty-token skip or a lower-rank no-op. Callers that only set-and-forget can
   // ignore it; the adoption-capture path uses it so its audit event never
   // falsely claims a captured write when the provenance guard refused it.
+  /** Record that this session was launched for a community harness, selected through its preset. With `runner`, also
+   *  record what that launch's preset declared: `runner: true` (1), OpenRig's hosted Pi-protocol runner for
+   *  `protocol: pi-rpc` ("pi-rpc", 2), or neither (0), so activity reads the launched occupant's declaration, never a
+   *  later preset edit. Without it (a restore carrying only the selection) the field is left as is. */
+  recordCommunityHarnessSelection(sessionId: string, app: string, runner?: boolean | "pi-rpc"): void {
+    if (runner !== undefined && sessionCommunityRunnerSelect(this.db, "sessions") !== "NULL") {
+      this.db.prepare("UPDATE sessions SET agent_app = ?, agent_runner = ? WHERE id = ?")
+        .run(app, runner === "pi-rpc" ? AGENT_RUNNER_HOSTED_PI_RPC : runner ? AGENT_RUNNER_PRESET : 0, sessionId);
+      return;
+    }
+    this.db.prepare("UPDATE sessions SET agent_app = ? WHERE id = ?").run(app, sessionId);
+  }
+
   updateResumeToken(sessionId: string, type: string, token: string, provenance?: "hook" | "scrape" | "operator" | "adoption"): boolean {
     if (typeof token !== "string" || token.trim().length === 0) return false;
     if (provenance) {
@@ -396,6 +616,21 @@ export class SessionRegistry {
           `${CLEAR_ROTATION_ON_TOKEN_CHANGE} WHERE id = ?`,
       )
       .run(type, token, prov, token, token, sessionId);
+    return true;
+  }
+
+  /** A community harness's conversation for this launch: one its launcher reported (`launcher`), or one OpenRig named and
+   *  passed to it (`passed`). Recorded with no verification stamp: neither is a verification, so the session doesn't read
+   *  as resumable. */
+  recordLauncherReportedToken(sessionId: string, type: string, token: string, provenance: "launcher" | "passed" = "launcher"): boolean {
+    if (typeof token !== "string" || token.trim().length === 0) return false;
+    this.db
+      .prepare(
+        "UPDATE sessions SET resume_type = ?, resume_token = ?, resume_provenance = ?, " +
+          "resume_last_verified = NULL, resume_last_probe_status = NULL, " +
+          `${CLEAR_ROTATION_ON_TOKEN_CHANGE} WHERE id = ?`,
+      )
+      .run(type, token, provenance, token, token, sessionId);
     return true;
   }
 
@@ -533,6 +768,7 @@ export class SessionRegistry {
     runtime: string | null;
     currentProvenance: string | null;
   } | null {
+    sessionName = savedSessionName(this.db, sessionName);
     const row = this.db.prepare(
       `SELECT s.id as session_id, s.node_id, n.rig_id, n.runtime, s.resume_provenance
        FROM sessions s
@@ -584,7 +820,7 @@ export class SessionRegistry {
         `SELECT s.* FROM sessions s
          JOIN nodes n ON s.node_id = n.id
          WHERE n.rig_id = ?
-         ORDER BY s.created_at`
+         ORDER BY s.created_at, s.rowid`
       )
       .all(rigId) as SessionRow[];
 
@@ -597,13 +833,14 @@ export class SessionRegistry {
    *  FR-4 periodic/manual snapshot refresh call ONE query (no duplication). */
   getLatestLiveSessions(rigId: string): LatestLiveSession[] {
     const rows = this.db.prepare(`
-      SELECT n.id as node_id, s.id as session_id, s.session_name, s.status, n.runtime, n.cwd, s.resume_type, s.resume_token
+      SELECT n.id as node_id, s.id as session_id, s.session_name, s.status, n.runtime, n.cwd, s.resume_type, s.resume_token,
+        s.origin, ${sessionCommunityHarnessSelect(this.db)} as community_harness
       FROM nodes n
       JOIN sessions s ON s.node_id = n.id
       WHERE n.rig_id = ?
         AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
         AND s.status IN ('running', 'idle', 'unknown')
-    `).all(rigId) as Array<{ node_id: string; session_id: string; session_name: string; status: string; runtime: string | null; cwd: string | null; resume_type: string | null; resume_token: string | null }>;
+    `).all(rigId) as Array<{ node_id: string; session_id: string; session_name: string; status: string; runtime: string | null; cwd: string | null; resume_type: string | null; resume_token: string | null; origin: string | null; community_harness: string | null }>;
 
     return rows.map((r) => ({
       nodeId: r.node_id,
@@ -614,6 +851,8 @@ export class SessionRegistry {
       resumeType: r.resume_type,
       resumeToken: r.resume_token,
       cwd: r.cwd,
+      communityHarness: r.community_harness,
+      origin: r.origin,
     }));
   }
 
@@ -707,6 +946,8 @@ export class SessionRegistry {
       origin: (row.origin === "claimed" ? "claimed" : "launched"),
       startupStatus: (row.startup_status as Session["startupStatus"]) ?? "pending",
       startupCompletedAt: row.startup_completed_at ?? null,
+      // Present only on a session launched for a community harness, so other sessions read as before.
+      ...(row.agent_app ? { communityHarness: row.agent_app } : {}),
     };
   }
 
@@ -741,6 +982,7 @@ interface SessionRow {
   origin: string;
   startup_status: string | null;
   startup_completed_at: string | null;
+  agent_app?: string | null;
   // OPR.0.4.3.20 FR-3/FR-6 — resume ledger provenance + verification freshness.
   resume_provenance?: string | null;
   resume_last_verified?: string | null;
@@ -758,4 +1000,40 @@ interface BindingRow {
   cmux_workspace: string | null;
   cmux_surface: string | null;
   updated_at: string;
+}
+
+const sessionsHaveCommunityHarness = new WeakMap<Database.Database, boolean>();
+
+/** The SQL that reads a session's recorded community harness: the retained storage column, or NULL on a schema without that column
+ *  (as other optional columns are read), so a partial schema reads every seat as before. The schema check is made
+ *  once per database: the column only appears through a migration, which runs before these reads. */
+export function sessionCommunityHarnessSelect(db: Database.Database, alias = "s"): string {
+  let has = sessionsHaveCommunityHarness.get(db);
+  if (has === undefined) {
+    has = (db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name?: string }>).some(row => row.name === "agent_app");
+    sessionsHaveCommunityHarness.set(db, has);
+  }
+  return has ? `${alias}.agent_app` : "NULL";
+}
+
+const sessionsHaveCommunityRunner = new WeakMap<Database.Database, boolean>();
+
+/** The SQL that reads whether a session's community app was launched as a runner: 1, 0, or NULL. NULL also on a schema
+ *  without the column, so a legacy database reads every seat as before (never a runner opt-in). */
+/** `sessions.agent_runner`: 1, a preset's own runner (`runner: true`); 2, OpenRig's hosted Pi-protocol runner for a
+ *  `protocol: pi-rpc` preset. Both are runners; only the second speaks Pi's RPC protocol. */
+export const AGENT_RUNNER_PRESET = 1;
+export const AGENT_RUNNER_HOSTED_PI_RPC = 2;
+/** The session was launched for a runner of either kind. */
+export function recordedRunner(value: number | null | undefined): boolean {
+  return value === AGENT_RUNNER_PRESET || value === AGENT_RUNNER_HOSTED_PI_RPC;
+}
+
+export function sessionCommunityRunnerSelect(db: Database.Database, alias = "s"): string {
+  let has = sessionsHaveCommunityRunner.get(db);
+  if (has === undefined) {
+    has = (db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name?: string }>).some(row => row.name === "agent_runner");
+    sessionsHaveCommunityRunner.set(db, has);
+  }
+  return has ? `${alias}.agent_runner` : "NULL";
 }

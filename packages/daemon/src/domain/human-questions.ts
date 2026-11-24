@@ -30,8 +30,11 @@ export type HumanAnswers = Record<string, string | TypedHumanReply>;
 /** The outcome of recording one clicked answer (QueueRepository.recordHumanAnswer). */
 export type RecordHumanAnswerResult =
   | { status: "recorded"; answers: HumanAnswers; complete: boolean; questions: HumanQuestion[] }
-  /** answerOnRecord: the decision is no longer pending, and this asked human's clicked answer is the one it holds. */
-  | { status: "not-applicable"; reason: string; answerOnRecord?: true };
+  /** answerOnRecord: the decision is no longer pending, and this asked human's clicked answer is the one it holds.
+   *  decidedForThem: it was decided on this asked human's behalf, inside their mode's decision room.
+   *  answeredBy: another person's committed answer is the ask's answer; nothing of this person's was recorded. */
+  | { status: "not-applicable"; reason: string; answerOnRecord?: true;
+    decidedForThem?: { decidedBy: string; modeName: string; chose: string; reversible: boolean }; answeredBy?: string };
 
 export const MAX_HUMAN_QUESTIONS = 4;
 export const MIN_OPTIONS = 2;
@@ -102,7 +105,23 @@ export function formatHumanAnswers(questions: readonly HumanQuestion[], answers:
   });
 }
 
+/** What was chosen, in question order: a button choice's option label, or null for a typed reply (a settled card names
+ *  the choice; the typed words stay in the thread). Empty when nothing is recorded. */
+export function chosenAnswers(questions: readonly HumanQuestion[], answers: HumanAnswers): Array<string | null> {
+  return questions.flatMap((q) => {
+    const answer = ownAnswer(answers, q.id);
+    if (answer == null) return [];
+    return [typeof answer === "string" ? q.options.find((o) => o.id === answer)?.label ?? answer : null];
+  });
+}
+
 /** The questions still waiting for an answer. */
 export function unansweredQuestions(questions: readonly HumanQuestion[], answers: HumanAnswers): HumanQuestion[] {
   return questions.filter((q) => ownAnswer(answers, q.id) == null);
+}
+
+/** Return the person's original answer, without the attribution footer used by both surfaces. */
+export function humanAnswerText(body: string): string {
+  const footer = body.lastIndexOf("\n\n---\n");
+  return (footer < 0 ? body : body.slice(0, footer)).trim();
 }

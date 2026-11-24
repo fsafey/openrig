@@ -31,6 +31,46 @@ function writeFile(p: string, content: string): void {
   fs.writeFileSync(p, content, "utf8");
 }
 
+it("uses only the rig association as the default, preserving explicit targets", () => {
+  const dir = fs.realpathSync(mktemp());
+  const alpha = path.join(dir, "alpha"), beta = path.join(dir, "beta"), shared = path.join(dir, "shared");
+  for (const root of [alpha, beta, shared]) fs.mkdirSync(path.join(root, "missions"), { recursive: true });
+  const catalog = path.join(dir, "workspace.yaml");
+  writeFile(catalog, "projects:\n  - id: alpha\n    root: alpha\n    rigs: [rig-a]\n  - id: beta\n    root: beta\n    rigs: [rig-b]\n");
+  vi.stubEnv("OPENRIG_WORKSPACE_CATALOG_PATH", catalog);
+  vi.stubEnv("OPENRIG_WORKSPACE_SLICES_ROOT", path.join(shared, "missions"));
+  vi.stubEnv("OPENRIG_SESSION_NAME", "seat@rig-a");
+  vi.stubEnv("OPENRIG_WORK_ROOT", "");
+  const report = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    expect(resolveMissionsRoot()).toBe(path.join(alpha, "missions"));
+    expect(report).toHaveBeenCalledWith(expect.stringContaining("alpha"));
+    expect(resolveMissionsRoot({ override: beta })).toBe(path.join(beta, "missions"));
+    vi.stubEnv("OPENRIG_WORK_ROOT", beta);
+    expect(resolveMissionsRoot()).toBe(path.join(beta, "missions"));
+    vi.stubEnv("OPENRIG_WORK_ROOT", "");
+    expect(resolveMissionsRoot({ targetPath: path.join(shared, "missions", "m", "slices", "01-x") })).toBe(path.join(shared, "missions"));
+    vi.stubEnv("OPENRIG_SESSION_NAME", "seat@no-match");
+    expect(resolveMissionsRoot()).toBe(path.join(shared, "missions"));
+    writeFile(catalog, "projects:\n  - id: alpha\n    root: alpha\n    rigs: [rig-a]\n  - id: beta\n    root: beta\n    rigs: [rig-a]\n");
+    vi.stubEnv("OPENRIG_SESSION_NAME", "seat@rig-a");
+    expect(resolveMissionsRoot()).toBe(path.join(shared, "missions"));
+    expect(report).toHaveBeenCalledWith(expect.stringMatching(/several projects.*--workspace/));
+    writeFile(catalog, "projects:\n  - id: alpha\n    root: alpha\n    rigs: [rig-a]\n");
+    writeFile(path.join(alpha, "project.yaml"), "id: different\n");
+    expect(resolveMissionsRoot()).toBe(path.join(shared, "missions"));
+    expect(report).toHaveBeenCalledWith(expect.stringMatching(/conflicts with project identity[\s\S]*--workspace/));
+    writeFile(catalog, "projects: [broken\n");
+    vi.stubEnv("OPENRIG_SESSION_NAME", "seat@no-match");
+    expect(resolveMissionsRoot()).toBe(path.join(shared, "missions"));
+    expect(report).toHaveBeenCalledWith(expect.stringMatching(/warning:.*--workspace/));
+  } finally {
+    report.mockRestore();
+    vi.unstubAllEnvs();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 describe("frontmatter parser", () => {
   it("returns {} when there is no frontmatter delimiter", () => {
     const { frontmatter, body } = splitFrontmatter("# heading\n\nbody");
@@ -326,6 +366,44 @@ describe("listMissions + listSlices + nextSliceNN", () => {
   });
 });
 
+describe("a slice's standing: in flight, delivered in place, or closed (#2427)", () => {
+  let root: string;
+  let missionsRoot: string;
+
+  beforeEach(() => {
+    root = mktemp();
+    missionsRoot = path.join(root, "missions");
+    writeFile(path.join(missionsRoot, "m1", "README.md"), "---\nid: OPR.9.1\n---\n# m1\n");
+    const slice = (dir: string, frontmatter: string) => writeFile(path.join(missionsRoot, "m1", dir, "README.md"), `---\n${frontmatter}\n---\nbody\n`);
+    slice("slices/01-open", "id: OPR.9.1.1\nstatus: active");
+    slice("slices/02-blocked", "id: OPR.9.1.2\nstatus: blocked");
+    slice("slices/03-shipped", "id: OPR.9.1.3\nstatus: shipped");
+    slice("slices/04-done", "id: OPR.9.1.4\nstatus: done");
+    slice("slices/05-replaced", "id: OPR.9.1.5\nstatus: active\nstage: superseded\nsuperseded-by: OPR.9.1.9");
+    slice("slices/06-superseded", "id: OPR.9.1.6\nstatus: superseded");
+    slice("closed/07-stale", "id: OPR.9.1.7\nstatus: closed-stale");
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("slice ls: active is work in flight (blocked included); shipped is delivered in place; closed includes exits in place", () => {
+    const mission = findMission(missionsRoot, "m1");
+    const names = (state: "active" | "shipped" | "closed" | "all") => listSlices(mission, state).map((s) => s.name);
+    expect(names("active")).toEqual(["01-open", "02-blocked"]);
+    expect(names("shipped")).toEqual(["03-shipped", "04-done"]);
+    expect(names("closed")).toEqual(["05-replaced", "06-superseded", "07-stale"]);
+    expect(names("all")).toHaveLength(7);
+  });
+
+  it("mission counts give each slice one standing, the same as slice ls", () => {
+    const counts = { activeSliceCount: 2, shippedSliceCount: 2, closedSliceCount: 3 };
+    expect(listMissions(missionsRoot)[0]).toMatchObject(counts);
+    expect(findMission(missionsRoot, "m1")).toMatchObject(counts);
+  });
+});
+
 describe("findSlice + resolution variants", () => {
   let root: string;
   let missionsRoot: string;
@@ -354,6 +432,43 @@ describe("findSlice + resolution variants", () => {
     const abs = path.join(missionsRoot, "release-0.3.2", "slices", "07-target");
     const slice = findSlice(missionsRoot, abs);
     expect(slice.missionName).toBe("release-0.3.2");
+  });
+
+  it("finds the owning mission when the missions root ends in a separator", () => {
+    const withSlash = missionsRoot + path.sep;
+    expect(findSlice(withSlash, "07-target", "release-0.3.2").missionName).toBe("release-0.3.2");
+    const abs = path.join(missionsRoot, "release-0.3.2", "slices", "07-target");
+    expect(findSlice(withSlash, abs).missionName).toBe("release-0.3.2");
+  });
+
+  it("finds the owning mission for a relative missions root with a bare name and --mission, or a mission path", () => {
+    const prev = process.cwd();
+    process.chdir(root);
+    try {
+      const hinted = findSlice("missions", "07-target", "release-0.3.2");
+      expect(hinted.missionName).toBe("release-0.3.2");
+      expect(hinted.absPath).toBe(path.join(fs.realpathSync(root), "missions", "release-0.3.2", "slices", "07-target"));
+      expect(findSlice("missions/", "07-target", "release-0.3.2").missionName).toBe("release-0.3.2");
+      expect(findSlice("missions", "release-0.3.2/slices/07-target").missionName).toBe("release-0.3.2");
+    } finally {
+      process.chdir(prev);
+    }
+  });
+
+  it.each(["/.", "/sub/.."])("resolves an absolute slice path ending in %s to the slice itself", (suffix) => {
+    const abs = path.join(missionsRoot, "release-0.3.2", "slices", "07-target");
+    fs.mkdirSync(path.join(abs, "sub"));
+    const slice = findSlice(missionsRoot, abs + suffix.replace(/\//g, path.sep));
+    expect(slice.absPath).toBe(abs);
+    expect(slice.name).toBe("07-target");
+    expect(slice.missionName).toBe("release-0.3.2");
+  });
+
+  it("keeps an absolute slice path that leaves the missions root pointing at the requested folder", () => {
+    const outside = path.join(root, "other", "m1", "slices", "x");
+    fs.mkdirSync(outside, { recursive: true });
+    const slice = findSlice(missionsRoot, [missionsRoot, "..", "other", "m1", "slices", "x"].join(path.sep));
+    expect(slice.absPath).toBe(outside);
   });
 
   it.each(["workspace", "missions", "declared mission"])(
@@ -436,6 +551,36 @@ describe("findSlice + resolution variants", () => {
 
   it("3-part error when slice not found (HG-10)", () => {
     expect(() => findSlice(missionsRoot, "99-missing", "release-0.3.2")).toThrow(/not found/);
+  });
+
+  it("O2: an absolute slice in another workspace's missions tree names the --workspace that selects it", () => {
+    const project = path.join(root, "projects", "alpha");
+    const slice = path.join(project, "missions", "m1", "slices", "01-x");
+    writeFile(path.join(project, "missions", "m1", "SPEC.md"), "---\nid: ALPHA.99.0.1\n---\nbody");
+    writeFile(path.join(slice, "SPEC.md"), "---\nid: ALPHA.99.0.1.1\n---\nbody");
+    let error: unknown;
+    try { findSlice(missionsRoot, slice); } catch (err) { error = err; }
+    expect(error).toBeInstanceOf(ScopeCliError);
+    expect((error as ScopeCliError).fact).toBe(`Slice path "${slice}" resolved to ${slice} but no parent mission was found.`);
+    expect((error as ScopeCliError).action).toBe(
+      `The slice is in another workspace's missions tree (${path.join(project, "missions")}), not under ${missionsRoot}. `
+      + `Select that tree with the parent --workspace option, for example: rig scope --workspace '${project}' slice <verb> '${slice}'`,
+    );
+    // The named option works: that workspace resolves the slice.
+    expect(findSlice(resolveMissionsRoot({ override: project, strictOverride: true }), slice).id).toBe("ALPHA.99.0.1.1");
+  });
+
+  it("O2: a slice outside any missions tree keeps the old advice and adds the --workspace route", () => {
+    const scratch = path.join(root, "07-target");
+    fs.mkdirSync(scratch);
+    expect(() => findSlice(missionsRoot, scratch)).toThrow(
+      "Ensure the slice lives under <missionsRoot>/<mission>/{slices,closed}/. For a slice in another workspace, such as a catalog project, "
+      + "select its tree with the parent option: rig scope --workspace <project root> slice <verb> <slice-path>",
+    );
+  });
+
+  it("O2: a mission not found names the --workspace route", () => {
+    expect(() => findMission(missionsRoot, "absent")).toThrow("rig scope --workspace <project root> mission <verb> <mission>");
   });
 });
 

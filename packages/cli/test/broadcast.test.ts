@@ -59,6 +59,50 @@ describe("Broadcast CLI", () => {
                 { ok: false, sessionName: "dev-qa@fail-rig", error: "send failed" },
               ],
             }));
+          } else if (parsed.rig === "notice-rig") {
+            // A managed-compaction notice on a sent and on a failed recipient; none on the third.
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              total: 3, sent: 2, failed: 1,
+              results: [
+                { ok: true, sessionName: "a@notice-rig", managedCompaction: { stage: "restoring", observed: "before_send", notice: "a@notice-rig was mid-restore: the restore request was sent and the post-restore audit is still owed." } },
+                { ok: true, sessionName: "b@notice-rig" },
+                { ok: false, sessionName: "c@notice-rig", error: "send failed", managedCompaction: { stage: "compacting", observed: "before_send", notice: "c@notice-rig was being compacted: /compact was submitted." } },
+              ],
+            }));
+          } else if (parsed.rig === "held-only-rig") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              total: 2, sent: 1, retained: 1, failed: 0,
+              results: [
+                { ok: true, sessionName: "a@held-only-rig", outcome: "delivered" },
+                { ok: true, sessionName: "b@held-only-rig", outcome: "retained", sent: false },
+              ],
+            }));
+          } else if (parsed.rig === "held-rig") {
+            // The daemon's shape for a held recipient: ok, outcome "retained", nothing written; sent excludes it.
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              total: 3, sent: 1, retained: 1, failed: 1,
+              results: [
+                { ok: true, sessionName: "a@held-rig", outcome: "delivered" },
+                { ok: true, sessionName: "b@held-rig", outcome: "retained", sent: false },
+                { ok: false, sessionName: "c@held-rig", sent: false, inputPhase: "not_reached", error: "send failed" },
+              ],
+            }));
+          } else if (parsed.rig === "phase-rig") {
+            // #2507: a recipient whose input was attempted or written is recorded indeterminate, not failed.
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              total: 5, sent: 1, failed: 4,
+              results: [
+                { ok: true, sessionName: "a@phase-rig", inputPhase: "written", sent: true },
+                { ok: false, sessionName: "b@phase-rig", inputPhase: "not_reached", sent: false, error: "target_needs_input" },
+                { ok: false, sessionName: "c@phase-rig", inputPhase: "attempted", sent: false, error: "paste lost" },
+                { ok: false, sessionName: "d@phase-rig", inputPhase: "written", sent: false, error: "enter unconfirmed" },
+                { ok: false, sessionName: "e@phase-rig", sent: true, error: "receipt lost" },
+              ],
+            }));
           } else if (parsed.rig === "warn-rig") {
             // S2 (OPR.0.5.4.3): an unattributed broadcast's response carries the
             // sign-it notice as an additive warning; the renderer must surface it.
@@ -112,13 +156,27 @@ describe("Broadcast CLI", () => {
   });
   afterEach(() => { vi.unstubAllEnvs(); });
 
-  function makeCmd(): Command {
+  function makeCmd(deps: StatusDeps = runningDeps(port)): Command {
     const prog = new Command(); prog.exitOverride();
-    prog.addCommand(broadcastCommand(runningDeps(port)));
+    prog.addCommand(broadcastCommand(deps));
     return prog;
   }
 
   // S2 (OPR.0.5.4.3): the broadcast renderer must SURFACE an additive warning.
+  it.each([false, true])("renders native pending and unknown custody without claiming it was sent or model work completed (json=%s)", async json => {
+    const client = { post: async () => ({ status: 200, data: { total: 2, sent: 0, failed: 0, pendingNative: 1, indeterminateNative: 1,
+      results: [{ ok: true, sessionName: "a@r", runnerReceipt: { version: 1, requestId: "pending", stage: "accepted" } },
+        { ok: true, sessionName: "b@r", runnerReceipt: { version: 1, requestId: "unknown", stage: "completed", result: { submissionUnknown: true } } }] } }) } as unknown as DaemonClient;
+    const result = await captureLogs(() => makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync(["node", "rig", "broadcast", "message", ...(json ? ["--json"] : [])]));
+    if (json) expect(JSON.parse(result.logs[0]!)).toMatchObject({ sent: 0, pendingNative: 1, indeterminateNative: 1 });
+    else {
+      expect(result.logs.join("\n")).not.toContain(": sent");
+      expect(result.logs.join("\n")).toContain("native receipt accepted");
+      expect(result.logs.join("\n")).toContain("native effect unknown");
+      expect(result.logs.join("\n")).toContain("1 native pending");
+    }
+    expect(result.exitCode).toBe(1);
+  });
   it("broadcast renderer surfaces the unknown-sender notice from the response warning", async () => {
     const { logs } = await captureLogs(async () => {
       await makeCmd().parseAsync(["node", "rig", "broadcast", "--rig", "warn-rig", "hello"]);
@@ -128,6 +186,56 @@ describe("Broadcast CLI", () => {
     expect(output).toContain("Advisory:");
     expect(output).toMatch(/no way of knowing who sent/i);
     expect(output).toMatch(/sign/i);
+  });
+
+  it("broadcast prints each recipient's compaction notice under that recipient's line, exit code unchanged", async () => {
+    const { stdout, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "broadcast", "--rig", "notice-rig", "hello"]);
+    });
+    expect(stdout).toEqual([
+      "a@notice-rig: sent",
+      "Notice: a@notice-rig was mid-restore: the restore request was sent and the post-restore audit is still owed.",
+      "b@notice-rig: sent",
+      "c@notice-rig: FAILED — send failed",
+      "Notice: c@notice-rig was being compacted: /compact was submitted.",
+      "2/3 delivered",
+    ]);
+    expect(exitCode).toBe(1);
+  });
+
+  it("broadcast prints UNCONFIRMED, not FAILED, for a recipient whose input was attempted or written; exit code unchanged", async () => {
+    const { stdout, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "broadcast", "--rig", "phase-rig", "hello"]);
+    });
+    const check = "the text may have reached it, so check with rig capture before resending";
+    expect(stdout).toEqual([
+      "a@phase-rig: sent",
+      "b@phase-rig: FAILED — target_needs_input",
+      `c@phase-rig: UNCONFIRMED — paste lost; ${check}`,
+      `d@phase-rig: UNCONFIRMED — enter unconfirmed; ${check}`,
+      `e@phase-rig: UNCONFIRMED — receipt lost; ${check}`,
+      "1/5 delivered",
+    ]);
+    expect(exitCode).toBe(1);
+  });
+
+  it("broadcast prints a held recipient as retained, not sent, and counts it as held", async () => {
+    const { stdout, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "broadcast", "--rig", "held-rig", "hello"]);
+    });
+    expect(stdout).toEqual([
+      "a@held-rig: sent",
+      "b@held-rig: retained, not delivered; inspect with rig seat held-messages",
+      "c@held-rig: FAILED — send failed",
+      "1/3 delivered, 1 held",
+    ]);
+    // The failed recipient sets the exit code; a held one alone doesn't, as with rig send.
+    expect(exitCode).toBe(1);
+    const heldOnly = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "broadcast", "--rig", "held-only-rig", "hello"]);
+    });
+    expect(heldOnly.stdout.at(-1)).toBe("1/2 delivered, 1 held");
+    expect(heldOnly.exitCode ?? 0).toBe(0);
   });
 
   it("broadcast --rig prints per-target summary", async () => {
@@ -217,11 +325,11 @@ describe("Broadcast CLI", () => {
   // path — same helper — wrapped. The fix ADDS body.envelopeSender via the single-origin helper. The
   // DaemonClient auto-stamps X-OpenRig-Session=origin env on the POST (client.ts:171), so the remote derives
   // the From: from the transport; the marker VALUE is ignored.
-  function crossHostBcast(): { posts: Array<{ path: string; body: Record<string, unknown> }>; deps: Parameters<typeof broadcastCommand>[0] } {
+  function crossHostBcast(data: Record<string, unknown> = { results: [{ sessionName: "a@rig", ok: true }], sent: 1, total: 1, failed: 0 }): { posts: Array<{ path: string; body: Record<string, unknown> }>; deps: Parameters<typeof broadcastCommand>[0] } {
     const posts: Array<{ path: string; body: Record<string, unknown> }> = [];
     const client = {
       get: async (p: string) => { posts.push({ path: p, body: {} }); return { status: 200, data: {} }; },
-      post: async (p: string, b: unknown) => { posts.push({ path: p, body: (b ?? {}) as Record<string, unknown> }); return { status: 200, data: { results: [{ sessionName: "a@rig", ok: true }], sent: 1, total: 1, failed: 0 } }; },
+      post: async (p: string, b: unknown) => { posts.push({ path: p, body: (b ?? {}) as Record<string, unknown> }); return { status: 200, data }; },
     } as unknown as DaemonClient;
     const hostRegistryLoader = () => ({ ok: true as const, registry: { hosts: [{ id: "vm-a", transport: "http" as const, url: "http://vm-a:7433" }] } });
     return { posts, deps: { ...runningDeps(port), clientFactory: () => client, hostRegistryLoader } };
@@ -263,6 +371,27 @@ describe("Broadcast CLI", () => {
     expect(bcast!.body["envelopeSender"]).toBe("<unknown sender>"); // honest marker present (anti-storm), never forged
   });
 
+  it("a cross-host broadcast prints each recipient's compaction notice under that recipient's line", async () => {
+    const { deps } = crossHostBcast({
+      total: 2, sent: 2, failed: 0,
+      results: [
+        { ok: true, sessionName: "a@rig", managedCompaction: { stage: "compacted", observed: "after_send", notice: "a@rig was compacted, with its restore not yet requested." } },
+        { ok: true, sessionName: "b@rig" },
+      ],
+    });
+    const prog = new Command(); prog.exitOverride();
+    prog.addCommand(broadcastCommand(deps));
+    const { stdout, exitCode } = await captureLogs(async () => {
+      await prog.parseAsync(["node", "rig", "broadcast", "--host", "vm-a", "--rig", "my-rig", "hi team"]);
+    });
+    const at = stdout.indexOf("a@rig: sent");
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(stdout[at + 1]).toBe("Notice: a@rig was compacted, with its restore not yet requested.");
+    expect(stdout[at + 2]).toBe("b@rig: sent");
+    expect(stdout.filter((l) => l.startsWith("Notice:"))).toHaveLength(1);
+    expect(exitCode).toBeFalsy();
+  });
+
   it("broadcast --json prints raw JSON", async () => {
     const { stdout } = await captureLogs(async () => {
       await makeCmd().parseAsync(["node", "rig", "broadcast", "--rig", "my-rig", "hello", "--json"]);
@@ -279,6 +408,7 @@ describe("Broadcast CLI", () => {
     const output = logs.join("\n");
     expect(output).toContain("No running sessions found");
     expect(output).toContain("0/0 delivered");
+    expect(logs).toContainEqual(expect.stringMatching(/^FAILED — No running sessions found/));
     expect(exitCode).toBe(1);
   });
 });

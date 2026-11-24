@@ -97,6 +97,24 @@ missing tools or logins, kernel startup, a closed viewing terminal and recovery 
 before choosing an action. A healthy daemon doesn't by itself mean the project's seats are ready: check
 `rig ps --nodes --rig <rig-name>`.
 
+If the whole team stopped when a herdr terminal closed, OpenRig or its tmux server was started from inside that
+terminal: herdr-core ends every process started there when the terminal closes. `rig daemon start` no longer passes a
+herdr terminal's scope on, but processes started before that keep it until they restart. OpenRig never restarts them
+for you; restart at a time you choose, from a terminal outside herdr.
+
+With `terminal.tmux_server` at its default (`inherit`), OpenRig puts seats on the tmux server of the shell that
+started it, usually your own default server. If that server was already running, and you had started it from a herdr
+terminal, it carries that terminal's scope. OpenRig can't prevent this, because the server is yours.
+The same applies when a command like `rig chatroom watch`, run in a herdr terminal, starts the default server. Start
+tmux outside herdr, or use `terminal.tmux_server isolated` (see `tmux-servers.md`), which gives OpenRig a server it
+starts itself.
+
+The daemon keeps `HC_SESSION` and `HC_SOCKET`. The herdr-core they select is the one the herdr-app provider starts
+viewers in; `rig terminal status --provider herdr-app` names it (`core` and `assumption`), as do open failures
+(`viewer_start_failed`, `herdr_app_unavailable`) and the note when a window has not confirmed showing a view. If your
+herdr-app window is attached to a different herdr-core than the daemon's, its viewers will not appear there; start the
+daemon with that core's `HC_SESSION` and `HC_SOCKET`.
+
 ### The agent is waiting for permission or can't reach the daemon
 
 Read [Have your agent configure permissions](getting-started.md#have-your-agent-configure-permissions)
@@ -120,6 +138,12 @@ unknown outcome, check `rig seat status <seat>` before trying again. For a rig w
 `--non-interruptive` on `rig up` or `rig bundle install` avoids Claude's warning and Codex's notices in the first
 place; see `non-interruptive-mode.md` beside this file.
 
+Codex's initial sign-in chooser and API-key entry are recognised as `login_required`, so startup reports the
+sign-in step instead of waiting for a generic readiness timeout. Finish that step in the seat's terminal, then use
+the continuation command above. A quoted or dismissed login screen is not a current login gate; other layouts
+keep their existing readiness handling. Claude's persistent "Not logged in" footer alone is not a login refusal, because a
+configured gateway may authenticate its requests.
+
 ### You can't tell which instance or configuration is involved
 
 Read [instance layout](instance-layout.md) (`rig context get reference/instance-layout.md`) and
@@ -133,7 +157,9 @@ issue's current status; a similar symptom alone is not a diagnosis.
 
 - Claude seats reported as needing attention after a restore: [#86](https://github.com/mvschwarz/openrig/issues/86),
   [#273](https://github.com/mvschwarz/openrig/issues/273).
-- Claude usage limits may not be detected: [#99](https://github.com/mvschwarz/openrig/issues/99).
+- Claude usage limits may not be detected when neither a status line window nor a current
+  `StopFailure/rate_limit` hook is available: [#99](https://github.com/mvschwarz/openrig/issues/99).
+  See [Claude usage-limit detection](claude-status-line.md#claude-usage-limit-detection) for the inputs and retry behavior.
 - Codex prompt variants not recognised as idle: [#79](https://github.com/mvschwarz/openrig/issues/79).
 - Codex asks about hook trust at first launch: [#17](https://github.com/mvschwarz/openrig/issues/17), not reproduced
   by the team.
@@ -141,8 +167,9 @@ issue's current status; a similar symptom alone is not a diagnosis.
   daemon, when its Codex configuration sets network access off, a managed requirement could restrict it, or Codex
   doesn't answer OpenRig's configuration read in time: [#275](https://github.com/mvschwarz/openrig/issues/275).
 - Kernel seats fail within a second of the first start on a distribution tmux whose server exits on `capture-pane`
-  (`tmux -V` prints `next-3.4`): [#980](https://github.com/mvschwarz/openrig/issues/980). The check and recovery
-  are in [Incomplete setup and restart](getting-started.md#incomplete-setup-and-restart).
+  (`tmux -V` prints `next-3.4`): [#980](https://github.com/mvschwarz/openrig/issues/980). `rig doctor` checks for
+  it (`tmux_capture`); the manual check and recovery are in
+  [Incomplete setup and restart](getting-started.md#incomplete-setup-and-restart).
 
 For everything else, search [open issues](https://github.com/mvschwarz/openrig/issues).
 

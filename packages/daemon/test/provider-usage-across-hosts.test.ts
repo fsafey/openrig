@@ -356,8 +356,10 @@ describe("GET /api/provider/usage/hosts", () => {
 
 describe("POST /api/provider/usage/hosts/refresh", () => {
   it("a refresh slower than the 5 s read class still succeeds, and its reading reaches the view", async () => {
-    const a = await host("a", { codex: { delayMs: 6_000, secondaryUsed: 85 } });
-    const hub = await host("hub", { registry: [a.entry()] });
+    // Keep the scripted weekly window before its reset while the delay uses real timers.
+    const now = () => "2026-10-14T00:00:00.000Z";
+    const a = await host("a", { now, codex: { delayMs: 6_000, secondaryUsed: 85 } });
+    const hub = await host("hub", { now, registry: [a.entry()] });
     const started = Date.now();
     const { status, body } = await refreshVia(hub, { provider: "codex" });
     expect(Date.now() - started).toBeGreaterThan(5_000);
@@ -592,13 +594,17 @@ describe("round 3: every rendered field checked, failures kept to their host, a 
     expect(all.filter((r) => !isUsageRow(r))).toEqual([]);
     const seat = (seatSession: string, runtime: string) => ({ seatSession, rigName: "r", runtime, lifecycleState: "running" });
     const seats = configuredSeatAccounts({
-      seats: [seat("q@r", "codex"), seat("d@r", "codex"), seat("a@r", "claude-code"), seat("b@r", "claude-code"), seat("x@r", "pi"), seat("q@r", "codex")],
+      seats: [seat("q@r", "codex"), seat("d@r", "codex"), seat("a@r", "claude-code"), seat("b@r", "claude-code"), seat("x@r", "pi"), seat("q@r", "codex"),
+        // A Claude seat's own token or API key, and a seat moved to its own home by an account switch.
+        { ...seat("t@r", "claude-code"), claudeToken: { label: "team-a" } }, { ...seat("k@r", "claude-code"), claudeToken: { label: "ci", kind: "api-key" as const } },
+        { ...seat("h@r", "codex"), runtimeHome: { home: "/homes/h", source: "account-switch" as const } }],
       auth: { profiles: ["work-a"], seats: [{ seat: "q@r", rig: "r", runtime: "codex", cwd: "/w", authProfile: "work-a", updatedTs: "2026-10-12T10:00:00Z" },
         { seat: "d@r", rig: "r", runtime: "claude-code", cwd: "/w", authProfile: "gone", updatedTs: "2026-10-12T10:00:00Z" }] } as never,
       usage: after, claudeSamples: h.samples, codexHome: "/h/.codex", claudeConfigDir: undefined, home: "/h",
     });
-    expect(seats.length).toBe(6);
-    expect(new Set(seats.map((s) => s.configured.source))).toEqual(new Set(["registry", "default_login", "unknown"]));
+    expect(seats.length).toBe(9);
+    expect(new Set(seats.map((s) => s.configured.source))).toEqual(new Set(["registry", "default_login", "unknown", "claude_token"]));
+    expect(seats.find((s) => s.seatSession === "h@r")!.configured).toMatchObject({ homeFrom: "account-switch" });
     expect(seats.filter((s) => !isSeat(s))).toEqual([]);
   });
 
@@ -608,6 +614,11 @@ describe("round 3: every rendered field checked, failures kept to their host, a 
     ["window reason", firstWindow((w) => ({ ...w, levelReason: TRAP })), "rows"],
     ["window remaining percent missing", firstWindow(({ remainingPercent: _r, ...w }) => w), "rows"],
     ["disagreeing seat", firstWindow((w) => ({ ...w, disagreeingSeats: [{ seatSession: TRAP, usedPercent: 1, resetsAt: null, observedAt: NOW }] })), "rows"],
+    ["last observed exhaustion", withCodexRow((r) => ({ ...r, lastObservedExhausted: { at: TRAP, window: null, evidence: "at the limit" } })), "rows"],
+    ["window expectation", firstWindow((w) => ({ ...w, expectation: { expectedFullSince: TRAP, note: "planning" } })), "rows"],
+    ["retained", withCodexRow((r) => ({ ...r, retained: TRAP })), "rows"],
+    ["account history", withCodexRow((r) => ({ ...r, accountHistory: TRAP })), "rows"],
+    ["saved profile", withCodexRow((r) => ({ ...r, savedProfile: TRAP })), "rows"],
     ["seat account label", withSeat((x) => ({ ...x, configured: { ...(x["configured"] as Body), profileRef: TRAP } })), "seats"],
     ["seat registryNotes not a list", withSeat((x) => ({ ...x, registryNotes: 5 })), "seats"],
     ["seat differsFrom not a list", withSeat((x) => ({ ...x, observed: { ...(x["observed"] as Body), differsFrom: "dev-b@r" } })), "seats"],

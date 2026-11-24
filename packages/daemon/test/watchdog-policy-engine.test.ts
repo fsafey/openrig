@@ -22,6 +22,7 @@ import {
   parseWatchdogSpec,
   WatchdogPolicyEngine,
 } from "../src/domain/watchdog-policy-engine.js";
+import { makeWatchdogDeliver } from "../src/domain/watchdog-delivery.js";
 import type { PersistedEvent } from "../src/domain/types.js";
 import type { PolicyEvaluation } from "../src/domain/policies/types.js";
 
@@ -120,6 +121,47 @@ describe("WatchdogPolicyEngine (PL-004 Phase C R1)", () => {
     }
   });
 
+  it.each([
+    ["stopped", "ok"], ["stopped", "failed"],
+    ["terminal", "ok"], ["terminal", "failed"],
+  ] as const)("records a completed %s job's %s delivery without advancing its schedule", async (state, status) => {
+    const registered = jobsRepo.register({
+      policy: "periodic-reminder", specYaml: "target: { session: alice@rig }\nmessage: ping\n",
+      targetSession: "alice@rig", intervalSeconds: 60, registeredBySession: "ops@kernel",
+    });
+    const previousFire = "2026-05-03T06:00:00.000Z";
+    const completedFire = "2026-05-03T07:00:00.000Z";
+    jobsRepo.recordEvaluation(registered.jobId, previousFire, true);
+    const job = jobsRepo.getByIdOrThrow(registered.jobId);
+    let started!: () => void;
+    const delivering = new Promise<void>(resolve => { started = resolve; });
+    let finish!: (outcome: { status: "ok" | "failed" }) => void;
+    const onWakeAttempt = vi.fn();
+    const engine = makeEngine({
+      now: () => new Date(completedFire), onWakeAttempt,
+      deliver: () => {
+        started();
+        return new Promise(resolve => { finish = resolve; });
+      },
+    });
+
+    const evaluation = engine.evaluate(job);
+    await delivering;
+    if (state === "stopped") jobsRepo.stop(job.jobId, "work finished");
+    else jobsRepo.markTerminal(job.jobId, "park ended");
+    const retired = jobsRepo.getByIdOrThrow(job.jobId);
+    finish({ status });
+    const result = await evaluation;
+
+    expect(result.history).toMatchObject({ deliveryStatus: status, evaluatedAt: completedFire });
+    expect(jobsRepo.getByIdOrThrow(job.jobId)).toMatchObject({
+      state, terminalReason: retired.terminalReason,
+      lastEvaluationAt: retired.lastEvaluationAt, lastFireAt: completedFire,
+      specYaml: retired.specYaml, intervalSeconds: retired.intervalSeconds,
+    });
+    expect(onWakeAttempt).not.toHaveBeenCalled();
+  });
+
   it("evaluate(periodic-reminder) routes through delivery + records sent + emits evaluation_fired + sets actionable=true", async () => {
     const engine = makeEngine();
     const job = jobsRepo.register({
@@ -141,6 +183,23 @@ describe("WatchdogPolicyEngine (PL-004 Phase C R1)", () => {
     expect(after.lastFireAt).not.toBeNull();
     expect(after.actionable).toBe(true);
     expect(after.lastActionableAt).not.toBeNull();
+  });
+
+  it("records what the send's own result says in the shared words: taken, and render-verified only when the screen showed it", async () => {
+    const results = [{ ok: true, sessionName: "alice@rig", outcome: "rendered-unconfirmed" as const, verified: false },
+      { ok: true, sessionName: "alice@rig", outcome: "delivered" as const, verified: true }];
+    const engine = makeEngine({ deliver: makeWatchdogDeliver({ sessionTransport: { send: async () => results.shift()! } }) });
+    const job = jobsRepo.register({
+      policy: "periodic-reminder", specYaml: "policy: periodic-reminder\ntarget:\n  session: alice@rig\nmessage: ping\n",
+      targetSession: "alice@rig", intervalSeconds: 60, registeredBySession: "ops@kernel",
+    });
+    await engine.evaluate(job);
+    await engine.evaluate(jobsRepo.getByIdOrThrow(job.jobId));
+    const [verified, unconfirmed] = log.listForJob(job.jobId);
+    // Both stay `sent`, as before; the notes say which was only taken by the route.
+    expect(unconfirmed).toMatchObject({ outcome: "sent", evaluationNotes: expect.objectContaining({ deliveryFact: "accepted" }) });
+    expect(unconfirmed?.evaluationNotes).not.toHaveProperty("deliveryRenderVerified");
+    expect(verified).toMatchObject({ outcome: "sent", evaluationNotes: expect.objectContaining({ deliveryFact: "accepted", deliveryRenderVerified: true }) });
   });
 
   it("evaluate(quiet skip — no_actionable_artifacts) does NOT record history nor emit event (POC parity)", async () => {
@@ -177,7 +236,7 @@ describe("WatchdogPolicyEngine (PL-004 Phase C R1)", () => {
     }
   });
 
-  it("delivery failure recorded as sent with delivery_status=failed (still meaningful)", async () => {
+  it("a failed delivery is recorded as failed, not sent (still meaningful)", async () => {
     const failingDeliver: DeliveryFn = async () => ({ status: "failed", error: "transport denied" });
     const engine = makeEngine({ deliver: failingDeliver });
     const job = jobsRepo.register({
@@ -190,7 +249,7 @@ describe("WatchdogPolicyEngine (PL-004 Phase C R1)", () => {
     });
     await engine.evaluate(job);
     const list = log.listForJob(job.jobId);
-    expect(list[0]?.outcome).toBe("sent");
+    expect(list[0]?.outcome).toBe("failed");
     expect(list[0]?.deliveryStatus).toBe("failed");
   });
 
@@ -549,7 +608,7 @@ describe("engine effects for the parked-owner consumer (OPR.0.5.6.24)", () => {
     h.db.close();
   });
 
-  it("delivery-reason pin: the delivery error string is persisted EXACTLY into the sent row's evaluationNotes.deliveryReason", async () => {
+  it("delivery-reason pin: a prompt refusal reads refused, with its error string persisted EXACTLY into evaluationNotes.deliveryReason", async () => {
     const refusal = "Refused: 'dev-planner@test-rig' is at an interactive prompt (target_needs_input). No text was sent.";
     const h = makeHarness({
       deliver: async () => ({ status: "failed" as const, error: refusal }),
@@ -563,7 +622,7 @@ describe("engine effects for the parked-owner consumer (OPR.0.5.6.24)", () => {
     await h.engine.evaluate(h.job);
     const entries = h.log.listForJob(h.job.jobId, 10);
     expect(entries).toHaveLength(1);
-    expect(entries[0]?.outcome).toBe("sent");
+    expect(entries[0]?.outcome).toBe("refused");
     expect(entries[0]?.deliveryStatus).toBe("failed");
     expect(entries[0]?.evaluationNotes?.["deliveryReason"]).toBe(refusal);
     // The policy's own notes survive the merge untouched.

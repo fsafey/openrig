@@ -25,6 +25,10 @@ function mockFs(initialFiles?: Record<string, string>) {
   return {
     readFile: (p: string) => { if (p in store) return store[p]!; throw new Error(`Not found: ${p}`); },
     writeFile: (p: string, c: string) => { store[p] = c; },
+    copyFileExclusive: (src: string, dest: string) => {
+      if (dest in store) throw Error(`Recovery path exists: ${dest}`);
+      store[dest] = store[src]!;
+    },
     exists: (p: string) => p in store || Object.keys(store).some((k) => k.startsWith(p + "/")),
     mkdirp: () => {},
     listFiles: (dir: string) => Object.keys(store).filter((k) => k.startsWith(dir + "/")).map((k) => k.slice(dir.length + 1)),
@@ -135,6 +139,30 @@ describe("PluginVendorService — vendoring (HG-2.3)", () => {
     expect(fs._store[installedSkill]).toBe("# same-version installed authority");
   });
 
+  it("keeps an old same-version core plugin's relay and manifest without inventing diagnostic delivery", async () => {
+    const asset = (rel: string) => readFileSync(new URL(`../assets/plugins/openrig-core/${rel}`, import.meta.url), "utf8");
+    const currentHooks = asset("hooks/claude.json");
+    const oldManifest = JSON.parse(currentHooks);
+    delete oldManifest.hooks.PermissionRequest;
+    const oldHooks = JSON.stringify(oldManifest);
+    const fs = mockFs({
+      "/asset-root/openrig-core/.claude-plugin/plugin.json": asset(".claude-plugin/plugin.json"),
+      "/asset-root/openrig-core/.codex-plugin/plugin.json": asset(".codex-plugin/plugin.json"),
+      "/asset-root/openrig-core/hooks/claude.json": currentHooks,
+      "/asset-root/openrig-core/hooks/scripts/activity-relay.cjs": asset("hooks/scripts/activity-relay.cjs"),
+      "/asset-root/openrig-core/hooks/scripts/permission-stop-descriptor.cjs": asset("hooks/scripts/permission-stop-descriptor.cjs"),
+      "/fixture/plugins/openrig-core/.claude-plugin/plugin.json": asset(".claude-plugin/plugin.json"),
+      "/fixture/plugins/openrig-core/hooks/claude.json": oldHooks,
+      "/fixture/plugins/openrig-core/hooks/scripts/activity-relay.cjs": "// installed old relay",
+    });
+    const httpClient = vi.fn();
+    await new PluginVendorService({ vendoredAssetsDir: "/asset-root", userPluginsDir: "/fixture/plugins", fs, httpClient }).ensureVendored("openrig-core");
+    expect(fs._store["/fixture/plugins/openrig-core/hooks/claude.json"]).toBe(oldHooks);
+    expect(fs._store["/fixture/plugins/openrig-core/hooks/scripts/activity-relay.cjs"]).toBe("// installed old relay");
+    expect(fs.exists("/fixture/plugins/openrig-core/hooks/scripts/permission-stop-descriptor.cjs")).toBe(false);
+    expect(httpClient).not.toHaveBeenCalled();
+  });
+
   it("upgrades an older installed plugin only when the bundled manifest version is newer", async () => {
     const source = {
       ...VENDORED_OPENRIG_CORE,
@@ -157,6 +185,44 @@ describe("PluginVendorService — vendoring (HG-2.3)", () => {
 
     expect(fs._store["/home/test/.openrig/plugins/openrig-core/skills/openrig-skills/SKILL.md"]).toBe("# bundled 0.2.0");
     expect(fs._store["/home/test/.openrig/plugins/openrig-core/.claude-plugin/plugin.json"]).toContain('"0.2.0"');
+  });
+
+  // The openrig plugin carries the CLI's release version from 0.7.13, so an install still at its earlier 0.1.0 refreshes;
+  // a daemon run from development source (still 0.1.0) leaves a newer released install as it is.
+  it("refreshes an openrig plugin installed at 0.1.0 to a release-stamped 0.7.13, backing up what it replaces, and never downgrades", async () => {
+    const manifest = (version: string) => `{"name":"openrig","version":"${version}"}`;
+    const bundled = (version: string, skill: string) => ({
+      "/asset-root/openrig/.claude-plugin/plugin.json": manifest(version),
+      "/asset-root/openrig/.codex-plugin/plugin.json": manifest(version),
+      "/asset-root/openrig/skills/working-with-an-openrig-team/SKILL.md": skill,
+    });
+    const installedSkill = "/fixture/home/.openrig/plugins/openrig/skills/working-with-an-openrig-team/SKILL.md";
+    const installedManifest = "/fixture/home/.openrig/plugins/openrig/.claude-plugin/plugin.json";
+    const service = (fs: ReturnType<typeof mockFs>) => new PluginVendorService({ vendoredAssetsDir: "/asset-root",
+      userPluginsDir: "/fixture/home/.openrig/plugins", fs, httpClient: vi.fn(), logger: vi.fn() });
+
+    const older = mockFs({ ...bundled("0.7.13", "# released 0.7.13"), [installedManifest]: manifest("0.1.0"), [installedSkill]: "# installed 0.1.0" });
+    await service(older).ensureVendored("openrig");
+    expect(older._store[installedSkill]).toBe("# released 0.7.13");
+    expect(older._store[installedManifest]).toBe(manifest("0.7.13"));
+    const backups = Object.entries(older._store).filter(([path]) => path.startsWith("/fixture/home/.openrig/backups/managed-refresh/"));
+    expect(backups.map(([path, text]) => [path.split("/").slice(-1)[0], text])).toEqual(expect.arrayContaining([["SKILL.md", "# installed 0.1.0"]]));
+
+    const devSource = mockFs({ ...bundled("0.1.0", "# development source"), [installedManifest]: manifest("0.7.13"), [installedSkill]: "# released 0.7.13" });
+    await service(devSource).ensureVendored("openrig");
+    expect(devSource._store[installedSkill]).toBe("# released 0.7.13");
+    expect(devSource._store[installedManifest]).toBe(manifest("0.7.13"));
+
+    // An openrig install with no version manifest was put there another way: left as it is, with no version invented.
+    const unversioned = mockFs({ ...bundled("0.7.13", "# released 0.7.13"), [installedSkill]: "# a person's own openrig copy" });
+    const before = { ...unversioned._store };
+    const logger = vi.fn();
+    await new PluginVendorService({ vendoredAssetsDir: "/asset-root", userPluginsDir: "/fixture/home/.openrig/plugins", fs: unversioned,
+      httpClient: vi.fn(), logger }).ensureVendored("openrig");
+    expect(unversioned._store).toEqual(before);
+    expect(unversioned.exists(installedManifest)).toBe(false);
+    expect(unversioned.exists("/fixture/home/.openrig/plugins/openrig/.codex-plugin/plugin.json")).toBe(false);
+    expect(logger).toHaveBeenCalledWith(expect.stringMatching(/existing plugin 'openrig' has no version authority .*leaving it unchanged/));
   });
 
   it("the shipped core upgrades 0.1.5 installs to daemon-publication instructions", async () => {
