@@ -1,6 +1,9 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { prepareHermeticEnv, type HermeticScaffold } from "./helpers/hermetic-env.js";
 import {
   spawnScenarioDaemon,
@@ -87,6 +90,35 @@ describe("scenario-daemon forced-local spawn (integration)", () => {
     expect((await fetch(`${daemon.baseUrl}/healthz`)).ok).toBe(true);
     await daemon.sigterm();
     await expect(fetch(`${daemon.baseUrl}/healthz`)).rejects.toThrow();
+  }, 60_000);
+
+  // #3631: once the first stop removed daemon.json, a repeated stop (sigterm then afterEach stop) ran with the scrubbed
+  // scaffold env and checked the CLI's configured default daemon, 127.0.0.1:7433, the machine's own. A decoy stands in for
+  // that default (OPENRIG_PORT) and must receive nothing: every stop addresses only this daemon's own URL.
+  it("a repeated stop never reaches the CLI's default daemon port", async () => {
+    scaffold = prepareHermeticEnv({ baseEnv: realBaseEnv() });
+    daemon = await spawnScenarioDaemon(scaffold, { rigBin: RIG_BIN });
+    await daemon.sigterm();
+    await expect(fetch(`${daemon.baseUrl}/healthz`)).rejects.toThrow();
+    expect(existsSync(join(scaffold.openrigHome, "daemon.json"))).toBe(false);
+
+    const hits: string[] = [];
+    const decoy = createServer((req, res) => {
+      hits.push(`${req.method} ${req.url}`);
+      res.writeHead(503).end();
+    });
+    await new Promise<void>((done) => decoy.listen(0, "127.0.0.1", done));
+    // Set only after the spawn: the helper refuses a scaffold env that carries a daemon target.
+    scaffold.env.OPENRIG_PORT = String((decoy.address() as AddressInfo).port);
+    try {
+      await daemon.sigterm();
+      await daemon.stop();
+    } finally {
+      daemon = undefined;
+      scaffold = undefined;
+      await new Promise<void>((done) => decoy.close(() => done()));
+    }
+    expect(hits).toEqual([]);
   }, 60_000);
 
   it("daemon restart re-spawns the scenario-local daemon on the same port/scratch", async () => {
