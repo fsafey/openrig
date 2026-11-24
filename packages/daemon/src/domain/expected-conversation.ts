@@ -6,7 +6,8 @@ import type { ContextUsageStore } from "./context-usage-store.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import { ProcessCensus } from "./process-census.js";
 import { CodexThreadIdResolver } from "./codex-thread-id.js";
-import { resolveIdentityVerifiedClaudeRecord, resolveLiveCodexThreadId } from "./model-divergence/current-generation-record.js";
+import { codexPaneChain, resolveIdentityVerifiedClaudeRecord, resolveLiveCodexThreadId, startedBeforeVerdict } from "./model-divergence/current-generation-record.js";
+import { commandNamesClaude } from "./native-process-lineage.js";
 import { parseSqliteUtcMs } from "./sqlite-time.js";
 import { DeliveryGuardError } from "./seat-delivery-guard.js";
 
@@ -62,7 +63,9 @@ export async function resolveExpectedConversation(expected: ExpectedConversation
   try {
     rootPid = await tmux.getPanePid(pane);
     if (!rootPid || rootPid !== (proof.evidence.observedPanePid ?? proof.evidence.observedPid)) unavailable("The pane process no longer matches its verified occupant.");
-    const deps = { getPanePid: () => tmux.getPanePid(pane), listProcesses: () => census.list(),
+    // One census snapshot serves the native lookup and the process checks below.
+    const processes = await census.list();
+    const deps = { getPanePid: () => tmux.getPanePid(pane), listProcesses: async () => processes,
       readThreadIdByPid: async (pid: number, startedAt?: string) => startedAt ? threads.resolve(pid, startedAt) : undefined };
     if (expected.runtime === "claude-code") {
       const sidecar = store.readSidecar(expected.sessionName);
@@ -88,8 +91,22 @@ export async function resolveExpectedConversation(expected: ExpectedConversation
       if (!recordHome) unavailable("The current native process's record home could not be established.");
       recordPath = store.readCodexTranscriptPath(nativeId, recordHome);
     }
+    // The verdict recorded PIDs: the processes now holding them must be the ones it saw (legacy verdicts name the root only).
+    const nativePid = proof.evidence.observedPanePid != null ? proof.evidence.observedPid ?? undefined : undefined;
+    for (const [label, verifiedPid] of [["pane root", rootPid], ...(nativePid === undefined ? [] : [["native process", nativePid]])] as const) {
+      if (!startedBeforeVerdict(processes.find(row => row.pid === verifiedPid), proof.observedAt))
+        unavailable(`The pane process no longer matches its verified occupant: its ${label} did not start before it was verified.`);
+    }
+    // A legacy Claude verdict's chain covers the Claude processes the selection read a session id from.
+    const isNative = expected.runtime === "claude-code"
+      ? (command: string) => commandNamesClaude(command) && /--(?:session-id|resume)[= ][0-9a-f-]{36}/.test(command) : undefined;
+    const chain = codexPaneChain(processes, rootPid, nativePid, isNative);
     assertCurrent();
-    if (await tmux.getPanePid(pane) !== rootPid) mismatch("The pane process changed during native resolution.");
+    // After the lookup's awaits, the pane must still be held by the same process chain, read from a census of its own
+    // (never one already in flight). Tenure and binding are read last, with nothing awaited after them.
+    const closingPid = await tmux.getPanePid(pane);
+    const closingChain = codexPaneChain(await new ProcessCensus().list(), rootPid, nativePid, isNative);
+    if (closingPid !== rootPid || closingChain !== chain) mismatch("The pane process changed during native resolution.");
     assertCurrent();
   } catch (error) {
     if (error instanceof DeliveryGuardError) throw error;
