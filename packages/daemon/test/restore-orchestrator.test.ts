@@ -2550,6 +2550,43 @@ describe("RestoreOrchestrator", () => {
     }
   });
 
+  // A set-cwd after the snapshot is the seat's current launch setting, like its stored model: restoring the older snapshot
+  // resumes the retained conversation in the audited directory. Only an audited move of the same node counts, and a run's
+  // --cwd still wins; anything else keeps the snapshot's directory as before.
+  it.each([
+    { name: "an audited move after the snapshot", move: "audited", override: undefined, expected: "/srv/product" },
+    { name: "a run's --cwd over an audited move", move: "audited", override: "/srv/run-only", expected: "/srv/run-only" },
+    { name: "an unaudited stored change", move: "unaudited", override: undefined, expected: "/srv/operations" },
+    { name: "an audit the stored cwd no longer matches", move: "superseded", override: undefined, expected: "/srv/operations" },
+  ] as const)("restores a pre-move snapshot in the right directory: $name", async ({ move, override, expected }) => {
+    const rig = rigRepo.createRig("cwd-move");
+    const node = rigRepo.addNode(rig.id, "design.aid", { runtime: "codex", cwd: "/srv/operations" });
+    const session = sessionRegistry.registerSession(node.id, "aid@cwd-move");
+    db.prepare("UPDATE sessions SET resume_type = ?, resume_token = ?, restore_policy = ? WHERE id = ?")
+      .run("codex_id", "retained-thread", "resume_if_possible", session.id);
+    sessionRegistry.updateStatus(session.id, "running");
+    const snap = snapshotCapture.captureSnapshot(rig.id, "manual");
+    sessionRegistry.updateStatus(session.id, "exited");
+    expect(rigRepo.setNodeCwd(node.id, "/srv/product", "/srv/operations")).toBe(true);
+    if (move !== "unaudited") {
+      eventBus.emit({ type: "node.cwd_changed", rigId: rig.id, nodeId: node.id, logicalId: "design.aid",
+        from: "/srv/operations", to: "/srv/product", reason: "assigned product checkout", operator: "lead@cwd-move" });
+    }
+    if (move === "superseded") expect(rigRepo.setNodeCwd(node.id, "/srv/elsewhere", "/srv/product")).toBe(true);
+    const tmux = mockTmux();
+    const resume = vi.fn(async () => ({ ok: true as const }));
+    const orch = createOrchestrator({ tmux, codex: { canResume: vi.fn((type: string | null) => type === "codex_id"), resume } as unknown as CodexResumeAdapter });
+
+    const result = await orch.restore(snap.id, override ? { cwdOverride: override } : undefined);
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    const call = resume.mock.calls.find(c => (c as unknown[])[2] === "retained-thread") as unknown[] | undefined;
+    expect(call, "restore must resume the retained conversation").toBeDefined();
+    expect(call![3]).toBe(expected);
+    expect(vi.mocked(tmux.createSession).mock.calls.map(c => c[1])).toEqual([expected]);
+    // Restore reads the setting; it never writes the stored cwd.
+    expect(rigRepo.getRig(rig.id)!.nodes[0]!.cwd).toBe(move === "superseded" ? "/srv/elsewhere" : "/srv/product");
+  });
+
   // #3347 r2: seats restored into one folder each keep their own checkpoint, so each "rebuilt" is true. A run's --cwd puts
   // every seat in one folder; on main, seats whose saved folder is the same already shared it.
   it.each(["--cwd", "shared saved folder"] as const)("two seats in one folder (%s) each get their own checkpoint", async (mode) => {

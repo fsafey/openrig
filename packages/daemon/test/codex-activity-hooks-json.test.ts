@@ -196,6 +196,69 @@ describe("Codex activity hooks with a hooks.json keep the person's own state (#1
     expect(m.store[CONFIG]).toContain('model = "gpt"');
   });
 
+  // A person's disable of OpenRig's hook is their choice for OpenRig's activity, not for a position: turning hooks off and
+  // on again (runtime.codex.hooks_enabled) must not silently re-enable it, even when a later group of theirs moves up.
+  it("keeps a disable of OpenRig's group across hooks off and on, with a later user group", () => {
+    const m = mockCodexFs({ [RELAY]: "// relay", [HOOKS]: JSON.stringify({ hooks: {} }) });
+    const a = adapter(m.fs);
+    a.ensureCodexActivityHooks();
+    m.store[CONFIG] = m.store[CONFIG]!.replace(`[hooks.state."${HOOKS}:stop:0:0"]\n`, `[hooks.state."${HOOKS}:stop:0:0"]\nenabled = false\n`);
+    const later = { hooks: [{ type: "command", command: "echo later" }] };
+    const document = JSON.parse(m.store[HOOKS]!);
+    document.hooks.Stop.push(later);
+    m.store[HOOKS] = JSON.stringify(document);
+    m.store[CONFIG] += `\n[hooks.state."${HOOKS}:stop:1:0"]\nenabled = false\ntrusted_hash = "sha256:person"\n`;
+
+    a.removeCodexActivityHooks();
+    expect(JSON.parse(m.store[HOOKS]!).hooks.Stop).toEqual([later]);
+    const off = state(m.store[CONFIG]!);
+    expect(off[`${HOOKS}:stop:0:0`]).toEqual({ enabled: false, trusted_hash: "sha256:person" });
+    // Only the explicit choice waits where OpenRig's group comes back; its trust does not, and nothing else is kept.
+    expect(off[`${HOOKS}:stop:1:0`]).toEqual({ enabled: false });
+    expect(off[`${HOOKS}:session_start:0:0`]).toBeUndefined();
+    const removedOnce = m.store[CONFIG];
+    a.removeCodexActivityHooks();
+    expect(m.store[CONFIG]).toBe(removedOnce);
+
+    a.ensureCodexActivityHooks();
+    expect(JSON.parse(m.store[HOOKS]!).hooks.Stop).toEqual([later, ours()]);
+    const on = state(m.store[CONFIG]!);
+    expect(on[`${HOOKS}:stop:0:0`]).toEqual({ enabled: false, trusted_hash: "sha256:person" });
+    expect(on[`${HOOKS}:stop:1:0`]).toEqual({ enabled: false, trusted_hash: trustOf("Stop", 1).hash });
+    expect(on[`${HOOKS}:session_start:0:0`]).toEqual({ trusted_hash: trustOf("SessionStart", 0).hash });
+  });
+
+  // OpenRig's group as its inline block writes it (this install's relay, timeout 5, no status label) is OpenRig's, not a
+  // second relay to add beside: upgraded in place, keeping the person's choice there, and removed when hooks are off.
+  it("upgrades OpenRig's unlabeled group in place instead of adding a duplicate, and removes it when hooks are off", () => {
+    const unlabeled = { hooks: [{ type: "command", command: `node "${RELAY}"`, timeout: 5 }] };
+    const config = `[hooks.state."${HOOKS}:stop:1:0"]\nenabled = false\n`;
+    const m = mockCodexFs({ [RELAY]: "// relay", [CONFIG]: config, [HOOKS]: JSON.stringify({ hooks: { Stop: [USER_GROUP, unlabeled] } }) });
+    const a = adapter(m.fs);
+    a.ensureCodexActivityHooks();
+    expect(JSON.parse(m.store[HOOKS]!).hooks.Stop).toEqual([USER_GROUP, ours()]);
+    expect(state(m.store[CONFIG]!)[`${HOOKS}:stop:1:0`]).toEqual({ enabled: false, trusted_hash: trustOf("Stop", 1).hash });
+    expect(state(m.store[CONFIG]!)[`${HOOKS}:stop:2:0`]).toBeUndefined();
+
+    const n = mockCodexFs({ [RELAY]: "// relay", [HOOKS]: JSON.stringify({ hooks: { Stop: [unlabeled, USER_GROUP] } }) });
+    adapter(n.fs).removeCodexActivityHooks();
+    expect(JSON.parse(n.store[HOOKS]!).hooks.Stop).toEqual([USER_GROUP]);
+  });
+
+  it.each([
+    ["another relay path", { hooks: [{ type: "command", command: 'node "/other/assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs"', timeout: 5 }] }],
+    ["another timeout", { hooks: [{ type: "command", command: `node "${RELAY}"`, timeout: 6 }] }],
+    ["a matcher", { matcher: "Bash", hooks: [{ type: "command", command: `node "${RELAY}"`, timeout: 5 }] }],
+    ["an extra handler field", { hooks: [{ type: "command", command: `node "${RELAY}"`, timeout: 5, async: true }] }],
+  ])("keeps a person's near-copy with %s and adds OpenRig's own group", (_name, group) => {
+    const m = mockCodexFs({ [RELAY]: "// relay", [HOOKS]: JSON.stringify({ hooks: { Stop: [group] } }) });
+    const a = adapter(m.fs);
+    a.ensureCodexActivityHooks();
+    expect(JSON.parse(m.store[HOOKS]!).hooks.Stop).toEqual([group, ours()]);
+    a.removeCodexActivityHooks();
+    expect(JSON.parse(m.store[HOOKS]!).hooks.Stop).toEqual([group]);
+  });
+
   it.each(["8", "08"])("keeps stale state index %s when removing a known JSON group", index => {
     const config = `[hooks.state.'${HOOKS}:stop:${index}:0']\ntrusted_hash = "stale-person"\nenabled = false\n`;
     const m = mockCodexFs({ [RELAY]: "// relay", [CONFIG]: config,
