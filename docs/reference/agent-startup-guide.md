@@ -431,9 +431,9 @@ running Claude seat:
 
 Adopting promptly is guidance. It doesn't protect against a poll or a compaction that runs before your next command.
 
-**Before adopting,** don't `rig down`/`rig up` or hand over by fork. Those resume the existing conversation in the
-saved directory, and Claude keeps conversations per project directory, so a resume there may not find it.
-Cross-directory resume hasn't been run natively; this is the order to follow. `rig seat restart --keep-conversation`
+**Before adopting,** a `rig down`/`rig up` or a handover by fork resumes the existing conversation in the saved
+directory. Claude Code and Codex both find a conversation there that was recorded in the previous directory (run
+natively with Claude Code 2.1.331 and Codex 0.171.0). `rig seat restart --keep-conversation`
 (Codex) isn't adoption: it respawns in the directory it observes from the running process.
 
 **Failures:** a refusal, missing or malformed saved startup context, or an audit-write failure leaves the prior
