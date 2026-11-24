@@ -5,7 +5,7 @@ no connector implementation is authorized by this document.
 
 ## Installed and demonstrated
 
-The instance now runs OpenRig 0.7.21; see [current runtime](operations.md#current-runtime).
+The instance now runs a fork build on OpenRig 0.7.22; see [current runtime](operations.md#current-runtime).
 The pilot below used published **OpenRig 0.6.10**, build `3001cc436656c435e54425443e708e3e2d8c7d68`,
 runs on Apple silicon with **Node 22.23.1**. It is installed under
 `$HOME/.local/share/openrig/0.6.10`, independent of the source checkout and

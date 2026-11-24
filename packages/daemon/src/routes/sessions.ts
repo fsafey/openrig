@@ -865,10 +865,10 @@ const generationRecord = async (c: Context) => {
       const processes = await generationCensus.list();
       const live = await resolveLiveCodexThreadId(binding.tmuxPane, {
         getPanePid: async () => pid,
-        listProcesses: async () => processes,
+        listProcesses: async (opts) => opts?.fresh ? generationCensus.list(opts) : processes,
         readThreadIdByPid: async (nativePid, startedAt) => {
           if (!startedAt) return undefined;
-          const read = await threads.resolveWithHome(nativePid, startedAt);
+          const read = await threads.resolveWithHome(nativePid, startedAt, nativePid === identity.evidence.observedPid);
           if (read.thread && read.codexHome) homes.add(read.codexHome);
           if (nativePid === identity.evidence.observedPid) { verifiedNativeThreadId = read.thread; verifiedHome = read.codexHome; }
           return read.thread;

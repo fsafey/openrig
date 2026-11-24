@@ -63,9 +63,11 @@ export async function resolveExpectedConversation(expected: ExpectedConversation
   try {
     rootPid = await tmux.getPanePid(pane);
     if (!rootPid || rootPid !== (proof.evidence.observedPanePid ?? proof.evidence.observedPid)) unavailable("The pane process no longer matches its verified occupant.");
-    // One census snapshot serves the native lookup and the process checks below.
+    // One census snapshot serves the native lookup and the process checks below; a caller asking for a fresh census
+    // (the resolver's after-read check) gets one taken now.
     const processes = await census.list();
-    const deps = { getPanePid: () => tmux.getPanePid(pane), listProcesses: async () => processes,
+    const deps = { getPanePid: () => tmux.getPanePid(pane),
+      listProcesses: async (opts?: { fresh?: boolean }) => opts?.fresh ? census.list(opts) : processes,
       readThreadIdByPid: async (pid: number, startedAt?: string) => startedAt ? threads.resolve(pid, startedAt) : undefined };
     if (expected.runtime === "claude-code") {
       const sidecar = store.readSidecar(expected.sessionName);
@@ -79,7 +81,7 @@ export async function resolveExpectedConversation(expected: ExpectedConversation
       const homes = new Set<string>();
       const selected = await resolveLiveCodexThreadId(pane, { ...deps, readThreadIdByPid: async (pid, startedAt) => {
         if (!startedAt) return undefined;
-        const read = await threads.resolveWithHome(pid, startedAt);
+        const read = await threads.resolveWithHome(pid, startedAt, pid === proof.evidence.observedPid);
         if (read.thread && read.codexHome) homes.add(read.codexHome);
         if (pid === proof.evidence.observedPid) { verifiedThread = read.thread; verifiedHome = read.codexHome; }
         return read.thread;
