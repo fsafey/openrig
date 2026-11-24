@@ -1618,9 +1618,10 @@ rules), and managed compaction, manual or automatic, asks the seat to write its
 restore map there, which may be outside its current workspace, where a seat
 without bypass permissions may meet a write prompt. Adopting promptly is guidance; it doesn't protect against a poll or
 a compaction that runs before your next command.
-Before adopting, don't rig down/rig up or hand over by fork: those resume the
-existing conversation in the saved directory, and Claude keeps conversations per
-project directory, so a resume there may not find it (not run natively).
+Before adopting, rig down/rig up or a handover by fork resumes the existing
+conversation in the saved directory. Claude Code and Codex both find a
+conversation there that was recorded in the previous directory (run natively
+with Claude Code 2.1.331 and Codex 0.171.0).
 rig seat restart --keep-conversation (Codex) isn't adoption: it respawns in the
 directory it observes from the running process.
 
